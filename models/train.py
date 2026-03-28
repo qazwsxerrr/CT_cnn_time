@@ -15,7 +15,7 @@ from radon_transform import TheoreticalDataGenerator
 from config import (
     n_data, n_train,
     device, MODEL_PATH, BEST_MODEL_PATH, CHECKPOINT_DIR,
-    TRAINING_CONFIG, DATA_CONFIG, LOGGING_CONFIG
+    TRAINING_CONFIG, DATA_CONFIG, LOGGING_CONFIG, TIME_DOMAIN_CONFIG, EXPERIMENT_OUTPUT_TAG
 )
 
 # Optional quick overrides for debugging (do not affect config.py).
@@ -44,6 +44,7 @@ class TheoreticalTrainer:
     def __init__(self):
         self._setup_logging()
         self.model = initialize_model()
+        self.experiment_metadata = self._build_experiment_metadata()
         train_data_source = str(
             DATA_CONFIG.get("train_data_source", DATA_CONFIG.get("data_source", "random_ellipses"))
         ).strip().lower()
@@ -54,6 +55,14 @@ class TheoreticalTrainer:
         self.val_data_generator = TheoreticalDataGenerator(data_source=val_data_source)
         self.logger.info("Train data source: %s", train_data_source)
         self.logger.info("Validation data source: %s", val_data_source)
+        self.logger.info("Experiment tag: %s", self.experiment_metadata["output_tag"])
+        self.logger.info("Operator mode: %s", self.experiment_metadata["operator_mode"])
+        self.logger.info("Operator class: %s", self.experiment_metadata["operator_class"])
+        self.logger.info(
+            "Active beta vectors (%d): %s",
+            len(self.experiment_metadata["beta_vectors"]),
+            self.experiment_metadata["beta_vectors"],
+        )
         noise_mode = str(DATA_CONFIG.get("noise_mode", "additive")).strip().lower()
         if noise_mode == "snr":
             self.logger.info("Noise setting: SNR=%sdB", DATA_CONFIG.get("target_snr_db", 30.0))
@@ -101,6 +110,22 @@ class TheoreticalTrainer:
             'update_difference': []
         }
         self.logger.info("Theoretical trainer initialized successfully")
+
+    def _build_experiment_metadata(self):
+        operator = self.model.optimizer.operator
+        beta_vectors = [
+            tuple(int(v) for v in beta)
+            for beta in getattr(operator, "beta_vectors", TIME_DOMAIN_CONFIG.get("beta_vectors", []))
+        ]
+        return {
+            "output_tag": EXPERIMENT_OUTPUT_TAG or "default",
+            "operator_mode": str(TIME_DOMAIN_CONFIG.get("operator_mode", "")),
+            "operator_class": operator.__class__.__name__,
+            "num_angles": int(getattr(operator, "num_angles", 1) or 1),
+            "num_backbone": int(getattr(operator, "num_backbone", getattr(operator, "num_angles", 1)) or 1),
+            "cnn_backbone_only": bool(TIME_DOMAIN_CONFIG.get("cnn_backbone_only", True)),
+            "beta_vectors": beta_vectors,
+        }
 
     def _setup_logging(self):
         log_dir = LOGGING_CONFIG['log_dir']
@@ -272,6 +297,7 @@ class TheoreticalTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
             'training_history': self.training_history,
+            'experiment_metadata': self.experiment_metadata,
         }
         checkpoint_path = os.path.join(
             CHECKPOINT_DIR, f'checkpoint_iter_{self.current_iter}.pth'

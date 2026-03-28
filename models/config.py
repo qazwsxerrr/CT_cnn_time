@@ -247,7 +247,7 @@ TIME_DOMAIN_CONFIG = {
 
     # Multi-angle configuration (only used when use_multi_angle is True).
     # beta_vectors are the fixed 8 backbone directions that must always be present.
-    "num_angles": 8,
+    # The effective num_angles is derived later from num_angles_total.
     "num_angles_total": 8,
     "beta_vectors": list(BACKBONE_MULTI8_BETA_VECTORS),
     # Multi-angle solver:
@@ -256,14 +256,28 @@ TIME_DOMAIN_CONFIG = {
     "multi_angle_solver_mode": "stacked_tikhonov",
     # Random seed for extra angles when num_angles_total > len(beta_vectors).
     "extra_angle_seed": 20260322,
+    # CNN-side angle channels:
+    # - True:  only expose the fixed backbone angles to the learned update network
+    # - False: expose all physical angles to the learned update network
+    "cnn_backbone_only": True,
     # Weight mu for extra (non-backbone) generic refinement views.
     "extra_angle_weight_mu": 1.0,
     # ADMM controls for the split-triangular backbone solver.
-    "split_admm_rho": 1.0,
-    # Keep enough iterations so noisy 8-angle Morozov initialization does not stop
-    # in a clearly under-converged state.
-    "split_admm_max_iter": 200,
-    "split_admm_tol": 1.0e-4,
+    "split_admm_rho": 0.5,
+    # Keep enough iterations so the backbone 8-angle ADMM can reach
+    # an actually stable consensus before any extra-angle refinement.
+    "split_admm_max_iter": 1200,
+    "split_admm_tol": 5.0e-5,
+    # Extra-angle refinement controls for K > 8 structured solves.
+    # The refinement solves for delta_c around the backbone solution:
+    #   mu ||A_extra delta_c - r_extra||^2 + gamma ||delta_c||^2
+    # with gamma = extra_refine_gamma_scale * lambda_backbone
+    #           + extra_refine_residual_scale * ||r_extra|| / sqrt(M_extra).
+    "extra_refine_gamma_scale": 32.0,
+    "extra_refine_residual_scale": 32.0,
+    "extra_refine_solver": "direct",
+    "extra_refine_cg_iters": 20,
+    "extra_refine_cg_tol": 1.0e-4,
 
     # Initialization strategy used by train.py / test.py before the learned updates.
     # Supported values:
@@ -346,6 +360,12 @@ if _m_override is not None:
 
 _apply_string_override(
     TIME_DOMAIN_CONFIG,
+    "operator_mode",
+    "OPERATOR_MODE_OVERRIDE",
+    allowed_values={"theoretical_b1b1", "implicit_b1b1"},
+)
+_apply_string_override(
+    TIME_DOMAIN_CONFIG,
     "init_method",
     "INIT_METHOD_OVERRIDE",
     allowed_values={"cg", "tikhonov_direct"},
@@ -356,13 +376,26 @@ _apply_string_override(
     "MULTI_ANGLE_SOLVER_MODE_OVERRIDE",
     allowed_values={"stacked_tikhonov", "split_triangular_admm"},
 )
+_apply_bool_override(TIME_DOMAIN_CONFIG, "cnn_backbone_only", "CNN_BACKBONE_ONLY_OVERRIDE")
 _apply_bool_override(TIME_DOMAIN_CONFIG, "auto_angle_t0", "AUTO_ANGLE_T0_OVERRIDE")
 _apply_float_override(TIME_DOMAIN_CONFIG, "extra_angle_weight_mu", "EXTRA_ANGLE_WEIGHT_MU_OVERRIDE")
 _apply_float_override(TIME_DOMAIN_CONFIG, "split_admm_rho", "SPLIT_ADMM_RHO_OVERRIDE")
 _apply_float_override(TIME_DOMAIN_CONFIG, "split_admm_tol", "SPLIT_ADMM_TOL_OVERRIDE")
+_apply_float_override(TIME_DOMAIN_CONFIG, "extra_refine_gamma_scale", "EXTRA_REFINE_GAMMA_SCALE_OVERRIDE")
+_apply_float_override(TIME_DOMAIN_CONFIG, "extra_refine_residual_scale", "EXTRA_REFINE_RESIDUAL_SCALE_OVERRIDE")
+_apply_string_override(
+    TIME_DOMAIN_CONFIG,
+    "extra_refine_solver",
+    "EXTRA_REFINE_SOLVER_OVERRIDE",
+    allowed_values={"direct", "cg"},
+)
 _split_iter_override = os.environ.get("SPLIT_ADMM_MAX_ITER_OVERRIDE", None)
 if _split_iter_override is not None and str(_split_iter_override).strip():
     TIME_DOMAIN_CONFIG["split_admm_max_iter"] = int(str(_split_iter_override).strip())
+_extra_refine_iters_override = os.environ.get("EXTRA_REFINE_CG_ITERS_OVERRIDE", None)
+if _extra_refine_iters_override is not None and str(_extra_refine_iters_override).strip():
+    TIME_DOMAIN_CONFIG["extra_refine_cg_iters"] = int(str(_extra_refine_iters_override).strip())
+_apply_float_override(TIME_DOMAIN_CONFIG, "extra_refine_cg_tol", "EXTRA_REFINE_CG_TOL_OVERRIDE")
 _seed_override = os.environ.get("EXTRA_ANGLE_SEED_OVERRIDE", None)
 if _seed_override is not None and str(_seed_override).strip():
     TIME_DOMAIN_CONFIG["extra_angle_seed"] = int(str(_seed_override).strip())
@@ -384,11 +417,24 @@ TRAINING_CONFIG = {
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-MODEL_PATH = os.path.join(MODEL_DIR, "theoretical_ct_model.pth")
-BEST_MODEL_PATH = os.path.join(MODEL_DIR, "theoretical_ct_best_model.pth")
-CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints")
+EXPERIMENT_OUTPUT_TAG = str(os.environ.get("OUTPUT_TAG_OVERRIDE", "") or "").strip()
+_model_stem = "theoretical_ct"
+if EXPERIMENT_OUTPUT_TAG:
+    _model_stem = f"{_model_stem}_{EXPERIMENT_OUTPUT_TAG}"
 
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
+MODEL_PATH = os.path.join(MODEL_DIR, f"{_model_stem}_model.pth")
+BEST_MODEL_PATH = os.path.join(MODEL_DIR, f"{_model_stem}_best_model.pth")
+CHECKPOINT_DIR = (
+    os.path.join(MODEL_DIR, f"checkpoints_{EXPERIMENT_OUTPUT_TAG}")
+    if EXPERIMENT_OUTPUT_TAG
+    else os.path.join(MODEL_DIR, "checkpoints")
+)
+
+LOG_DIR = (
+    os.path.join(PROJECT_ROOT, "logs", EXPERIMENT_OUTPUT_TAG)
+    if EXPERIMENT_OUTPUT_TAG
+    else os.path.join(PROJECT_ROOT, "logs")
+)
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -423,11 +469,14 @@ def print_config():
     else:
         print(f"Noise Level (delta): {DATA_CONFIG['noise_level']}")
     print(f"Data fidelity mode: {DATA_CONFIG['data_fidelity_mode']}")
+    print(f"Operator mode: {TIME_DOMAIN_CONFIG['operator_mode']}")
     print(f"Lambda mode: {DATA_CONFIG['lambda_select_mode']}")
     print(f"Init method: {TIME_DOMAIN_CONFIG['init_method']}")
     print(f"Multi-angle solver mode: {TIME_DOMAIN_CONFIG['multi_angle_solver_mode']}")
     print(f"Backbone angles: {len(TIME_DOMAIN_CONFIG['beta_vectors'])}")
     print(f"Total angles: {TIME_DOMAIN_CONFIG['num_angles_total']}")
+    print(f"CNN backbone only: {TIME_DOMAIN_CONFIG['cnn_backbone_only']}")
+    print(f"Output tag: {EXPERIMENT_OUTPUT_TAG or '(default)'}")
     print(f"Training iterations: {n_train}")
     print(f"Batch size: {n_data}")
     print(f"Learning rate: {TRAINING_CONFIG['optimizer_learning_rate']}")

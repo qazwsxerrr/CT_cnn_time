@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from config import device, THEORETICAL_CONFIG, TRAINING_CONFIG, DATA_CONFIG, IMAGE_SIZE
+from config import device, THEORETICAL_CONFIG, TRAINING_CONFIG, DATA_CONFIG, TIME_DOMAIN_CONFIG, IMAGE_SIZE
 from radon_transform import build_time_domain_operator
 
 
@@ -171,13 +171,32 @@ class LearnedGradientDescent(nn.Module):
         self.height = height
         self.width = width
         self.operator = build_time_domain_operator(beta=beta, height=height, width=width)
-        self.theoretical_gd = TheoreticalGradientDescent(
-            beta, height, width, regularizer_type, operator=self.operator
-        )
         self.num_angles = int(getattr(self.operator, "num_angles", 1) or 1)
         if not hasattr(self.operator, "split_measurements") or not hasattr(self.operator, "adjoint_per_angle"):
             raise ValueError("Current B1*B1 8-angle pipeline requires per-angle operator support.")
-        self.input_channels = (2 + self.num_angles + self.n_memory)
+        self.cnn_backbone_only = bool(TIME_DOMAIN_CONFIG.get("cnn_backbone_only", True))
+        backbone_angles = int(getattr(self.operator, "num_backbone", self.num_angles) or self.num_angles)
+        self.learned_operator = (
+            getattr(self.operator, "backbone_operator", self.operator)
+            if self.cnn_backbone_only
+            else self.operator
+        )
+        self.learned_num_angles = int(getattr(self.learned_operator, "num_angles", self.num_angles) or self.num_angles)
+        self.cnn_num_angles = backbone_angles if self.cnn_backbone_only else self.num_angles
+        if self.cnn_num_angles <= 0 or self.cnn_num_angles > self.num_angles:
+            raise ValueError(
+                f"Invalid CNN angle channel count {self.cnn_num_angles}; "
+                f"expected a value in [1, {self.num_angles}]."
+            )
+        if self.learned_num_angles <= 0 or self.learned_num_angles > self.num_angles:
+            raise ValueError(
+                f"Invalid learned gradient angle count {self.learned_num_angles}; "
+                f"expected a value in [1, {self.num_angles}]."
+            )
+        self.theoretical_gd = TheoreticalGradientDescent(
+            beta, height, width, regularizer_type, operator=self.learned_operator
+        )
+        self.input_channels = (2 + self.cnn_num_angles + self.n_memory)
         self.detach_physical_grads = bool(DATA_CONFIG.get("detach_physical_grads", True))
         self.learned_correction_max = float(DATA_CONFIG.get("learned_correction_max", 0.0))
         self.update_max_norm = float(DATA_CONFIG.get("update_max_norm", 0.0))
@@ -225,8 +244,24 @@ class LearnedGradientDescent(nn.Module):
             _, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(
                 coeff_current, g_observed, return_per_angle=True
             )
-        grad_channels = data_grad_pa.squeeze(2)
+        if int(data_grad_pa.shape[1]) < int(self.cnn_num_angles):
+            raise ValueError(
+                f"Per-angle gradient only has {int(data_grad_pa.shape[1])} channels, "
+                f"but CNN expects {int(self.cnn_num_angles)}."
+            )
+        grad_channels = data_grad_pa[:, : self.cnn_num_angles].squeeze(2)
         return torch.cat([coeff_current, grad_channels, reg_grad, memory], dim=1)
+
+    def _select_learned_measurements(self, g_observed):
+        if self.learned_operator is self.operator:
+            return g_observed
+        g_pa = self.operator.split_measurements(g_observed)
+        if int(g_pa.shape[1]) < int(self.learned_num_angles):
+            raise ValueError(
+                f"Observed measurements only contain {int(g_pa.shape[1])} angles, "
+                f"but learned operator expects {int(self.learned_num_angles)}."
+            )
+        return g_pa[:, : self.learned_num_angles, :].reshape(g_pa.shape[0], -1)
 
     def _cap_correction(self, correction):
         if self.learned_correction_max <= 0:
@@ -258,6 +293,7 @@ class LearnedGradientDescent(nn.Module):
             g_observed = g_observed.squeeze(1)
         batch_size = coeff_initial.shape[0]
         coeff_current = coeff_initial.clone()
+        g_observed_learned = self._select_learned_measurements(g_observed)
         memory = torch.zeros(batch_size, self.n_memory, self.height, self.width,
                              device=coeff_initial.device)
         history = [coeff_current.clone()]
@@ -267,7 +303,7 @@ class LearnedGradientDescent(nn.Module):
             reg_grad_base = self.theoretical_gd.compute_regularization_gradient(coeff_current)
 
             data_grad, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(
-                coeff_current, g_observed, return_per_angle=True
+                coeff_current, g_observed_learned, return_per_angle=True
             )
 
             if self.detach_physical_grads:
@@ -279,7 +315,7 @@ class LearnedGradientDescent(nn.Module):
             reg_grad = reg_grad_base * lambda_i
 
             cnn_input = self._compose_cnn_input(
-                coeff_current, g_observed, reg_grad, memory, data_grad_pa=data_grad_pa
+                coeff_current, g_observed_learned, reg_grad, memory, data_grad_pa=data_grad_pa
             )
 
             cnn_output = self.update_network(cnn_input)
@@ -374,6 +410,10 @@ def initialize_model():
     print(f"Regularizer type: {regularizer_type}")
     print(f"Optimization iterations: {n_iter}")
     print(f"Memory units: {n_memory}")
+    print(
+        "Physical angles / learned data angles / CNN angle channels: "
+        f"{model.optimizer.num_angles} / {model.optimizer.learned_num_angles} / {model.optimizer.cnn_num_angles}"
+    )
 
     return model
 

@@ -99,44 +99,29 @@ def _morozov_newton_scalar(
         phi_hi = float(residual2_fn(hi) - target2)
     if phi_hi < 0.0:
         return float(hi)
-
-    lam = float(initial_lambda)
-    if not (lo < lam < hi):
-        lam = math.sqrt(lo * hi) if lo > 0.0 else 0.5 * hi
-
-    best = lam
-    best_abs = float("inf")
+    # Use a monotone bracketed search in log-space. The residual curve can have
+    # a flat near-zero plateau for tiny lambda, where Newton updates become
+    # numerically meaningless even though a valid bracket already exists.
     scale = max(1.0, float(target2))
-
     for _ in range(int(max_iter)):
+        lam = math.sqrt(lo * hi) if lo > 0.0 else 0.5 * (lo + hi)
         value = float(residual2_fn(lam) - target2)
-        abs_value = abs(value)
-        if abs_value < best_abs:
-            best = lam
-            best_abs = abs_value
-        if abs_value <= float(tol) * scale:
+        if abs(value) <= float(tol) * scale:
             return float(lam)
-
         if value < 0.0:
             lo = lam
         else:
             hi = lam
 
-        deriv = float(derivative_fn(lam))
-        candidate = None
-        if math.isfinite(deriv) and deriv > 0.0:
-            newton = lam - (value / deriv)
-            if lo < newton < hi and math.isfinite(newton):
-                candidate = float(newton)
-        if candidate is None:
-            candidate = math.sqrt(lo * hi) if lo > 0.0 else 0.5 * hi
+    return float(math.sqrt(lo * hi) if lo > 0.0 else 0.5 * (lo + hi))
 
-        cand_value = float(residual2_fn(candidate) - target2)
-        if (not math.isfinite(cand_value)) or abs(cand_value) > abs_value:
-            candidate = math.sqrt(lo * hi) if lo > 0.0 else 0.5 * hi
-        lam = float(candidate)
 
-    return float(best)
+def _normalized_extra_angle_weight(
+    base_weight: float,
+    num_extra: int,
+) -> float:
+    _ = int(num_extra)
+    return float(base_weight)
 
 
 def _choose_lambda_morozov_from_explicit_svd(
@@ -860,6 +845,21 @@ class ImplicitPixelRadonOperator2D(torch.nn.Module):
         return self.adjoint(self.forward(coeff_matrix))
 
     @torch.no_grad()
+    def solve_tikhonov_direct(
+        self,
+        b: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+    ) -> torch.Tensor:
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.alphas.device)
+        self.last_split_admm_stats = None
+        rhs = self.adjoint(b).view(b.shape[0], self.N)
+        eigvals, eigvecs = _ensure_implicit_gram_spectrum(self, self._morozov_cache_fingerprint())
+        coeff = _solve_tikhonov_from_gram_spectrum(rhs, eigvals=eigvals, eigvecs=eigvecs, lambda_reg=lambda_reg)
+        return coeff.to(device=self.alphas.device, dtype=torch.float32).view(-1, 1, self.height, self.width)
+
+    @torch.no_grad()
     def solve_tikhonov_cg(
         self,
         b: torch.Tensor,
@@ -1206,15 +1206,11 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
                     f"weights has {int(weight_vec.numel())} entries, expected num_angles={int(self.num_angles)}."
                 )
 
-        extra_weight_eff = float(
-            TIME_DOMAIN_CONFIG.get("extra_angle_weight_mu", 1.0) if extra_weight is None else extra_weight
-        )
-        extra_rhs = None
-        extra_eigs = None
-        if extra_operator is not None and extra_measurements is not None and float(extra_weight_eff) > 0.0:
-            extra_measurements = extra_measurements.to(dtype=torch.float32, device=self.r_vectors.device)
-            extra_rhs = extra_operator.adjoint(extra_measurements).view(batch, self.N)
-            extra_eigs = _ensure_implicit_gram_spectrum(extra_operator, extra_operator._morozov_cache_fingerprint())
+        if extra_operator is not None or extra_measurements is not None or extra_weight is not None:
+            raise ValueError(
+                "solve_split_triangular_admm only supports the backbone 8-angle problem. "
+                "Extra-angle refinement must be applied outside the backbone ADMM."
+            )
 
         d_stack = []
         for angle_idx in range(self.num_angles):
@@ -1231,6 +1227,8 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         sqrt_k = math.sqrt(float(self.num_angles))
         primal = float("inf")
         dual = float("inf")
+        primal_rel = float("inf")
+        dual_rel = float("inf")
         converged = False
         iterations_run = 0
         for iter_idx in range(max_iter_eff):
@@ -1258,30 +1256,42 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
                     angle_idx,
                 )
 
-            if extra_rhs is None:
-                denom = (2.0 * lam) + (rho_eff * float(self.num_angles))
-                c_flat = (rho_eff * consensus_sum) / denom.view(-1, 1).clamp_min(1.0e-8)
-            else:
-                eigvals, eigvecs = extra_eigs
-                rhs_scaled = extra_rhs + ((rho_eff / (2.0 * extra_weight_eff)) * consensus_sum)
-                lambda_scaled = ((2.0 * lam) + (rho_eff * float(self.num_angles))) / (2.0 * extra_weight_eff)
-                c_flat = _solve_tikhonov_from_gram_spectrum(
-                    rhs_scaled,
-                    eigvals=eigvals,
-                    eigvecs=eigvecs,
-                    lambda_reg=lambda_scaled,
-                ).to(device=self.r_vectors.device, dtype=torch.float32)
+            denom = (2.0 * lam) + (rho_eff * float(self.num_angles))
+            c_flat = (rho_eff * consensus_sum) / denom.view(-1, 1).clamp_min(1.0e-8)
 
             primal_sq = c_flat.new_zeros((batch,))
+            d_norm_sq = c_flat.new_zeros((batch,))
+            pc_norm_sq = c_flat.new_zeros((batch,))
             for angle_idx in range(self.num_angles):
                 permuted = self._permute_c_to_d(c_flat, angle_idx)
                 diff = d_stack[:, angle_idx, :] - permuted
                 u_stack[:, angle_idx, :] = u_stack[:, angle_idx, :] + diff
                 primal_sq = primal_sq + torch.sum(diff * diff, dim=1)
-            primal = torch.sqrt(primal_sq).max().item() / math.sqrt(float(self.N) * float(self.num_angles))
-            dual = (rho_eff * sqrt_k * torch.norm(c_flat - c_prev, dim=1).max().item()) / math.sqrt(float(self.N))
+                d_norm_sq = d_norm_sq + torch.sum(d_stack[:, angle_idx, :] * d_stack[:, angle_idx, :], dim=1)
+                pc_norm_sq = pc_norm_sq + torch.sum(permuted * permuted, dim=1)
+
+            primal_abs_batch = torch.sqrt(primal_sq).div(math.sqrt(float(self.N) * float(self.num_angles)))
+            dual_abs_batch = (
+                rho_eff * sqrt_k * torch.norm(c_flat - c_prev, dim=1).div(math.sqrt(float(self.N)))
+            )
+            primal_scale = torch.maximum(
+                torch.sqrt(d_norm_sq).div(math.sqrt(float(self.N) * float(self.num_angles))),
+                torch.sqrt(pc_norm_sq).div(math.sqrt(float(self.N) * float(self.num_angles))),
+            ).clamp_min(1.0e-8)
+            dual_scale = (
+                rho_eff
+                * sqrt_k
+                * torch.norm(c_flat, dim=1).div(math.sqrt(float(self.N)))
+            ).clamp_min(1.0e-8)
+            primal_rel_batch = primal_abs_batch / primal_scale
+            dual_rel_batch = dual_abs_batch / dual_scale
+
+            primal = primal_abs_batch.max().item()
+            dual = dual_abs_batch.max().item()
+            primal_rel = primal_rel_batch.max().item()
+            dual_rel = dual_rel_batch.max().item()
             iterations_run = int(iter_idx + 1)
-            if max(primal, dual) <= tol_eff:
+            if max(primal_rel, dual_rel) <= tol_eff:
                 converged = True
                 break
 
@@ -1291,9 +1301,11 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
             "converged": bool(converged),
             "primal_residual": float(primal),
             "dual_residual": float(dual),
+            "relative_primal_residual": float(primal_rel),
+            "relative_dual_residual": float(dual_rel),
             "rho": float(rho_eff),
             "tol": float(tol_eff),
-            "used_extra_angles": bool(extra_rhs is not None),
+            "used_extra_angles": False,
             "num_angles": int(self.num_angles),
         }
         return c_flat.view(-1, 1, self.height, self.width)
@@ -1527,6 +1539,83 @@ class StructuredMultiAngleB1B1Operator2D(torch.nn.Module):
         return self.adjoint(self.forward(coeff_matrix))
 
     @torch.no_grad()
+    def _solve_extra_delta_refinement(
+        self,
+        c_backbone: torch.Tensor,
+        g_extra: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        extra_weight: float,
+    ) -> tuple[torch.Tensor, dict[str, float | str]]:
+        if self.extra_operator is None or int(self.num_extra) <= 0:
+            return c_backbone, {
+                "extra_refine_gamma": 0.0,
+                "extra_refine_backbone_gamma": 0.0,
+                "extra_refine_residual_gamma": 0.0,
+                "extra_refine_delta_norm": 0.0,
+                "extra_refine_solver": str(TIME_DOMAIN_CONFIG.get("extra_refine_solver", "direct")),
+                "extra_refine_residual_norm": 0.0,
+            }
+        if g_extra.dim() == 1:
+            g_extra = g_extra.unsqueeze(0)
+        batch = int(g_extra.shape[0])
+        g_extra = g_extra.to(dtype=torch.float32, device=device)
+        mu = max(float(extra_weight), 1.0e-8)
+        extra_solver = str(TIME_DOMAIN_CONFIG.get("extra_refine_solver", "direct")).strip().lower()
+        if extra_solver not in {"direct", "cg"}:
+            raise ValueError(
+                "Unsupported extra_refine_solver="
+                f"{extra_solver!r}; expected 'direct' or 'cg'."
+            )
+        g_extra_pred = self.extra_operator.forward(c_backbone).view(batch, -1)
+        extra_residual = g_extra - g_extra_pred
+
+        if torch.is_tensor(lambda_reg):
+            lambda_backbone = lambda_reg.detach().to(dtype=torch.float32, device=device).view(-1)
+            if int(lambda_backbone.numel()) == 1 and batch > 1:
+                lambda_backbone = lambda_backbone.expand(batch)
+            elif int(lambda_backbone.numel()) != batch:
+                raise ValueError(
+                    f"lambda_reg has {int(lambda_backbone.numel())} entries, expected 1 or batch={batch}."
+                )
+        else:
+            lambda_backbone = torch.full((batch,), float(lambda_reg), dtype=torch.float32, device=device)
+
+        gamma_scale = float(TIME_DOMAIN_CONFIG.get("extra_refine_gamma_scale", 8.0))
+        residual_scale = float(TIME_DOMAIN_CONFIG.get("extra_refine_residual_scale", 8.0))
+        residual_norm = torch.norm(extra_residual.view(batch, -1), dim=1) / math.sqrt(float(extra_residual.shape[1]))
+        gamma_backbone = gamma_scale * lambda_backbone
+        gamma_residual = residual_scale * residual_norm
+        gamma = gamma_backbone + gamma_residual
+        lambda_eff = gamma / mu
+        if extra_solver == "direct":
+            delta_c = self.extra_operator.solve_tikhonov_direct(
+                extra_residual,
+                lambda_reg=lambda_eff,
+            )
+        else:
+            delta_c = self.extra_operator.solve_tikhonov_cg(
+                extra_residual,
+                lambda_reg=lambda_eff,
+                max_iter=int(TIME_DOMAIN_CONFIG.get("extra_refine_cg_iters", 20)),
+                tol=float(TIME_DOMAIN_CONFIG.get("extra_refine_cg_tol", 1.0e-4)),
+                x0=torch.zeros_like(c_backbone),
+            )
+        refined = c_backbone + delta_c.to(device=device, dtype=torch.float32)
+        delta_norm = torch.norm(delta_c.view(batch, -1), dim=1).mean().item() / math.sqrt(float(self.N))
+        stats = {
+            "extra_refine_gamma": float(gamma.mean().item()),
+            "extra_refine_backbone_gamma": float(gamma_backbone.mean().item()),
+            "extra_refine_residual_gamma": float(gamma_residual.mean().item()),
+            "extra_refine_delta_norm": float(delta_norm),
+            "extra_refine_solver": str(extra_solver),
+            "extra_refine_residual_norm": float(residual_norm.mean().item()),
+        }
+        return (
+            refined.to(device=device, dtype=torch.float32).view(-1, 1, self.height, self.width),
+            stats,
+        )
+
+    @torch.no_grad()
     def solve_tikhonov_direct(
         self,
         b: torch.Tensor,
@@ -1539,20 +1628,44 @@ class StructuredMultiAngleB1B1Operator2D(torch.nn.Module):
         solver_mode = str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "split_triangular_admm")).strip().lower()
         if solver_mode == "split_triangular_admm":
             g_backbone, g_extra = self._split_backbone_extra(b)
-            coeff = self.backbone_operator.solve_split_triangular_admm(
+            base_extra_weight = float(TIME_DOMAIN_CONFIG.get("extra_angle_weight_mu", 1.0))
+            normalized_extra_weight = _normalized_extra_angle_weight(base_extra_weight, self.num_extra)
+            rho_eff = float(TIME_DOMAIN_CONFIG.get("split_admm_rho", 1.0) if rho is None else rho)
+            coeff_backbone = self.backbone_operator.solve_split_triangular_admm(
                 g_backbone.reshape(g_backbone.shape[0], -1),
                 lambda_reg=lambda_reg,
                 rho=rho,
                 max_iter=max_iter,
                 tol=tol,
-                extra_operator=self.extra_operator,
-                extra_measurements=g_extra,
-                extra_weight=float(TIME_DOMAIN_CONFIG.get("extra_angle_weight_mu", 1.0)),
             )
+            coeff = coeff_backbone
+            extra_stats = {
+                "extra_refine_gamma": 0.0,
+                "extra_refine_backbone_gamma": 0.0,
+                "extra_refine_residual_gamma": 0.0,
+                "extra_refine_delta_norm": 0.0,
+                "extra_refine_solver": str(TIME_DOMAIN_CONFIG.get("extra_refine_solver", "direct")),
+                "extra_refine_residual_norm": 0.0,
+            }
+            if self.extra_operator is not None and g_extra is not None and float(normalized_extra_weight) > 0.0:
+                coeff, extra_stats = self._solve_extra_delta_refinement(
+                    coeff_backbone,
+                    g_extra,
+                    lambda_reg=lambda_reg,
+                    extra_weight=normalized_extra_weight,
+                )
             stats = getattr(self.backbone_operator, "last_split_admm_stats", None)
             self.last_split_admm_stats = dict(stats) if stats is not None else None
             if self.last_split_admm_stats is not None:
                 self.last_split_admm_stats["num_extra_angles"] = int(self.num_extra)
+                self.last_split_admm_stats["base_extra_weight_mu"] = float(base_extra_weight)
+                self.last_split_admm_stats["effective_extra_weight_mu"] = float(normalized_extra_weight)
+                self.last_split_admm_stats["solve_path"] = (
+                    "backbone_split_admm_plus_extra_delta_refinement"
+                    if self.extra_operator is not None and g_extra is not None and float(normalized_extra_weight) > 0.0
+                    else "backbone_split_admm"
+                )
+                self.last_split_admm_stats.update(extra_stats)
             return coeff
         if solver_mode != "stacked_tikhonov":
             raise ValueError(
@@ -1625,8 +1738,22 @@ class StructuredMultiAngleB1B1Operator2D(torch.nn.Module):
         lambda_min: float = 1.0e-12,
         lambda_max: float = 1.0e12,
     ) -> torch.Tensor:
+        solver_mode = str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "split_triangular_admm")).strip().lower()
         if b.dim() == 1:
             b = b.unsqueeze(0)
+        if solver_mode == "split_triangular_admm":
+            g_backbone, _ = self._split_backbone_extra(b)
+            noise_norm = noise_norm.to(dtype=torch.float32, device=b.device).view(-1)
+            scale = math.sqrt(float(self.num_backbone) / float(self.num_angles))
+            noise_norm_backbone = noise_norm * float(scale)
+            return self.backbone_operator.choose_lambda_morozov(
+                g_backbone.reshape(g_backbone.shape[0], -1),
+                noise_norm=noise_norm_backbone,
+                tau=tau,
+                max_iter=max_iter,
+                lambda_min=lambda_min,
+                lambda_max=lambda_max,
+            )
         b = b.to(dtype=torch.float32, device=device)
         rhs = self.adjoint(b).view(b.shape[0], self.N)
         eigvals, eigvecs = _ensure_implicit_gram_spectrum(self, self._morozov_cache_fingerprint())
