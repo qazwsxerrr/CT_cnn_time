@@ -72,6 +72,7 @@ def _configure_random_angle_environment() -> Tuple[int, List[Tuple[int, int]]]:
 
     os.environ.setdefault("OPERATOR_MODE_OVERRIDE", "implicit_b1b1")
     os.environ.setdefault("NUM_ANGLES_TOTAL_OVERRIDE", str(num_angles))
+    os.environ.setdefault("CNN_NUM_ANGLES_OVERRIDE", str(min(num_angles, DEFAULT_NUM_ANGLES)))
     os.environ.setdefault(
         "OUTPUT_TAG_OVERRIDE",
         f"random{num_angles}_seed{seed}",

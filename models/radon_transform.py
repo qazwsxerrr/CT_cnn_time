@@ -656,6 +656,43 @@ def _theoretical_b1b1_block(
         "effective_t0": torch.tensor(float(effective_t0), dtype=torch.float64),
     }
 
+# Provide discrete forward/adjoint Jacobian products explicitly so training does
+# not rely on unsupported second-order derivatives through grid_sample.
+class _ImplicitForwardProjectFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, coeff_matrix: torch.Tensor, operator):
+        ctx.operator = operator
+        return operator._forward_numeric(coeff_matrix)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_coeff = ctx.operator._adjoint_numeric(grad_output)
+        return grad_coeff, None
+
+
+class _ImplicitAdjointProjectFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, residual: torch.Tensor, operator):
+        ctx.operator = operator
+        return operator._adjoint_numeric(residual)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_residual = ctx.operator._forward_numeric(grad_output)
+        return grad_residual, None
+
+
+class _ImplicitAdjointPerAngleFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, residual_per_angle: torch.Tensor, operator):
+        ctx.operator = operator
+        return operator._adjoint_per_angle_numeric(residual_per_angle)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_residual = ctx.operator._forward_from_per_angle_coeff_numeric(grad_output)
+        return grad_residual, None
+
 
 class ImplicitPixelRadonOperator2D(torch.nn.Module):
     """
@@ -787,23 +824,49 @@ class ImplicitPixelRadonOperator2D(torch.nn.Module):
             raise ValueError(f"Expected measurement length M={self.M}, got {g.shape[1]}")
         return g.view(g.shape[0], self.num_angles, self.M_per_angle)
 
-    def forward_per_angle(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+    def _forward_single_angle_numeric(self, coeff_matrix: torch.Tensor, angle_idx: int) -> torch.Tensor:
         if coeff_matrix.dim() == 3:
             coeff_matrix = coeff_matrix.unsqueeze(1)
         coeff_matrix = coeff_matrix.to(dtype=torch.float32, device=self.alphas.device)
         padded = self._pad_image(coeff_matrix)
+        rotated = self._rotate_batch(padded, self.forward_grids[int(angle_idx)])
+        proj_full = rotated.sum(dim=2).squeeze(1)
+        return self._resize_projection(proj_full, self.M_per_angle)
+
+    def _forward_per_angle_numeric(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         proj_list = []
         for idx in range(self.num_angles):
-            rotated = self._rotate_batch(padded, self.forward_grids[idx])
-            proj_full = rotated.sum(dim=2).squeeze(1)
-            proj = self._resize_projection(proj_full, self.M_per_angle)
-            proj_list.append(proj)
+            proj_list.append(self._forward_single_angle_numeric(coeff_matrix, idx))
         return torch.stack(proj_list, dim=1)
 
-    def forward(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
-        return self.forward_per_angle(coeff_matrix).reshape(coeff_matrix.shape[0], self.M)
+    def _forward_numeric(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        return self._forward_per_angle_numeric(coeff_matrix).reshape(coeff_matrix.shape[0], self.M)
 
-    def adjoint_per_angle(self, residual_per_angle: torch.Tensor) -> torch.Tensor:
+    def _adjoint_single_angle_numeric(
+        self,
+        residual_angle: torch.Tensor,
+        angle_idx: int,
+    ) -> torch.Tensor:
+        if residual_angle.dim() == 3 and residual_angle.shape[1] == 1:
+            residual_angle = residual_angle.squeeze(1)
+        if residual_angle.dim() != 2:
+            raise ValueError(
+                f"Expected residual_angle with shape (B,M_per_angle), got {tuple(residual_angle.shape)}"
+            )
+        residual_angle = residual_angle.to(dtype=torch.float32, device=self.alphas.device)
+        with torch.enable_grad():
+            x = torch.zeros(
+                (residual_angle.shape[0], 1, self.height, self.width),
+                device=self.alphas.device,
+                dtype=torch.float32,
+                requires_grad=True,
+            )
+            proj = self._forward_single_angle_numeric(x, angle_idx)
+            weighted_sum = torch.sum(proj * residual_angle)
+            grad = torch.autograd.grad(weighted_sum, x, retain_graph=False, create_graph=False)[0]
+        return grad.detach()
+
+    def _adjoint_per_angle_numeric(self, residual_per_angle: torch.Tensor) -> torch.Tensor:
         if residual_per_angle.dim() == 4 and residual_per_angle.shape[2] == 1:
             residual_per_angle = residual_per_angle.squeeze(2)
         if residual_per_angle.dim() != 3:
@@ -812,34 +875,46 @@ class ImplicitPixelRadonOperator2D(torch.nn.Module):
             )
         residual_per_angle = residual_per_angle.to(dtype=torch.float32, device=self.alphas.device)
         out = []
-        with torch.enable_grad():
-            for idx in range(self.num_angles):
-                x = torch.zeros(
-                    (residual_per_angle.shape[0], 1, self.height, self.width),
-                    device=self.alphas.device,
-                    dtype=torch.float32,
-                    requires_grad=True,
-                )
-                proj = self.forward_per_angle(x)[:, idx, :]
-                weighted_sum = torch.sum(proj * residual_per_angle[:, idx, :])
-                grad = torch.autograd.grad(weighted_sum, x, retain_graph=False, create_graph=False)[0]
-                out.append(grad.detach())
+        for idx in range(self.num_angles):
+            out.append(self._adjoint_single_angle_numeric(residual_per_angle[:, idx, :], idx))
         return torch.stack(out, dim=1)
 
-    def adjoint(self, residual: torch.Tensor) -> torch.Tensor:
+    def _adjoint_numeric(self, residual: torch.Tensor) -> torch.Tensor:
         if residual.dim() == 1:
             residual = residual.unsqueeze(0)
-        residual = residual.to(dtype=torch.float32, device=self.alphas.device)
-        with torch.enable_grad():
-            x = torch.zeros(
-                (residual.shape[0], 1, self.height, self.width),
-                device=self.alphas.device,
-                dtype=torch.float32,
-                requires_grad=True,
+        residual_pa = self.split_measurements(residual)
+        return self._adjoint_per_angle_numeric(residual_pa).sum(dim=1)
+
+    def _forward_from_per_angle_coeff_numeric(self, coeff_per_angle: torch.Tensor) -> torch.Tensor:
+        if coeff_per_angle.dim() == 4:
+            coeff_per_angle = coeff_per_angle.unsqueeze(2)
+        if coeff_per_angle.dim() != 5 or coeff_per_angle.shape[2] != 1:
+            raise ValueError(
+                "Expected coeff_per_angle with shape (B,K,1,H,W), "
+                f"got {tuple(coeff_per_angle.shape)}"
             )
-            weighted_sum = torch.sum(self.forward(x) * residual)
-            grad = torch.autograd.grad(weighted_sum, x, retain_graph=False, create_graph=False)[0]
-        return grad.detach()
+        outputs = []
+        for idx in range(self.num_angles):
+            outputs.append(self._forward_single_angle_numeric(coeff_per_angle[:, idx, :, :, :], idx))
+        return torch.stack(outputs, dim=1)
+
+    def forward_per_angle(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        return self._forward_per_angle_numeric(coeff_matrix)
+
+    def forward(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled() and coeff_matrix.requires_grad:
+            return _ImplicitForwardProjectFunction.apply(coeff_matrix, self)
+        return self._forward_numeric(coeff_matrix)
+
+    def adjoint_per_angle(self, residual_per_angle: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled() and residual_per_angle.requires_grad:
+            return _ImplicitAdjointPerAngleFunction.apply(residual_per_angle, self)
+        return self._adjoint_per_angle_numeric(residual_per_angle)
+
+    def adjoint(self, residual: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled() and residual.requires_grad:
+            return _ImplicitAdjointProjectFunction.apply(residual, self)
+        return self._adjoint_numeric(residual)
 
     def apply_normal(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.adjoint(self.forward(coeff_matrix))

@@ -89,6 +89,16 @@ def _apply_float_override(target: dict, key: str, env_name: str):
         raise ValueError(f"Invalid {env_name}={value!r}; expected a float.") from e
 
 
+def _apply_int_override(target: dict, key: str, env_name: str):
+    value = _get_env_override(env_name)
+    if value is None:
+        return
+    try:
+        target[key] = int(value)
+    except ValueError as e:
+        raise ValueError(f"Invalid {env_name}={value!r}; expected an integer.") from e
+
+
 def _apply_bool_override(target: dict, key: str, env_name: str):
     value = _get_env_override(env_name)
     if value is None:
@@ -260,6 +270,10 @@ TIME_DOMAIN_CONFIG = {
     # - True:  only expose the fixed backbone angles to the learned update network
     # - False: expose all physical angles to the learned update network
     "cnn_backbone_only": True,
+    # Optional hard cap for the learned optimizer angle subset. When set to a
+    # positive integer, the learned stage uses only the first K angles even if
+    # the physical operator / initialization uses more views.
+    "cnn_num_angles_override": None,
     # Weight mu for extra (non-backbone) generic refinement views.
     "extra_angle_weight_mu": 1.0,
     # ADMM controls for the split-triangular backbone solver.
@@ -377,6 +391,7 @@ _apply_string_override(
     allowed_values={"stacked_tikhonov", "split_triangular_admm"},
 )
 _apply_bool_override(TIME_DOMAIN_CONFIG, "cnn_backbone_only", "CNN_BACKBONE_ONLY_OVERRIDE")
+_apply_int_override(TIME_DOMAIN_CONFIG, "cnn_num_angles_override", "CNN_NUM_ANGLES_OVERRIDE")
 _apply_bool_override(TIME_DOMAIN_CONFIG, "auto_angle_t0", "AUTO_ANGLE_T0_OVERRIDE")
 _apply_float_override(TIME_DOMAIN_CONFIG, "extra_angle_weight_mu", "EXTRA_ANGLE_WEIGHT_MU_OVERRIDE")
 _apply_float_override(TIME_DOMAIN_CONFIG, "split_admm_rho", "SPLIT_ADMM_RHO_OVERRIDE")

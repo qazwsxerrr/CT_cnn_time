@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 from config import device, THEORETICAL_CONFIG, TRAINING_CONFIG, DATA_CONFIG, TIME_DOMAIN_CONFIG, IMAGE_SIZE
-from radon_transform import build_time_domain_operator
+from radon_transform import build_time_domain_operator, ImplicitPixelRadonOperator2D
 
 
 # ============================================================================
@@ -175,14 +175,22 @@ class LearnedGradientDescent(nn.Module):
         if not hasattr(self.operator, "split_measurements") or not hasattr(self.operator, "adjoint_per_angle"):
             raise ValueError("Current B1*B1 8-angle pipeline requires per-angle operator support.")
         self.cnn_backbone_only = bool(TIME_DOMAIN_CONFIG.get("cnn_backbone_only", True))
-        backbone_angles = int(getattr(self.operator, "num_backbone", self.num_angles) or self.num_angles)
+        self.requested_cnn_num_angles = TIME_DOMAIN_CONFIG.get("cnn_num_angles_override", None)
+        if self.requested_cnn_num_angles is not None:
+            self.requested_cnn_num_angles = int(self.requested_cnn_num_angles)
+            if self.requested_cnn_num_angles <= 0:
+                raise ValueError(
+                    "cnn_num_angles_override must be a positive integer when provided; "
+                    f"got {self.requested_cnn_num_angles}."
+                )
         self.learned_operator = (
             getattr(self.operator, "backbone_operator", self.operator)
             if self.cnn_backbone_only
             else self.operator
         )
+        self.learned_operator = self._limit_learned_operator_angles(self.learned_operator)
         self.learned_num_angles = int(getattr(self.learned_operator, "num_angles", self.num_angles) or self.num_angles)
-        self.cnn_num_angles = backbone_angles if self.cnn_backbone_only else self.num_angles
+        self.cnn_num_angles = self.learned_num_angles
         if self.cnn_num_angles <= 0 or self.cnn_num_angles > self.num_angles:
             raise ValueError(
                 f"Invalid CNN angle channel count {self.cnn_num_angles}; "
@@ -220,6 +228,30 @@ class LearnedGradientDescent(nn.Module):
         target_lambda = max(float(DATA_CONFIG.get("learned_reg_lambda_init", 1.0e-3)) - lambda_min, 1e-8)
         raw_lambda_init = math.log(math.exp(target_lambda) - 1.0)
         self.reg_lambda_raw = nn.Parameter(torch.tensor(raw_lambda_init, dtype=torch.float32))
+
+    def _limit_learned_operator_angles(self, operator):
+        limit = self.requested_cnn_num_angles
+        if limit is None:
+            return operator
+        operator_angles = int(getattr(operator, "num_angles", 1) or 1)
+        if limit > operator_angles:
+            raise ValueError(
+                f"cnn_num_angles_override={limit} exceeds learned operator angle count {operator_angles}."
+            )
+        if limit == operator_angles:
+            return operator
+        if isinstance(operator, ImplicitPixelRadonOperator2D):
+            beta_subset = [tuple(int(v) for v in beta) for beta in list(operator.beta_vectors)[:limit]]
+            return ImplicitPixelRadonOperator2D(
+                beta_vectors=beta_subset,
+                height=self.height,
+                width=self.width,
+                num_detector_samples_per_angle=int(operator.M_per_angle),
+            ).to(device)
+        raise ValueError(
+            "cnn_num_angles_override currently supports ImplicitPixelRadonOperator2D angle subsets; "
+            f"got {operator.__class__.__name__}."
+        )
 
     def _build_update_network(self, input_channels):
         return nn.Sequential(

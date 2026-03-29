@@ -59,6 +59,12 @@ class TheoreticalTrainer:
         self.logger.info("Operator mode: %s", self.experiment_metadata["operator_mode"])
         self.logger.info("Operator class: %s", self.experiment_metadata["operator_class"])
         self.logger.info(
+            "Angle usage: total=%d, learned=%d, cnn_channels=%d",
+            self.experiment_metadata["num_angles"],
+            self.experiment_metadata["learned_num_angles"],
+            self.experiment_metadata["cnn_num_angles"],
+        )
+        self.logger.info(
             "Active beta vectors (%d): %s",
             len(self.experiment_metadata["beta_vectors"]),
             self.experiment_metadata["beta_vectors"],
@@ -124,6 +130,8 @@ class TheoreticalTrainer:
             "num_angles": int(getattr(operator, "num_angles", 1) or 1),
             "num_backbone": int(getattr(operator, "num_backbone", getattr(operator, "num_angles", 1)) or 1),
             "cnn_backbone_only": bool(TIME_DOMAIN_CONFIG.get("cnn_backbone_only", True)),
+            "learned_num_angles": int(getattr(self.model.optimizer, "learned_num_angles", 1) or 1),
+            "cnn_num_angles": int(getattr(self.model.optimizer, "cnn_num_angles", 1) or 1),
             "beta_vectors": beta_vectors,
         }
 
