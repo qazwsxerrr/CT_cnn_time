@@ -28,7 +28,7 @@ if os.name == 'nt' and 'data_fidelity_error' not in globals():
         sys.stdout = NullWriter()
         sys.stderr = NullWriter()
 
-from model import initialize_model
+from model import initialize_model, export_trainable_state_dict
 from config import (
     n_data, n_train,
     device, MODEL_PATH, BEST_MODEL_PATH, CHECKPOINT_DIR,
@@ -340,7 +340,8 @@ class TheoreticalTrainerOffline:
     def _save_checkpoint(self, is_best=False):
         checkpoint = {
             'iter': self.current_iter,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': export_trainable_state_dict(self.model, move_to_cpu=True),
+            'model_state_format': 'trainable_parameters_only',
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),

@@ -10,7 +10,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from model import initialize_model, count_parameters
+from model import (
+    initialize_model,
+    count_parameters,
+    export_trainable_state_dict,
+    load_trainable_state_dict,
+)
 from radon_transform import TheoreticalDataGenerator
 from config import (
     n_data, n_train,
@@ -59,9 +64,17 @@ class TheoreticalTrainer:
         self.logger.info("Operator mode: %s", self.experiment_metadata["operator_mode"])
         self.logger.info("Operator class: %s", self.experiment_metadata["operator_class"])
         self.logger.info(
-            "Angle usage: total=%d, learned=%d, cnn_channels=%d",
+            "Angle usage: total=%d, learned=%d, raw_cnn_channels=%d, mixed_cnn_channels=%d",
             self.experiment_metadata["num_angles"],
             self.experiment_metadata["learned_num_angles"],
+            self.experiment_metadata["raw_cnn_angle_channels"],
+            self.experiment_metadata["cnn_num_angles"],
+        )
+        self.logger.info(
+            "Angle adapter: enabled=%s mode=%s hidden=%d out=%d",
+            self.experiment_metadata["cnn_angle_adapter_enabled"],
+            self.experiment_metadata["cnn_angle_adapter_mode"],
+            self.experiment_metadata["cnn_angle_adapter_hidden_channels"],
             self.experiment_metadata["cnn_num_angles"],
         )
         self.logger.info(
@@ -125,14 +138,25 @@ class TheoreticalTrainer:
         ]
         return {
             "output_tag": EXPERIMENT_OUTPUT_TAG or "default",
+            "experiment_profile": str(TIME_DOMAIN_CONFIG.get("experiment_profile", "default")),
             "operator_mode": str(TIME_DOMAIN_CONFIG.get("operator_mode", "")),
+            "multi_angle_layout": str(TIME_DOMAIN_CONFIG.get("multi_angle_layout", "structured_backbone_extra")),
             "operator_class": operator.__class__.__name__,
             "num_angles": int(getattr(operator, "num_angles", 1) or 1),
+            "num_angles_total": int(TIME_DOMAIN_CONFIG.get("num_angles_total", getattr(operator, "num_angles", 1) or 1)),
             "num_backbone": int(getattr(operator, "num_backbone", getattr(operator, "num_angles", 1)) or 1),
             "cnn_backbone_only": bool(TIME_DOMAIN_CONFIG.get("cnn_backbone_only", True)),
             "learned_num_angles": int(getattr(self.model.optimizer, "learned_num_angles", 1) or 1),
+            "raw_cnn_angle_channels": int(getattr(self.model.optimizer, "raw_cnn_num_angles", getattr(self.model.optimizer, "cnn_num_angles", 1)) or 1),
             "cnn_num_angles": int(getattr(self.model.optimizer, "cnn_num_angles", 1) or 1),
+            "cnn_angle_adapter_enabled": bool(getattr(self.model.optimizer, "angle_feature_adapter", None) is not None),
+            "cnn_angle_adapter_mode": str(getattr(self.model.optimizer, "angle_adapter_mode", "disabled")),
+            "cnn_angle_adapter_hidden_channels": int(getattr(self.model.optimizer, "angle_adapter_hidden_channels", 0) or 0),
             "beta_vectors": beta_vectors,
+            "explicit_extra_beta_vectors": [
+                list(beta)
+                for beta in list(TIME_DOMAIN_CONFIG.get("explicit_extra_beta_vectors", []) or [])
+            ],
         }
 
     def _setup_logging(self):
@@ -250,6 +274,7 @@ class TheoreticalTrainer:
                 self.training_history['update_difference'].append(metrics.get('update_difference', 0.0))
             iter_time = time.time() - iter_start_time
             if self.current_iter % TRAINING_CONFIG['validation_interval'] == 0:
+                angle_adapter_diag = self.model.optimizer.get_angle_adapter_diagnostics()
                 val_loss, val_metrics = self._validate()
                 # 记录验证损失
                 self.training_history['val_loss'].append(val_loss)
@@ -277,6 +302,17 @@ class TheoreticalTrainer:
                     f"Data Fidelity Error: {data_err:.6f} | "
                     f"Coeff Change: {upd_diff:.3e}"
                 )
+                if angle_adapter_diag is not None:
+                    self.logger.info(
+                        "  Angle adapter stats | gate(mean/min/max)=%.4f/%.4f/%.4f | "
+                        "mix_row_norm(mean/min/max)=%.4f/%.4f/%.4f",
+                        angle_adapter_diag.get("gate_mean", float("nan")),
+                        angle_adapter_diag.get("gate_min", float("nan")),
+                        angle_adapter_diag.get("gate_max", float("nan")),
+                        angle_adapter_diag.get("mix_row_norm_mean", float("nan")),
+                        angle_adapter_diag.get("mix_row_norm_min", float("nan")),
+                        angle_adapter_diag.get("mix_row_norm_max", float("nan")),
+                    )
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self.patience_counter = 0
@@ -300,7 +336,8 @@ class TheoreticalTrainer:
     def _save_checkpoint(self, is_best=False):
         checkpoint = {
             'iter': self.current_iter,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': export_trainable_state_dict(self.model, move_to_cpu=True),
+            'model_state_format': 'trainable_parameters_only',
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
@@ -371,7 +408,7 @@ class TheoreticalTrainer:
     def load_checkpoint(self, checkpoint_path):
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            load_info = load_trainable_state_dict(self.model, checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             self.current_iter = checkpoint['iter']
@@ -379,6 +416,12 @@ class TheoreticalTrainer:
             self.training_history = checkpoint['training_history']
             self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
             self.logger.info(f"Resuming from iteration {self.current_iter}")
+            self.logger.info(
+                "Loaded %d trainable parameters from checkpoint; ignored %d non-parameter keys and %d buffer keys",
+                load_info["loaded_parameter_count"],
+                len(load_info["ignored_non_parameter_keys"]),
+                len(load_info["missing_buffer_keys"]),
+            )
         else:
             self.logger.warning(f"Checkpoint not found: {checkpoint_path}")
 

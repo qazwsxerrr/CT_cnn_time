@@ -34,7 +34,7 @@ if os.name == 'nt':
 
 # 引入项目配置
 # 注意：这些导入必须在上面的补丁之后，因为 config.py 里面有 print 语句
-from model import initialize_model
+from model import initialize_model, export_trainable_state_dict, load_trainable_state_dict
 from config import (
     n_data,
     device, MODEL_PATH, BEST_MODEL_PATH, CHECKPOINT_DIR,
@@ -148,8 +148,14 @@ class ContinueTrainer:
         self.logger.info(f"Loading checkpoint from: {load_path}")
         checkpoint = torch.load(load_path, map_location=device)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        load_info = load_trainable_state_dict(self.model, checkpoint['model_state_dict'])
         self.logger.info("Model weights loaded successfully.")
+        self.logger.info(
+            "Loaded %d trainable parameters from checkpoint; ignored %d non-parameter keys and %d buffer keys",
+            load_info["loaded_parameter_count"],
+            len(load_info["ignored_non_parameter_keys"]),
+            len(load_info["missing_buffer_keys"]),
+        )
 
         if 'iter' in checkpoint: self.start_iter = checkpoint['iter']
         if 'best_val_loss' in checkpoint: self.best_val_loss = checkpoint['best_val_loss']
@@ -324,7 +330,8 @@ class ContinueTrainer:
     def _save_checkpoint(self, current_iter, is_best=False):
         state = {
             'iter': current_iter,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': export_trainable_state_dict(self.model, move_to_cpu=True),
+            'model_state_format': 'trainable_parameters_only',
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),

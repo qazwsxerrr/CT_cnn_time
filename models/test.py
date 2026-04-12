@@ -1,4 +1,5 @@
-﻿import os
+﻿import copy
+import os
 import re
 import argparse
 from contextlib import contextmanager
@@ -8,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from model import initialize_model
+from model import initialize_model, load_trainable_state_dict
 from radon_transform import TheoreticalDataGenerator
 from config import (
     device,
@@ -20,6 +21,7 @@ from config import (
     DATA_CONFIG,
     EXPERIMENT_OUTPUT_TAG,
     TIME_DOMAIN_CONFIG,
+    _apply_experiment_profile,
 )
 
 
@@ -53,14 +55,15 @@ def load_model(load_path: Optional[str] = None, checkpoint=None):
     experiment_metadata = checkpoint.get("experiment_metadata", {}) if isinstance(checkpoint, dict) else {}
     model = initialize_model()
     loaded_state = checkpoint.get("model_state_dict", checkpoint)
-    model_state = model.state_dict()
-    filtered = {k: v for k, v in loaded_state.items() if k in model_state and model_state[k].shape == v.shape}
-    skipped = [k for k in loaded_state.keys() if k not in filtered]
-    model.load_state_dict(filtered, strict=False)
+    load_info = load_trainable_state_dict(model, loaded_state)
     model.eval()
     print(f"Loaded checkpoint: {load_path}")
+    skipped = load_info.get("ignored_non_parameter_keys", [])
+    missing_buffers = load_info.get("missing_buffer_keys", [])
     if skipped:
-        print(f"Skipped mismatched keys: {skipped}")
+        print(f"Ignored non-parameter keys: {skipped}")
+    if missing_buffers:
+        print(f"Rebuilt buffer keys from current config: {missing_buffers}")
     return model, experiment_metadata
 
 
@@ -122,36 +125,76 @@ def _temporary_experiment_config(experiment_metadata: dict):
         yield
         return
 
-    backup = {
-        "operator_mode": TIME_DOMAIN_CONFIG.get("operator_mode"),
-        "use_multi_angle": TIME_DOMAIN_CONFIG.get("use_multi_angle"),
-        "beta_vectors": list(TIME_DOMAIN_CONFIG.get("beta_vectors", [])),
-        "num_angles": TIME_DOMAIN_CONFIG.get("num_angles"),
-        "num_angles_total": TIME_DOMAIN_CONFIG.get("num_angles_total"),
-        "cnn_backbone_only": TIME_DOMAIN_CONFIG.get("cnn_backbone_only"),
-    }
+    backup = copy.deepcopy(TIME_DOMAIN_CONFIG)
     beta_vectors = [
         tuple(int(v) for v in beta)
         for beta in experiment_metadata.get("beta_vectors", [])
     ]
+    operator_class = str(experiment_metadata.get("operator_class", "") or "").strip()
+    num_backbone = int(experiment_metadata.get("num_backbone", len(beta_vectors) or 0) or 0)
     try:
+        profile_name = str(experiment_metadata.get("experiment_profile", "") or "").strip()
+        if profile_name:
+            try:
+                _apply_experiment_profile(profile_name)
+            except ValueError:
+                TIME_DOMAIN_CONFIG["experiment_profile"] = profile_name
         if experiment_metadata.get("operator_mode"):
             TIME_DOMAIN_CONFIG["operator_mode"] = str(experiment_metadata["operator_mode"])
+        if experiment_metadata.get("multi_angle_layout"):
+            TIME_DOMAIN_CONFIG["multi_angle_layout"] = str(experiment_metadata["multi_angle_layout"])
         if beta_vectors:
-            TIME_DOMAIN_CONFIG["beta_vectors"] = list(beta_vectors)
-            TIME_DOMAIN_CONFIG["use_multi_angle"] = len(beta_vectors) > 1
-            TIME_DOMAIN_CONFIG["num_angles"] = int(len(beta_vectors))
-            TIME_DOMAIN_CONFIG["num_angles_total"] = int(len(beta_vectors))
+            if operator_class == "StructuredMultiAngleB1B1Operator2D" and num_backbone > 0:
+                backbone_betas = list(beta_vectors[:num_backbone])
+                extra_betas = list(beta_vectors[num_backbone:])
+                TIME_DOMAIN_CONFIG["beta_vectors"] = backbone_betas
+                TIME_DOMAIN_CONFIG["explicit_extra_beta_vectors"] = extra_betas
+                TIME_DOMAIN_CONFIG["use_multi_angle"] = len(backbone_betas) > 1
+                TIME_DOMAIN_CONFIG["num_angles"] = int(len(beta_vectors))
+                TIME_DOMAIN_CONFIG["num_angles_total"] = int(len(beta_vectors))
+            else:
+                TIME_DOMAIN_CONFIG["beta_vectors"] = list(beta_vectors)
+                TIME_DOMAIN_CONFIG["explicit_extra_beta_vectors"] = None
+                TIME_DOMAIN_CONFIG["use_multi_angle"] = len(beta_vectors) > 1
+                TIME_DOMAIN_CONFIG["num_angles"] = int(len(beta_vectors))
+                TIME_DOMAIN_CONFIG["num_angles_total"] = int(len(beta_vectors))
         if "cnn_backbone_only" in experiment_metadata:
             TIME_DOMAIN_CONFIG["cnn_backbone_only"] = bool(experiment_metadata["cnn_backbone_only"])
+        if "learned_num_angles" in experiment_metadata:
+            learned_num_angles = int(experiment_metadata["learned_num_angles"])
+            TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
+                learned_num_angles if learned_num_angles > 0 else None
+            )
+        elif "raw_cnn_angle_channels" in experiment_metadata:
+            raw_cnn_angle_channels = int(experiment_metadata["raw_cnn_angle_channels"])
+            TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
+                raw_cnn_angle_channels if raw_cnn_angle_channels > 0 else None
+            )
+        elif "cnn_num_angles" in experiment_metadata:
+            cnn_num_angles = int(experiment_metadata["cnn_num_angles"])
+            TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
+                cnn_num_angles if cnn_num_angles > 0 else None
+            )
+        if "cnn_angle_adapter_enabled" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["cnn_angle_adapter_enabled"] = bool(
+                experiment_metadata["cnn_angle_adapter_enabled"]
+            )
+        if "cnn_angle_adapter_mode" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["cnn_angle_adapter_mode"] = str(
+                experiment_metadata["cnn_angle_adapter_mode"]
+            )
+        if "cnn_angle_adapter_hidden_channels" in experiment_metadata:
+            hidden_channels = int(experiment_metadata["cnn_angle_adapter_hidden_channels"])
+            if hidden_channels > 0:
+                TIME_DOMAIN_CONFIG["cnn_angle_adapter_hidden_channels"] = hidden_channels
+        if bool(TIME_DOMAIN_CONFIG.get("cnn_angle_adapter_enabled", False)) and "cnn_num_angles" in experiment_metadata:
+            adapter_output_channels = int(experiment_metadata["cnn_num_angles"])
+            if adapter_output_channels > 0:
+                TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = adapter_output_channels
         yield
     finally:
-        TIME_DOMAIN_CONFIG["operator_mode"] = backup["operator_mode"]
-        TIME_DOMAIN_CONFIG["use_multi_angle"] = backup["use_multi_angle"]
-        TIME_DOMAIN_CONFIG["beta_vectors"] = list(backup["beta_vectors"])
-        TIME_DOMAIN_CONFIG["num_angles"] = backup["num_angles"]
-        TIME_DOMAIN_CONFIG["num_angles_total"] = backup["num_angles_total"]
-        TIME_DOMAIN_CONFIG["cnn_backbone_only"] = backup["cnn_backbone_only"]
+        TIME_DOMAIN_CONFIG.clear()
+        TIME_DOMAIN_CONFIG.update(backup)
 
 
 def evaluate(
@@ -161,6 +204,7 @@ def evaluate(
     num_samples: int = 50,
     load_path: Optional[str] = None,
     result_prefix: Optional[str] = None,
+    result_dir: Optional[str] = None,
 ):
     resolved_load_path = load_path
     env_load_path = str(os.environ.get("MODEL_LOAD_PATH_OVERRIDE", "") or "").strip()
@@ -243,7 +287,10 @@ def evaluate(
             ).strip()
             if prefix:
                 save_name = f"{prefix}_{save_name}"
-            save_path = os.path.join(RESULTS_DIR, save_name)
+            resolved_result_dir = _normalize_runtime_path(
+                result_dir or os.environ.get("RESULT_DIR_OVERRIDE", "") or RESULTS_DIR
+            )
+            save_path = os.path.join(resolved_result_dir, save_name)
             plot_result(
                 idx="MainExperiment_last",
                 f_true=f_true_np,
@@ -269,7 +316,7 @@ def evaluate(
         }
 
 
-def compare_saved_models(tags: List[str], num_samples: int = 50):
+def compare_saved_models(tags: List[str], num_samples: int = 50, result_dir: Optional[str] = None):
     print("==== Saved Model Comparison ====")
     results = []
     for raw_tag in tags:
@@ -282,6 +329,7 @@ def compare_saved_models(tags: List[str], num_samples: int = 50):
             num_samples=num_samples,
             load_path=load_path,
             result_prefix=tag,
+            result_dir=result_dir,
         )
         results.append(result)
 
@@ -299,6 +347,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate saved CT reconstruction models.")
     parser.add_argument("--model-path", type=str, default="", help="Checkpoint path to evaluate.")
     parser.add_argument("--num-samples", type=int, default=None, help="Number of evaluation samples.")
+    parser.add_argument("--result-dir", type=str, default="", help="Directory for evaluation plots.")
+    parser.add_argument("--result-prefix", type=str, default="", help="Prefix for saved evaluation plot names.")
     parser.add_argument(
         "--compare-tags",
         type=str,
@@ -317,9 +367,12 @@ if __name__ == "__main__":
         compare_saved_models(
             tags=[token.strip() for token in compare_tags.split(",") if token.strip()],
             num_samples=num_samples,
+            result_dir=str(args.result_dir or "").strip() or None,
         )
     else:
         evaluate(
             num_samples=num_samples,
             load_path=str(args.model_path or "").strip() or None,
+            result_prefix=str(args.result_prefix or "").strip() or None,
+            result_dir=str(args.result_dir or "").strip() or None,
         )

@@ -120,8 +120,10 @@ def _normalized_extra_angle_weight(
     base_weight: float,
     num_extra: int,
 ) -> float:
-    _ = int(num_extra)
-    return float(base_weight)
+    num_extra = int(num_extra)
+    if num_extra <= 0:
+        return float(base_weight)
+    return float(base_weight) / float(num_extra)
 
 
 def _choose_lambda_morozov_from_explicit_svd(
@@ -259,16 +261,82 @@ def _ensure_implicit_gram_spectrum(
     return eigvals, eigvecs
 
 
+def _ensure_runtime_gram_spectrum(
+    operator,
+    fingerprint: dict[str, object],
+    target_device: torch.device | str,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    target_device = torch.device(target_device)
+    eigvals_cpu, eigvecs_cpu = _ensure_implicit_gram_spectrum(
+        operator,
+        fingerprint,
+        chunk_size=chunk_size,
+    )
+    if target_device.type != "cuda":
+        return (
+            eigvals_cpu.to(dtype=torch.float32, device=target_device),
+            eigvecs_cpu.to(dtype=torch.float32, device=target_device),
+        )
+
+    runtime_device = getattr(operator, "_morozov_gram_runtime_device", None)
+    cached_vals = getattr(operator, "_morozov_gram_eigvals_gpu", None)
+    cached_vecs = getattr(operator, "_morozov_gram_eigvecs_gpu", None)
+    if (
+        runtime_device == str(target_device)
+        and cached_vals is not None
+        and cached_vecs is not None
+    ):
+        return cached_vals, cached_vecs
+
+    try:
+        eigvals_gpu = eigvals_cpu.to(dtype=torch.float32, device=target_device, non_blocking=True)
+        eigvecs_gpu = eigvecs_cpu.to(dtype=torch.float32, device=target_device, non_blocking=True)
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "out of memory" not in message:
+            raise
+        if not bool(getattr(operator, "_morozov_gpu_fallback_warned", False)):
+            print(
+                "[Morozov] GPU runtime Gram cache allocation failed; "
+                "falling back to CPU spectrum for this run."
+            )
+            operator._morozov_gpu_fallback_warned = True
+        operator._morozov_gram_eigvals_gpu = None
+        operator._morozov_gram_eigvecs_gpu = None
+        operator._morozov_gram_runtime_device = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return eigvals_cpu, eigvecs_cpu
+
+    operator._morozov_gram_eigvals_gpu = eigvals_gpu
+    operator._morozov_gram_eigvecs_gpu = eigvecs_gpu
+    operator._morozov_gram_runtime_device = str(target_device)
+    return eigvals_gpu, eigvecs_gpu
+
+
 def _solve_tikhonov_from_gram_spectrum(
     rhs: torch.Tensor,
     eigvals: torch.Tensor,
     eigvecs: torch.Tensor,
     lambda_reg: float | torch.Tensor,
+    *,
+    rhs_proj: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # Keep the spectral Tikhonov solve on the same deterministic CPU float32
+    # path as the legacy 8-angle implementation.  The Gram problem is very
+    # ill-conditioned; moving this projection to GPU (or silently promoting the
+    # CPU path to float64) changes the learned optimizer's first-step gradients
+    # enough to alter the training trajectory, even when the underlying
+    # operator is mathematically equivalent.
     batch = int(rhs.shape[0])
     rhs_cpu = rhs.detach().to(dtype=torch.float32, device="cpu")
     eigvals_cpu = eigvals.detach().to(dtype=torch.float32, device="cpu")
     eigvecs_cpu = eigvecs.detach().to(dtype=torch.float32, device="cpu")
+    if rhs_proj is None:
+        rhs_proj_cpu = rhs_cpu @ eigvecs_cpu
+    else:
+        rhs_proj_cpu = rhs_proj.detach().to(dtype=torch.float32, device="cpu")
     if torch.is_tensor(lambda_reg):
         lam_cpu = lambda_reg.detach().to(dtype=torch.float32, device="cpu").view(-1)
         if int(lam_cpu.numel()) == 1 and batch > 1:
@@ -280,8 +348,8 @@ def _solve_tikhonov_from_gram_spectrum(
     else:
         lam_cpu = torch.full((batch,), float(lambda_reg), dtype=torch.float32, device="cpu")
     denom = eigvals_cpu.view(1, -1) + lam_cpu.view(-1, 1)
-    rhs_proj = rhs_cpu @ eigvecs_cpu
-    return (rhs_proj / denom) @ eigvecs_cpu.t()
+    coeff = (rhs_proj_cpu / denom) @ eigvecs_cpu.t()
+    return coeff.to(dtype=torch.float32, device=rhs.device)
 
 
 def _choose_lambda_morozov_from_gram_spectrum(
@@ -292,7 +360,13 @@ def _choose_lambda_morozov_from_gram_spectrum(
     eigvecs: torch.Tensor,
     tau: float,
     settings: dict[str, float],
+    *,
+    rhs_proj: Optional[torch.Tensor] = None,
+    b_norm2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    # Match the legacy CPU/NumPy scalar Morozov path for reproducibility.  The
+    # vectorized GPU path was faster, but it changed the selected lambdas and
+    # the resulting initialization enough to perturb the learned optimizer.
     if b.dim() == 1:
         b = b.unsqueeze(0)
     batch = int(b.shape[0])
@@ -305,19 +379,25 @@ def _choose_lambda_morozov_from_gram_spectrum(
     noise_cpu = noise_norm.detach().to(dtype=torch.float64, device="cpu")
     eigvals_cpu = eigvals.detach().to(dtype=torch.float64, device="cpu").numpy()
     eigvecs_cpu = eigvecs.detach().to(dtype=torch.float32, device="cpu")
-    rhs_proj_all = (rhs_cpu @ eigvecs_cpu).to(dtype=torch.float64)
+    if rhs_proj is None:
+        rhs_proj_all = (rhs_cpu @ eigvecs_cpu).to(dtype=torch.float64)
+    else:
+        rhs_proj_all = rhs_proj.detach().to(dtype=torch.float32, device="cpu").to(dtype=torch.float64)
 
     lam_list = []
     for idx in range(batch):
         rhs_proj2 = rhs_proj_all[idx].square().numpy()
-        b_norm2 = float(torch.dot(b_cpu[idx], b_cpu[idx]).item())
+        if b_norm2 is None:
+            sample_b_norm2 = float(torch.dot(b_cpu[idx], b_cpu[idx]).item())
+        else:
+            sample_b_norm2 = float(b_norm2.detach().to(dtype=torch.float32, device="cpu").view(-1)[idx].item())
         target2 = float(float(tau) * float(noise_cpu[idx].item())) ** 2
 
         def residual2_fn(lam: float) -> float:
             denom = eigvals_cpu + lam
             x_rhs = float(np.sum(rhs_proj2 / denom))
             x_norm2 = float(np.sum(rhs_proj2 / (denom * denom)))
-            return max(0.0, b_norm2 - x_rhs - (lam * x_norm2))
+            return max(0.0, sample_b_norm2 - x_rhs - (lam * x_norm2))
 
         def derivative_fn(lam: float) -> float:
             return float(2.0 * lam * np.sum(rhs_proj2 / ((eigvals_cpu + lam) ** 3)))
@@ -333,7 +413,7 @@ def _choose_lambda_morozov_from_gram_spectrum(
                 max_iter=int(settings["max_iter"]),
                 tol=float(settings["newton_tol"]),
                 min_residual2=0.0,
-                max_residual2=b_norm2,
+                max_residual2=sample_b_norm2,
             )
         )
 
@@ -450,6 +530,18 @@ def _formula_mode_from_solver_mode(solver_mode: str) -> str:
     )
 
 
+def _resolve_theoretical_formula_mode(formula_mode: str | None, solver_mode: str) -> str:
+    resolved = "auto" if formula_mode is None else str(formula_mode).strip().lower()
+    if resolved in {"", "auto"}:
+        return _formula_mode_from_solver_mode(solver_mode)
+    if resolved in {"legacy", "shifted_support", "legacy_injective_extension"}:
+        return resolved
+    raise ValueError(
+        f"Unsupported theoretical_formula_mode={formula_mode!r}; "
+        "expected 'auto', 'legacy', 'shifted_support', or 'legacy_injective_extension'."
+    )
+
+
 def _kernel_support_length(r: torch.Tensor, tol: float = 1.0e-8) -> int:
     nz = torch.nonzero(torch.abs(r.detach().to(dtype=torch.float64)) > float(tol)).view(-1)
     if int(nz.numel()) == 0:
@@ -487,6 +579,121 @@ def _build_upper_normal_banded_from_kernel(
             diag += float(rho)
         ab[bw - 1 - offset, offset:] = diag
     return ab
+
+
+def _trim_lower_banded_ab(lower_ab: np.ndarray, tol: float = 1.0e-12) -> np.ndarray:
+    if lower_ab.ndim != 2:
+        raise ValueError(f"lower_ab must be 2D, got shape {lower_ab.shape}")
+    keep = np.where(np.max(np.abs(lower_ab), axis=1) > float(tol))[0]
+    if keep.size == 0:
+        return lower_ab[:1].copy()
+    return lower_ab[: int(keep[-1]) + 1].copy()
+
+
+def _build_upper_normal_banded_from_lower_ab(
+    lower_ab: np.ndarray,
+    *,
+    rho: float,
+    weight: float,
+) -> np.ndarray:
+    lower_ab = np.asarray(lower_ab, dtype=np.float64)
+    if lower_ab.ndim != 2:
+        raise ValueError(f"lower_ab must be 2D, got shape {lower_ab.shape}")
+    bw, n = int(lower_ab.shape[0]), int(lower_ab.shape[1])
+    upper_ab = np.zeros((bw, n), dtype=np.float64)
+    scale = 2.0 * float(weight)
+    for offset in range(bw):
+        diag = np.zeros(n - offset, dtype=np.float64)
+        for subdiag in range(bw - offset):
+            length = n - offset - subdiag
+            if length <= 0:
+                continue
+            diag[:length] += lower_ab[offset + subdiag, :length] * lower_ab[subdiag, offset : offset + length]
+        diag *= scale
+        if offset == 0:
+            diag += float(rho)
+        upper_ab[bw - 1 - offset, offset:] = diag
+    return upper_ab
+
+
+def _lower_banded_apply(lower_bands: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    if lower_bands.dim() != 2:
+        raise ValueError(f"lower_bands must have shape (bw, N), got {tuple(lower_bands.shape)}")
+    bw = int(lower_bands.shape[0])
+    n = int(lower_bands.shape[1])
+    y = torch.zeros((x.shape[0], n), dtype=x.dtype, device=x.device)
+    for offset in range(bw):
+        length = n - offset
+        if length <= 0:
+            break
+        coeff = lower_bands[offset, :length].to(dtype=x.dtype, device=x.device)
+        y[:, offset:] = y[:, offset:] + x[:, :length] * coeff.unsqueeze(0)
+    return y
+
+
+def _lower_banded_adjoint_apply(lower_bands: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    if lower_bands.dim() != 2:
+        raise ValueError(f"lower_bands must have shape (bw, N), got {tuple(lower_bands.shape)}")
+    bw = int(lower_bands.shape[0])
+    n = int(lower_bands.shape[1])
+    y = torch.zeros((x.shape[0], n), dtype=x.dtype, device=x.device)
+    for offset in range(bw):
+        length = n - offset
+        if length <= 0:
+            break
+        coeff = lower_bands[offset, :length].to(dtype=x.dtype, device=x.device)
+        y[:, :length] = y[:, :length] + x[:, offset:] * coeff.unsqueeze(0)
+    return y
+
+
+def _lower_banded_apply_batched(lower_bands: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if x.dim() != 3:
+        raise ValueError(f"x must have shape (B,K,N), got {tuple(x.shape)}")
+    if lower_bands.dim() != 3:
+        raise ValueError(f"lower_bands must have shape (K,bw,N), got {tuple(lower_bands.shape)}")
+    batch, num_angles, n = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    if int(lower_bands.shape[0]) != num_angles or int(lower_bands.shape[2]) != n:
+        raise ValueError(
+            "lower_bands/x shape mismatch: "
+            f"lower_bands={tuple(lower_bands.shape)}, x={tuple(x.shape)}"
+        )
+    bw = int(lower_bands.shape[1])
+    y = torch.zeros((batch, num_angles, n), dtype=x.dtype, device=x.device)
+    lower_bands = lower_bands.to(dtype=x.dtype, device=x.device)
+    for offset in range(bw):
+        length = n - offset
+        if length <= 0:
+            break
+        coeff = lower_bands[:, offset, :length].unsqueeze(0)
+        y[:, :, offset:] = y[:, :, offset:] + x[:, :, :length] * coeff
+    return y
+
+
+def _lower_banded_adjoint_apply_batched(lower_bands: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if x.dim() != 3:
+        raise ValueError(f"x must have shape (B,K,N), got {tuple(x.shape)}")
+    if lower_bands.dim() != 3:
+        raise ValueError(f"lower_bands must have shape (K,bw,N), got {tuple(lower_bands.shape)}")
+    batch, num_angles, n = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    if int(lower_bands.shape[0]) != num_angles or int(lower_bands.shape[2]) != n:
+        raise ValueError(
+            "lower_bands/x shape mismatch: "
+            f"lower_bands={tuple(lower_bands.shape)}, x={tuple(x.shape)}"
+        )
+    bw = int(lower_bands.shape[1])
+    y = torch.zeros((batch, num_angles, n), dtype=x.dtype, device=x.device)
+    lower_bands = lower_bands.to(dtype=x.dtype, device=x.device)
+    for offset in range(bw):
+        length = n - offset
+        if length <= 0:
+            break
+        coeff = lower_bands[:, offset, :length].unsqueeze(0)
+        y[:, :, :length] = y[:, :, :length] + x[:, :, offset:] * coeff
+    return y
 
 
 def _to_integer_beta(beta) -> torch.Tensor:
@@ -597,7 +804,7 @@ def _theoretical_b1b1_block(
     formula_mode: str = "legacy",
     auto_shift_t0: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """Construct one per-direction theoretical B1*B1 block metadata without forming dense matrices."""
+    """Construct one per-direction theoretical B1*B1 block metadata for injective beta·k orderings."""
     h = int(height)
     w = int(width)
     n = int(h * w)
@@ -609,44 +816,70 @@ def _theoretical_b1b1_block(
     k1, k2 = _lex_lattice_indices(h, w)
     beta_dot_k = beta_i[0] * k1 + beta_i[1] * k2
 
-    uniq_sorted = torch.sort(torch.unique(beta_dot_k)).values
+    sort_perm = torch.argsort(beta_dot_k, stable=True)
+    uniq_sorted = beta_dot_k.index_select(0, sort_perm)
     if int(uniq_sorted.numel()) != n:
         raise ValueError(
             f"beta={tuple(int(x) for x in beta_i.tolist())} does not make beta·k injective on [0,{h-1}]x[0,{w-1}]."
         )
-
-    kappa0 = int(uniq_sorted[0].item())
-    kappa_m = int(uniq_sorted[-1].item())
-    if (kappa_m - kappa0 + 1) != n:
+    if int(torch.unique(uniq_sorted).numel()) != n:
         raise ValueError(
-            f"range(beta·k) must be contiguous with size N={n}, got [{kappa0}, {kappa_m}]"
+            f"beta={tuple(int(x) for x in beta_i.tolist())} does not make beta·k injective on [0,{h-1}]x[0,{w-1}]."
         )
-    expected = torch.arange(kappa0, kappa_m + 1, dtype=torch.int64)
-    if not torch.equal(uniq_sorted, expected):
-        raise ValueError("range(beta·k) must be consecutive integers for theoretical B1*B1 operator.")
 
-    kappa0 = int(uniq_sorted[0].item())
-    lex_to_d = (beta_dot_k - kappa0).to(torch.int64)
-    d_to_lex = torch.empty(n, dtype=torch.int64)
-    d_to_lex[lex_to_d] = torch.arange(n, dtype=torch.int64)
+    lex_to_d = torch.empty(n, dtype=torch.int64)
+    lex_to_d[sort_perm] = torch.arange(n, dtype=torch.int64)
+    d_to_lex = sort_perm.to(torch.int64)
 
-    k = torch.arange(n, dtype=torch.float64)
+    sorted_proj = uniq_sorted.to(torch.int64)
+    kappa0 = int(sorted_proj[0].item())
+    support_lo, support_hi = phi_support_bounds_b1b1(alpha)
+    support_hi_beta = float(support_hi * beta_norm)
     formula_mode = str(formula_mode).strip().lower()
     if formula_mode == "legacy":
-        effective_t0 = float(t0)
-        sampling_points = (float(t0) + k) / beta_norm
-        r = radon_phi_b1b1((float(t0) + k - float(kappa0)) / beta_norm, alpha).to(torch.float64)
+        effective_t0 = float(t0) - float(kappa0)
+        band_t0 = float(effective_t0)
     elif formula_mode == "shifted_support":
         effective_t0 = _effective_angle_t0(alpha, beta_norm=beta_norm, base_t0=float(t0), auto_shift=auto_shift_t0)
-        sampling_points = (float(effective_t0) + float(kappa0) + k) / beta_norm
-        r = radon_phi_b1b1((float(effective_t0) + k) / beta_norm, alpha).to(torch.float64)
+        band_t0 = float(effective_t0)
+    elif formula_mode == "legacy_injective_extension":
+        # New injective extension: work in the reordered support coordinate
+        # n'_i = n_i - n_0 and sample at s_i = n'_i + t0.  Therefore each
+        # lower-band entry depends on the relative sorted-projection gap
+        # n_{j+offset} - n_j, not on the absolute origin shift -kappa0.
+        #
+        # Keep effective_t0/sampling_points in the original beta·k coordinate
+        # for metadata compatibility, but construct lower_bands with band_t0.
+        effective_t0 = float(t0) - float(kappa0)
+        band_t0 = float(t0)
     else:
         raise ValueError(
-            f"Unknown B1*B1 formula_mode={formula_mode!r}; expected 'legacy' or 'shifted_support'."
+            f"Unknown B1*B1 formula_mode={formula_mode!r}; expected 'legacy', "
+            "'legacy_injective_extension', or 'shifted_support'."
         )
 
+    sampling_points = (float(effective_t0) + sorted_proj.to(torch.float64)) / beta_norm
+    max_gap = max(0, int(math.ceil(support_hi_beta - float(band_t0) + 1.0e-12)))
+    band_limit = min(n, max_gap + 1)
+    lower_ab = np.zeros((band_limit, n), dtype=np.float64)
+    proj_np = sorted_proj.detach().to(dtype=torch.float64, device="cpu")
+    for offset in range(band_limit):
+        length = n - offset
+        if length <= 0:
+            break
+        diffs = proj_np[offset:] - proj_np[:length]
+        values = radon_phi_b1b1((float(band_t0) + diffs) / beta_norm, alpha).to(dtype=torch.float64, device="cpu")
+        lower_ab[offset, :length] = values.numpy()
+    lower_ab = _trim_lower_banded_ab(lower_ab)
+    band_width = int(lower_ab.shape[0])
+    r = np.zeros((n,), dtype=np.float64)
+    r[:band_width] = lower_ab[:, 0]
+
     return {
-        "r": r,
+        "r": torch.from_numpy(r),
+        "lower_bands": torch.from_numpy(lower_ab),
+        "sorted_proj": sorted_proj,
+        "lower_bandwidth": torch.tensor(band_width, dtype=torch.int64),
         "alpha": alpha,
         "beta": beta_i,
         "sampling_points": sampling_points,
@@ -654,6 +887,7 @@ def _theoretical_b1b1_block(
         "d_to_lex": d_to_lex,
         "kappa0": torch.tensor(kappa0, dtype=torch.int64),
         "effective_t0": torch.tensor(float(effective_t0), dtype=torch.float64),
+        "band_t0": torch.tensor(float(band_t0), dtype=torch.float64),
     }
 
 # Provide discrete forward/adjoint Jacobian products explicitly so training does
@@ -1059,39 +1293,60 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
                 for beta in self.beta_vectors
             ]
             r_vectors = torch.stack([blk["r"] for blk in blocks], dim=0).to(dtype=torch.float32, device=device)
+            lower_bandwidths = torch.stack([blk["lower_bandwidth"] for blk in blocks], dim=0).to(
+                dtype=torch.int64, device=device
+            )
+            max_bandwidth = int(lower_bandwidths.max().item())
+            lower_bands = torch.zeros(
+                (self.num_angles, max_bandwidth, self.N),
+                dtype=torch.float32,
+                device=device,
+            )
+            sorted_proj = torch.zeros((self.num_angles, self.N), dtype=torch.int64, device=device)
+            for idx, blk in enumerate(blocks):
+                bw = int(blk["lower_bandwidth"].item())
+                lower_bands[idx, :bw, :] = blk["lower_bands"].to(dtype=torch.float32, device=device)
+                sorted_proj[idx] = blk["sorted_proj"].to(dtype=torch.int64, device=device)
             alphas = torch.stack([blk["alpha"] for blk in blocks], dim=0).to(dtype=torch.float32, device=device)
             betas = torch.stack([blk["beta"] for blk in blocks], dim=0).to(dtype=torch.int64, device=device)
             lex_to_d = torch.stack([blk["lex_to_d"] for blk in blocks], dim=0).to(dtype=torch.int64, device=device)
             d_to_lex = torch.stack([blk["d_to_lex"] for blk in blocks], dim=0).to(dtype=torch.int64, device=device)
             kappa0 = torch.stack([blk["kappa0"] for blk in blocks], dim=0).to(dtype=torch.int64, device=device)
             effective_t0 = torch.stack([blk["effective_t0"] for blk in blocks], dim=0).to(dtype=torch.float32, device=device)
+            band_t0 = torch.stack([blk["band_t0"] for blk in blocks], dim=0).to(dtype=torch.float32, device=device)
             sampling_points_pa = torch.stack([blk["sampling_points"] for blk in blocks], dim=0).to(
                 dtype=torch.float32, device=device
             )
 
-        conv_size = 1 << (int(2 * self.N - 1).bit_length())
-        r_fft = torch.fft.rfft(r_vectors, n=conv_size, dim=1)
-
         self.register_buffer("r_vectors", r_vectors)
-        self.register_buffer("r_fft", r_fft)
+        self.register_buffer("lower_bands", lower_bands)
+        self.register_buffer("lower_bandwidths", lower_bandwidths)
+        self.register_buffer("sorted_proj_per_angle", sorted_proj)
         self.register_buffer("alphas", alphas)
         self.register_buffer("betas", betas)
         self.register_buffer("lex_to_d_indices", lex_to_d)
         self.register_buffer("d_to_lex_indices", d_to_lex)
         self.register_buffer("kappa0_per_angle", kappa0)
         self.register_buffer("effective_t0_per_angle", effective_t0)
+        self.register_buffer("band_t0_per_angle", band_t0)
         self.register_buffer("sampling_points_per_angle", sampling_points_pa)
         self.register_buffer("sampling_points", sampling_points_pa.reshape(-1))
-        self.conv_size = int(conv_size)
         self._morozov_gram_eigvals: Optional[torch.Tensor] = None
         self._morozov_gram_eigvecs: Optional[torch.Tensor] = None
+        self._morozov_gram_eigvals_gpu: Optional[torch.Tensor] = None
+        self._morozov_gram_eigvecs_gpu: Optional[torch.Tensor] = None
+        self._morozov_gram_runtime_device: Optional[str] = None
+        self._morozov_gpu_fallback_warned = False
         self.last_morozov_cache_hit: Optional[bool] = None
         self.last_morozov_cache_build_seconds: Optional[float] = None
         self.last_split_admm_stats: Optional[dict[str, object]] = None
+        self._last_gram_context_signature: Optional[tuple[object, ...]] = None
+        self._last_gram_context: Optional[dict[str, torch.Tensor]] = None
         self._split_linear_cache: dict[tuple[int, float, float], dict[str, np.ndarray]] = {}
+        self._split_progress_logged_once = False
 
     def _morozov_cache_fingerprint(self) -> dict[str, object]:
-        return {
+        fingerprint = {
             "class_name": self.__class__.__name__,
             "height": int(self.height),
             "width": int(self.width),
@@ -1103,19 +1358,21 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
             "beta_vectors": [list(beta) for beta in self.beta_vectors],
             "basis": "b1b1",
         }
+        if str(self.formula_mode) == "legacy_injective_extension":
+            fingerprint["band_t0_per_angle"] = [float(v.item()) for v in self.band_t0_per_angle]
+            fingerprint["implementation_version"] = "legacy_injective_gap_v2"
+        return fingerprint
 
-    def _toeplitz_apply(self, r_fft: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        y_full = torch.fft.irfft(
-            torch.fft.rfft(x.to(torch.float32), n=self.conv_size, dim=1) * r_fft.unsqueeze(0),
-            n=self.conv_size,
-            dim=1,
-        )
-        return y_full[:, : self.N]
+    def _get_lower_bands(self, angle_idx: int) -> torch.Tensor:
+        angle_idx = int(angle_idx)
+        bw = int(self.lower_bandwidths[angle_idx].item())
+        return self.lower_bands[angle_idx, :bw, :]
 
-    def _toeplitz_adjoint_apply(self, r_fft: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        rev = torch.flip(x, dims=[1])
-        rev_y = self._toeplitz_apply(r_fft, rev)
-        return torch.flip(rev_y, dims=[1])
+    def _lower_apply(self, angle_idx: int, x: torch.Tensor) -> torch.Tensor:
+        return _lower_banded_apply(self._get_lower_bands(angle_idx), x)
+
+    def _lower_adjoint_apply(self, angle_idx: int, x: torch.Tensor) -> torch.Tensor:
+        return _lower_banded_adjoint_apply(self._get_lower_bands(angle_idx), x)
 
     def _permute_c_to_d(self, coeff_flat: torch.Tensor, angle_idx: int) -> torch.Tensor:
         return coeff_flat.index_select(1, self.d_to_lex_indices[int(angle_idx)])
@@ -1123,9 +1380,48 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
     def _permute_d_to_c(self, d_vector: torch.Tensor, angle_idx: int) -> torch.Tensor:
         return d_vector.gather(1, self.lex_to_d_indices[int(angle_idx)].view(1, -1).expand(d_vector.shape[0], -1))
 
-    def _split_kernel_np(self, angle_idx: int) -> np.ndarray:
-        support_len = _kernel_support_length(self.r_vectors[int(angle_idx)])
-        return self.r_vectors[int(angle_idx), :support_len].detach().to(dtype=torch.float64, device="cpu").numpy()
+    def _gram_context_signature(self, b: torch.Tensor) -> tuple[object, ...]:
+        return (
+            int(b.data_ptr()),
+            tuple(int(v) for v in b.shape),
+            str(b.device),
+            str(b.dtype),
+            int(getattr(b, "_version", 0)),
+        )
+
+    @torch.no_grad()
+    def _prepare_gram_context(self, b: torch.Tensor) -> dict[str, torch.Tensor]:
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.lower_bands.device)
+        signature = self._gram_context_signature(b)
+        if self._last_gram_context_signature == signature and self._last_gram_context is not None:
+            return self._last_gram_context
+
+        rhs = self.adjoint(b).view(b.shape[0], self.N)
+        eigvals, eigvecs = _ensure_implicit_gram_spectrum(
+            self,
+            self._morozov_cache_fingerprint(),
+        )
+        rhs_cpu = rhs.detach().to(dtype=torch.float32, device="cpu")
+        eigvecs_cpu = eigvecs.detach().to(dtype=torch.float32, device="cpu")
+        rhs_proj = rhs_cpu @ eigvecs_cpu
+        b_norm2 = torch.sum(b.detach().to(dtype=torch.float32, device="cpu").square(), dim=1)
+        context = {
+            "b": b,
+            "rhs": rhs,
+            "rhs_proj": rhs_proj,
+            "b_norm2": b_norm2,
+            "eigvals": eigvals,
+            "eigvecs": eigvecs,
+        }
+        self._last_gram_context_signature = signature
+        self._last_gram_context = context
+        return context
+
+    def _lower_ab_np(self, angle_idx: int) -> np.ndarray:
+        lower = self._get_lower_bands(angle_idx).detach().to(dtype=torch.float64, device="cpu").numpy()
+        return _trim_lower_banded_ab(lower)
 
     def _solve_single_lower_direct(self, angle_idx: int, rhs: torch.Tensor) -> torch.Tensor:
         _require_scipy_banded()
@@ -1133,10 +1429,9 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         if rhs.dim() == 1:
             rhs = rhs.unsqueeze(0)
         rhs_np = rhs.detach().to(dtype=torch.float64, device="cpu").numpy().T
-        kernel = self._split_kernel_np(angle_idx)
-        lower_ab = _build_lower_banded_ab_from_kernel(kernel, self.N)
-        solved = solve_banded((kernel.shape[0] - 1, 0), lower_ab, rhs_np, check_finite=False)
-        return torch.from_numpy(np.asarray(solved.T, dtype=np.float32)).to(device=self.r_vectors.device, dtype=torch.float32)
+        lower_ab = self._lower_ab_np(angle_idx)
+        solved = solve_banded((lower_ab.shape[0] - 1, 0), lower_ab, rhs_np, check_finite=False)
+        return torch.from_numpy(np.asarray(solved.T, dtype=np.float32)).to(device=self.lower_bands.device, dtype=torch.float32)
 
     def _get_split_linear_cache(self, angle_idx: int, rho: float, weight: float) -> dict[str, np.ndarray]:
         key = (int(angle_idx), round(float(rho), 12), round(float(weight), 12))
@@ -1144,13 +1439,13 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         if cached is not None:
             return cached
         _require_scipy_banded()
-        kernel = self._split_kernel_np(angle_idx)
-        upper_ab = _build_upper_normal_banded_from_kernel(kernel, self.N, rho=float(rho), weight=float(weight))
+        lower_ab = self._lower_ab_np(angle_idx)
+        upper_ab = _build_upper_normal_banded_from_lower_ab(lower_ab, rho=float(rho), weight=float(weight))
         chol = cholesky_banded(upper_ab, lower=False, check_finite=False)
         cached = {
-            "kernel": kernel,
+            "lower_ab": lower_ab,
             "chol": chol,
-            "bandwidth": np.asarray([kernel.shape[0]], dtype=np.int64),
+            "bandwidth": np.asarray([lower_ab.shape[0]], dtype=np.int64),
         }
         self._split_linear_cache[key] = cached
         return cached
@@ -1168,7 +1463,7 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
             rhs = rhs.unsqueeze(0)
         rhs_np = rhs.detach().to(dtype=torch.float64, device="cpu").numpy().T
         solved = cho_solve_banded((cache["chol"], False), rhs_np, check_finite=False)
-        return torch.from_numpy(np.asarray(solved.T, dtype=np.float32)).to(device=self.r_vectors.device, dtype=torch.float32)
+        return torch.from_numpy(np.asarray(solved.T, dtype=np.float32)).to(device=self.lower_bands.device, dtype=torch.float32)
 
     def split_measurements(self, g: torch.Tensor) -> torch.Tensor:
         if g.dim() == 3 and g.shape[1] == 1:
@@ -1182,14 +1477,12 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
     def forward_per_angle(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         if coeff_matrix.dim() == 3:
             coeff_matrix = coeff_matrix.unsqueeze(1)
-        coeff_matrix = coeff_matrix.to(dtype=torch.float32, device=self.r_vectors.device)
+        coeff_matrix = coeff_matrix.to(dtype=torch.float32, device=self.lower_bands.device)
         batch = int(coeff_matrix.shape[0])
         coeff_flat = coeff_matrix.view(batch, self.N)
-        outputs = []
-        for idx in range(self.num_angles):
-            d = coeff_flat.index_select(1, self.d_to_lex_indices[idx])
-            outputs.append(self._toeplitz_apply(self.r_fft[idx], d))
-        return torch.stack(outputs, dim=1)
+        gather_index = self.d_to_lex_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
+        d_all = coeff_flat.unsqueeze(1).expand(-1, self.num_angles, -1).gather(2, gather_index)
+        return _lower_banded_apply_batched(self.lower_bands, d_all)
 
     def forward(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.forward_per_angle(coeff_matrix).reshape(coeff_matrix.shape[0], self.M)
@@ -1201,14 +1494,12 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
             raise ValueError(
                 f"Expected residual_per_angle with shape (B,K,M_per_angle), got {tuple(residual_per_angle.shape)}"
             )
-        residual_per_angle = residual_per_angle.to(dtype=torch.float32, device=self.r_vectors.device)
+        residual_per_angle = residual_per_angle.to(dtype=torch.float32, device=self.lower_bands.device)
         batch = int(residual_per_angle.shape[0])
-        grads = []
-        for idx in range(self.num_angles):
-            grad_d = self._toeplitz_adjoint_apply(self.r_fft[idx], residual_per_angle[:, idx, :])
-            grad_c = grad_d.gather(1, self.lex_to_d_indices[idx].view(1, -1).expand(batch, -1))
-            grads.append(grad_c.view(batch, 1, self.height, self.width))
-        return torch.stack(grads, dim=1)
+        grad_d_all = _lower_banded_adjoint_apply_batched(self.lower_bands, residual_per_angle)
+        gather_index = self.lex_to_d_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
+        grad_c_all = grad_d_all.gather(2, gather_index)
+        return grad_c_all.view(batch, self.num_angles, 1, self.height, self.width)
 
     def adjoint(self, residual: torch.Tensor) -> torch.Tensor:
         residual_pa = self.split_measurements(residual)
@@ -1223,12 +1514,15 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         b: torch.Tensor,
         lambda_reg: float | torch.Tensor,
     ) -> torch.Tensor:
-        if b.dim() == 1:
-            b = b.unsqueeze(0)
-        rhs = self.adjoint(b.to(dtype=torch.float32, device=self.r_vectors.device)).view(b.shape[0], self.N)
-        eigvals, eigvecs = _ensure_implicit_gram_spectrum(self, self._morozov_cache_fingerprint())
-        coeff = _solve_tikhonov_from_gram_spectrum(rhs, eigvals=eigvals, eigvecs=eigvecs, lambda_reg=lambda_reg)
-        return coeff.to(device=self.r_vectors.device, dtype=torch.float32).view(-1, 1, self.height, self.width)
+        context = self._prepare_gram_context(b)
+        coeff = _solve_tikhonov_from_gram_spectrum(
+            context["rhs"],
+            eigvals=context["eigvals"],
+            eigvecs=context["eigvecs"],
+            lambda_reg=lambda_reg,
+            rhs_proj=context["rhs_proj"],
+        )
+        return coeff.to(device=self.lower_bands.device, dtype=torch.float32).view(-1, 1, self.height, self.width)
 
     @torch.no_grad()
     def solve_split_triangular_admm(
@@ -1246,20 +1540,20 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
     ) -> torch.Tensor:
         if b.dim() == 1:
             b = b.unsqueeze(0)
-        if int(self.num_angles) != 8:
+        if int(self.num_angles) <= 0:
             raise ValueError(
-                "split_triangular_admm requires exactly 8 backbone angles; "
+                "split_triangular_admm requires at least one theoretical angle; "
                 f"got {int(self.num_angles)}."
             )
 
         _require_scipy_banded()
         self.last_split_admm_stats = None
         batch = int(b.shape[0])
-        b = b.to(dtype=torch.float32, device=self.r_vectors.device)
+        b = b.to(dtype=torch.float32, device=self.lower_bands.device)
         g_backbone = self.split_measurements(b)  # (B,K,N)
         lam_batch = lambda_reg
         if torch.is_tensor(lam_batch):
-            lam = lam_batch.detach().to(dtype=torch.float32, device=self.r_vectors.device).view(-1)
+            lam = lam_batch.detach().to(dtype=torch.float32, device=self.lower_bands.device).view(-1)
             if int(lam.numel()) == 1 and batch > 1:
                 lam = lam.expand(batch)
             elif int(lam.numel()) != batch:
@@ -1267,15 +1561,24 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
                     f"lambda_reg has {int(lam.numel())} entries, expected 1 or batch={batch}."
                 )
         else:
-            lam = torch.full((batch,), float(lambda_reg), dtype=torch.float32, device=self.r_vectors.device)
+            lam = torch.full((batch,), float(lambda_reg), dtype=torch.float32, device=self.lower_bands.device)
 
         rho_eff = float(TIME_DOMAIN_CONFIG.get("split_admm_rho", 1.0) if rho is None else rho)
         max_iter_eff = int(TIME_DOMAIN_CONFIG.get("split_admm_max_iter", 20) if max_iter is None else max_iter)
         tol_eff = float(TIME_DOMAIN_CONFIG.get("split_admm_tol", 1.0e-4) if tol is None else tol)
+        progress_interval = max(int(TIME_DOMAIN_CONFIG.get("split_admm_progress_interval", 50)), 1)
+        progress_enabled = (not bool(getattr(self, "_split_progress_logged_once", False))) and max_iter_eff > 1
+        solve_started = time.perf_counter()
+        if progress_enabled:
+            print(
+                "[split_admm] start "
+                f"batch={batch} angles={int(self.num_angles)} max_iter={max_iter_eff} "
+                f"rho={rho_eff:.3g} tol={tol_eff:.3g}"
+            )
         if weights is None:
-            weight_vec = torch.ones((self.num_angles,), dtype=torch.float32, device=self.r_vectors.device)
+            weight_vec = torch.ones((self.num_angles,), dtype=torch.float32, device=self.lower_bands.device)
         else:
-            weight_vec = weights.detach().to(dtype=torch.float32, device=self.r_vectors.device).view(-1)
+            weight_vec = weights.detach().to(dtype=torch.float32, device=self.lower_bands.device).view(-1)
             if int(weight_vec.numel()) != int(self.num_angles):
                 raise ValueError(
                     f"weights has {int(weight_vec.numel())} entries, expected num_angles={int(self.num_angles)}."
@@ -1289,11 +1592,26 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
 
         d_stack = []
         for angle_idx in range(self.num_angles):
-            d_init = self._solve_single_lower_direct(angle_idx, g_backbone[:, angle_idx, :])
+            rhs_init = (
+                2.0
+                * float(weight_vec[angle_idx].item())
+                * self._lower_adjoint_apply(angle_idx, g_backbone[:, angle_idx, :])
+            )
+            d_init = self._solve_single_split_quadratic(
+                angle_idx,
+                rhs_init,
+                rho=rho_eff,
+                weight=float(weight_vec[angle_idx].item()),
+            )
             d_stack.append(d_init)
         d_stack = torch.stack(d_stack, dim=1)  # (B,K,N)
+        if progress_enabled:
+            print(
+                "[split_admm] quadratic warm start finished "
+                f"in {time.perf_counter() - solve_started:.2f}s"
+            )
 
-        c_flat = torch.zeros((batch, self.N), dtype=torch.float32, device=self.r_vectors.device)
+        c_flat = torch.zeros((batch, self.N), dtype=torch.float32, device=self.lower_bands.device)
         for angle_idx in range(self.num_angles):
             c_flat = c_flat + self._permute_d_to_c(d_stack[:, angle_idx, :], angle_idx)
         c_flat = c_flat / float(self.num_angles)
@@ -1314,7 +1632,7 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
                 rhs = (
                     2.0
                     * float(weight_vec[angle_idx].item())
-                    * self._toeplitz_adjoint_apply(self.r_fft[angle_idx], g_backbone[:, angle_idx, :])
+                    * self._lower_adjoint_apply(angle_idx, g_backbone[:, angle_idx, :])
                     + rho_eff * consensus
                 )
                 d_stack[:, angle_idx, :] = self._solve_single_split_quadratic(
@@ -1366,6 +1684,20 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
             primal_rel = primal_rel_batch.max().item()
             dual_rel = dual_rel_batch.max().item()
             iterations_run = int(iter_idx + 1)
+            if progress_enabled:
+                should_log_progress = (
+                    iterations_run == 1
+                    or iterations_run == max_iter_eff
+                    or (iterations_run % progress_interval) == 0
+                    or max(primal_rel, dual_rel) <= tol_eff
+                )
+                if should_log_progress:
+                    print(
+                        "[split_admm] iter "
+                        f"{iterations_run}/{max_iter_eff} "
+                        f"rel_primal={primal_rel:.3e} rel_dual={dual_rel:.3e} "
+                        f"elapsed={time.perf_counter() - solve_started:.2f}s"
+                    )
             if max(primal_rel, dual_rel) <= tol_eff:
                 converged = True
                 break
@@ -1383,6 +1715,15 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
             "used_extra_angles": False,
             "num_angles": int(self.num_angles),
         }
+        if progress_enabled:
+            print(
+                "[split_admm] done "
+                f"status={'converged' if converged else 'max_iter_reached'} "
+                f"iterations={iterations_run}/{max_iter_eff} "
+                f"rel_primal={primal_rel:.3e} rel_dual={dual_rel:.3e} "
+                f"total={time.perf_counter() - solve_started:.2f}s"
+            )
+            self._split_progress_logged_once = True
         return c_flat.view(-1, 1, self.height, self.width)
 
     @torch.no_grad()
@@ -1396,7 +1737,7 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         tol: Optional[float] = None,
     ) -> torch.Tensor:
         solver_mode = str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "split_triangular_admm")).strip().lower()
-        if solver_mode == "split_triangular_admm" and int(self.num_angles) == 8:
+        if solver_mode == "split_triangular_admm":
             return self.solve_split_triangular_admm(
                 b,
                 lambda_reg=lambda_reg,
@@ -1423,7 +1764,7 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
     ) -> torch.Tensor:
         if b.dim() == 1:
             b = b.unsqueeze(0)
-        b = b.to(dtype=torch.float32, device=self.r_vectors.device)
+        b = b.to(dtype=torch.float32, device=self.lower_bands.device)
         rhs = self.adjoint(b)
         if x0 is None:
             x = torch.zeros_like(rhs)
@@ -1470,20 +1811,18 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         lambda_min: float = 1e-12,
         lambda_max: float = 1e12,
     ) -> torch.Tensor:
-        if b.dim() == 1:
-            b = b.unsqueeze(0)
-        b = b.to(dtype=torch.float32, device=self.r_vectors.device)
-        rhs = self.adjoint(b).view(b.shape[0], self.N)
-        eigvals, eigvecs = _ensure_implicit_gram_spectrum(self, self._morozov_cache_fingerprint())
+        context = self._prepare_gram_context(b)
         settings = _morozov_settings(max_iter=max_iter, lambda_min=lambda_min, lambda_max=lambda_max)
         return _choose_lambda_morozov_from_gram_spectrum(
-            b=b,
-            rhs=rhs,
-            noise_norm=noise_norm.to(dtype=torch.float32, device=b.device),
-            eigvals=eigvals,
-            eigvecs=eigvecs,
+            b=context["b"],
+            rhs=context["rhs"],
+            noise_norm=noise_norm.to(dtype=torch.float32, device=context["b"].device),
+            eigvals=context["eigvals"],
+            eigvecs=context["eigvecs"],
             tau=float(tau),
             settings=settings,
+            rhs_proj=context["rhs_proj"],
+            b_norm2=context["b_norm2"],
         )
 
 
@@ -1819,8 +2158,19 @@ class StructuredMultiAngleB1B1Operator2D(torch.nn.Module):
         if solver_mode == "split_triangular_admm":
             g_backbone, _ = self._split_backbone_extra(b)
             noise_norm = noise_norm.to(dtype=torch.float32, device=b.device).view(-1)
-            scale = math.sqrt(float(self.num_backbone) / float(self.num_angles))
-            noise_norm_backbone = noise_norm * float(scale)
+            noise_mode = str(DATA_CONFIG.get("noise_mode", "multiplicative")).strip().lower()
+            if noise_mode == "multiplicative":
+                eps = float(1.0e-12)
+                total_energy = torch.norm(b.to(dtype=torch.float32).reshape(b.shape[0], -1), dim=1).clamp_min(eps)
+                bb_energy = torch.norm(
+                    g_backbone.to(dtype=torch.float32).reshape(g_backbone.shape[0], -1),
+                    dim=1,
+                )
+                scale = (bb_energy / total_energy).clamp(min=0.0, max=1.0)
+                noise_norm_backbone = noise_norm * scale
+            else:
+                scale = math.sqrt(float(self.num_backbone) / float(self.num_angles))
+                noise_norm_backbone = noise_norm * float(scale)
             return self.backbone_operator.choose_lambda_morozov(
                 g_backbone.reshape(g_backbone.shape[0], -1),
                 noise_norm=noise_norm_backbone,
@@ -2205,21 +2555,52 @@ def build_time_domain_operator(
         total_angles = int(TIME_DOMAIN_CONFIG.get("num_angles_total", TIME_DOMAIN_CONFIG.get("num_angles", len(backbone_betas))))
         t0 = float(TIME_DOMAIN_CONFIG.get("sampling_t0", 0.5))
         solver_mode = str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "stacked_tikhonov")).strip().lower()
-        formula_mode = _formula_mode_from_solver_mode(solver_mode)
+        formula_mode = _resolve_theoretical_formula_mode(
+            TIME_DOMAIN_CONFIG.get("theoretical_formula_mode", "auto"),
+            solver_mode,
+        )
         auto_shift_t0 = bool(TIME_DOMAIN_CONFIG.get("auto_angle_t0", True))
-        if use_multi:
+        layout = str(TIME_DOMAIN_CONFIG.get("multi_angle_layout", "structured_backbone_extra")).strip().lower()
+        if use_multi and layout == "structured_backbone_extra":
             _validate_multi_angle_backbone(
                 backbone_betas,
                 total_angles=total_angles,
             )
-        if use_multi and total_angles > len(backbone_betas):
-            extra_betas = _sample_uniform_extra_beta_vectors(
-                backbone_betas=backbone_betas,
-                extra_count=int(total_angles - len(backbone_betas)),
+        if use_multi and layout == "full_triangular":
+            if int(total_angles) != int(len(backbone_betas)):
+                raise ValueError(
+                    "full_triangular layout requires num_angles_total == len(beta_vectors); "
+                    f"got total_angles={int(total_angles)} and len(beta_vectors)={len(backbone_betas)}."
+                )
+            return TheoreticalB1B1Operator2D(
+                beta_vectors=backbone_betas,
                 height=int(height),
                 width=int(width),
-                seed=int(TIME_DOMAIN_CONFIG.get("extra_angle_seed", 20260322)),
-            )
+                t0=t0,
+                formula_mode=formula_mode,
+                auto_shift_t0=auto_shift_t0,
+            ).to(device)
+        if use_multi and total_angles > len(backbone_betas):
+            explicit_extra_betas = TIME_DOMAIN_CONFIG.get("explicit_extra_beta_vectors", None)
+            if explicit_extra_betas is not None:
+                extra_betas = [
+                    tuple(int(v) for v in _to_integer_beta(beta_i).tolist())
+                    for beta_i in list(explicit_extra_betas)
+                ]
+                expected_extra = int(total_angles - len(backbone_betas))
+                if len(extra_betas) != expected_extra:
+                    raise ValueError(
+                        "explicit_extra_beta_vectors length must match total_angles - num_backbone; "
+                        f"got {len(extra_betas)} extra angles, expected {expected_extra}."
+                    )
+            else:
+                extra_betas = _sample_uniform_extra_beta_vectors(
+                    backbone_betas=backbone_betas,
+                    extra_count=int(total_angles - len(backbone_betas)),
+                    height=int(height),
+                    width=int(width),
+                    seed=int(TIME_DOMAIN_CONFIG.get("extra_angle_seed", 20260322)),
+                )
             return StructuredMultiAngleB1B1Operator2D(
                 backbone_beta_vectors=backbone_betas,
                 extra_beta_vectors=extra_betas,
@@ -2229,7 +2610,7 @@ def build_time_domain_operator(
                 formula_mode=formula_mode,
                 auto_shift_t0=auto_shift_t0,
             ).to(device)
-        active_betas = backbone_betas if use_multi else backbone_betas
+        active_betas = backbone_betas
         return TheoreticalB1B1Operator2D(
             beta_vectors=active_betas,
             height=int(height),
@@ -2316,12 +2697,28 @@ class TheoreticalDataGenerator:
             height=self.img_size,
             width=self.img_size,
         )
+        self.feature_time_operator = None
+        feature_beta_vectors = TIME_DOMAIN_CONFIG.get("cnn_feature_beta_vectors_override", None)
+        if feature_beta_vectors:
+            feature_beta_vectors = [tuple(int(v) for v in beta) for beta in list(feature_beta_vectors)]
+            self.feature_time_operator = TheoreticalB1B1Operator2D(
+                beta_vectors=feature_beta_vectors,
+                height=self.img_size,
+                width=self.img_size,
+                t0=float(TIME_DOMAIN_CONFIG.get("sampling_t0", 0.5)),
+                formula_mode=_resolve_theoretical_formula_mode(
+                    TIME_DOMAIN_CONFIG.get("theoretical_formula_mode", "auto"),
+                    str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "stacked_tikhonov")).strip().lower(),
+                ),
+                auto_shift_t0=bool(TIME_DOMAIN_CONFIG.get("auto_angle_t0", True)),
+            ).to(device)
         self.M = int(getattr(self.time_operator, "M", int(TIME_DOMAIN_CONFIG.get("num_detector_samples", self.N))))
         self.flatten_order = getattr(self.time_operator, "flatten_order", None)
         self.last_lambda: Optional[float | torch.Tensor] = None
         self._chol_lambda: Optional[float] = None
         self._chol_factor: Optional[torch.Tensor] = None
         self._ata_factor: Optional[torch.Tensor] = None
+        self._first_batch_progress_logged = False
 
     def _normalize_lambda_reg(
         self,
@@ -2558,8 +2955,11 @@ class TheoreticalDataGenerator:
         with torch.no_grad():
             g_clean = self.forward_operator(coeff_true).to(torch.float32)
             g_observed = self._apply_noise(g_clean)
-
             observed = g_observed
+            if self.feature_time_operator is not None:
+                g_feature_clean = self.feature_time_operator.forward(coeff_true).to(torch.float32)
+                g_feature_observed = self._apply_noise(g_feature_clean)
+                observed = torch.cat([observed, g_feature_observed], dim=-1)
 
         # Coefficient init (feeds the learned iterative optimizer).
         if lambda_reg is not None:
@@ -2574,9 +2974,9 @@ class TheoreticalDataGenerator:
                 max_iter = int(DATA_CONFIG.get("morozov_max_iter", 40))
                 lam_min = float(DATA_CONFIG.get("morozov_lambda_min", 1.0e-12))
                 lam_max = float(DATA_CONFIG.get("morozov_lambda_max", 1.0e12))
-                noise_norm = torch.norm(observed - g_clean, dim=-1)  # (B,)
+                noise_norm = torch.norm(g_observed - g_clean, dim=-1)  # (B,)
                 lam = self.time_operator.choose_lambda_morozov(
-                    observed,
+                    g_observed,
                     noise_norm=noise_norm,
                     tau=tau,
                     max_iter=max_iter,
@@ -2591,10 +2991,10 @@ class TheoreticalDataGenerator:
         init_cg_iters = int(TIME_DOMAIN_CONFIG.get("init_cg_iters", 0))
 
         if init_method == "tikhonov_direct":
-            coeff_initial = self._tikhonov_direct_init(observed, lambda_reg=lambda_eff)
+            coeff_initial = self._tikhonov_direct_init(g_observed, lambda_reg=lambda_eff)
         elif init_method == "cg" and init_cg_iters > 0:
             coeff_initial = self._tikhonov_cg_init(
-                observed,
+                g_observed,
                 lambda_reg=lambda_eff,
                 max_iter=init_cg_iters,
             )
@@ -2616,6 +3016,23 @@ class TheoreticalDataGenerator:
             torch.manual_seed(random_seed)
             np.random.seed(random_seed)
 
+        batch_started = time.perf_counter()
+        init_method = str(TIME_DOMAIN_CONFIG.get("init_method", "cg")).strip().lower()
+        solver_mode = str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "split_triangular_admm")).strip().lower()
+        lambda_mode = "provided" if lambda_reg is not None else str(DATA_CONFIG.get("lambda_select_mode", "fixed")).strip().lower()
+        progress_enabled = (
+            (not self._first_batch_progress_logged)
+            and init_method == "tikhonov_direct"
+            and solver_mode == "split_triangular_admm"
+        )
+        if progress_enabled:
+            print(
+                "[init] first batch start "
+                f"batch_size={int(batch_size)} angles={int(getattr(self.time_operator, 'num_angles', 1) or 1)} "
+                f"lambda_mode={lambda_mode} init_method={init_method} "
+                f"split_admm_max_iter={int(TIME_DOMAIN_CONFIG.get('split_admm_max_iter', 0))}"
+            )
+
         # 1. Sample coefficients: (B,1,H,W)
         coeff_true = self._sample_coefficients(batch_size)
 
@@ -2628,6 +3045,11 @@ class TheoreticalDataGenerator:
 
             # 4. Add noise
             g_observed = self._apply_noise(g_clean)
+            g_observed_full = g_observed
+            if self.feature_time_operator is not None:
+                g_feature_clean = self.feature_time_operator.forward(coeff_true).to(torch.float32)
+                g_feature_observed = self._apply_noise(g_feature_clean)
+                g_observed_full = torch.cat([g_observed, g_feature_observed], dim=-1)
 
         # 5. Coefficient init
         if lambda_reg is not None:
@@ -2638,13 +3060,14 @@ class TheoreticalDataGenerator:
                 target_device=g_observed.device,
             )
         else:
-            mode = str(DATA_CONFIG.get("lambda_select_mode", "fixed")).strip().lower()
+            mode = lambda_mode
             if mode == "morozov":
                 tau = float(DATA_CONFIG.get("morozov_tau", 1.0))
                 max_iter = int(DATA_CONFIG.get("morozov_max_iter", 40))
                 lam_min = float(DATA_CONFIG.get("morozov_lambda_min", 1.0e-12))
                 lam_max = float(DATA_CONFIG.get("morozov_lambda_max", 1.0e12))
                 noise_norm = torch.norm(g_observed - g_clean, dim=-1)
+                lambda_started = time.perf_counter()
                 lam = self.time_operator.choose_lambda_morozov(
                     g_observed,
                     noise_norm=noise_norm,
@@ -2653,14 +3076,18 @@ class TheoreticalDataGenerator:
                     lambda_min=lam_min,
                     lambda_max=lam_max,
                 )
+                if progress_enabled:
+                    print(
+                        "[init] Morozov lambda selection finished "
+                        f"in {time.perf_counter() - lambda_started:.2f}s"
+                    )
                 lambda_eff = lam.to(dtype=torch.float32, device=g_observed.device)
             else:
                 lambda_eff = float(DATA_CONFIG.get("lambda_reg", 1e-2))
         self.last_lambda = lambda_eff
-
-        init_method = str(TIME_DOMAIN_CONFIG.get("init_method", "cg")).strip().lower()
         init_cg_iters = int(TIME_DOMAIN_CONFIG.get("init_cg_iters", 0))
 
+        coeff_init_started = time.perf_counter()
         if init_method == "tikhonov_direct":
             coeff_initial = self._tikhonov_direct_init(g_observed, lambda_reg=lambda_eff)
         elif init_method == "cg" and init_cg_iters > 0:
@@ -2671,6 +3098,13 @@ class TheoreticalDataGenerator:
             raise ValueError(
                 f"Unsupported init_method={init_method!r}; expected 'cg' or 'tikhonov_direct'."
             )
+        if progress_enabled:
+            print(
+                "[init] coefficient init finished "
+                f"in {time.perf_counter() - coeff_init_started:.2f}s"
+            )
+            print(f"[init] first batch ready in {time.perf_counter() - batch_started:.2f}s")
+            self._first_batch_progress_logged = True
 
         # coeff_true: (B,1,H,W), f_true: (B,1,H,W), g_observed: (B,M), coeff_initial: (B,1,H,W)
-        return coeff_true, f_true, g_observed, coeff_initial
+        return coeff_true, f_true, g_observed_full, coeff_initial
