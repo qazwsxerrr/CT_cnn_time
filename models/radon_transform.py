@@ -518,6 +518,17 @@ def _effective_angle_t0(alpha: torch.Tensor, beta_norm: float, base_t0: float, a
     return float(support_lo * float(beta_norm) + float(base_t0))
 
 
+def _beta_support_bounds_b1b1(beta: torch.Tensor) -> tuple[float, float]:
+    """Return the exact beta-domain support [A_beta, B_beta] for phi=B1(x)B1(y)."""
+    beta = beta.to(torch.int64).view(-1)
+    if int(beta.numel()) != 2:
+        raise ValueError(f"beta must have shape (2,), got {tuple(beta.shape)}")
+    b1 = int(beta[0].item())
+    b2 = int(beta[1].item())
+    vals = [0, b1, b2, b1 + b2]
+    return float(min(vals)), float(max(vals))
+
+
 def _formula_mode_from_solver_mode(solver_mode: str) -> str:
     solver_mode = str(solver_mode).strip().lower()
     if solver_mode == "stacked_tikhonov":
@@ -833,25 +844,31 @@ def _theoretical_b1b1_block(
 
     sorted_proj = uniq_sorted.to(torch.int64)
     kappa0 = int(sorted_proj[0].item())
-    support_lo, support_hi = phi_support_bounds_b1b1(alpha)
-    support_hi_beta = float(support_hi * beta_norm)
+    support_lo_beta_exact, support_hi_beta_exact = _beta_support_bounds_b1b1(beta_i)
+    support_hi_beta = float(support_hi_beta_exact)
     formula_mode = str(formula_mode).strip().lower()
     if formula_mode == "legacy":
         effective_t0 = float(t0) - float(kappa0)
         band_t0 = float(effective_t0)
+        support_lo_beta = float(support_lo_beta_exact)
+        theory_t0_abs = float(kappa0 + effective_t0)
     elif formula_mode == "shifted_support":
         effective_t0 = _effective_angle_t0(alpha, beta_norm=beta_norm, base_t0=float(t0), auto_shift=auto_shift_t0)
         band_t0 = float(effective_t0)
+        support_lo_beta = float(support_lo_beta_exact)
+        theory_t0_abs = float(kappa0 + effective_t0)
     elif formula_mode == "legacy_injective_extension":
-        # New injective extension: work in the reordered support coordinate
-        # n'_i = n_i - n_0 and sample at s_i = n'_i + t0.  Therefore each
-        # lower-band entry depends on the relative sorted-projection gap
+        # Old gap_v2-style injective extension: work in the reordered support
+        # coordinate n'_i = n_i - n_0 and sample at s_i = n'_i + t0. Therefore
+        # each lower-band entry depends on the relative sorted-projection gap
         # n_{j+offset} - n_j, not on the absolute origin shift -kappa0.
         #
         # Keep effective_t0/sampling_points in the original beta·k coordinate
-        # for metadata compatibility, but construct lower_bands with band_t0.
+        # for metadata compatibility, but construct lower_bands with band_t0=t0.
+        support_lo_beta = float(support_lo_beta_exact)
         effective_t0 = float(t0) - float(kappa0)
         band_t0 = float(t0)
+        theory_t0_abs = float(kappa0 + effective_t0)
     else:
         raise ValueError(
             f"Unknown B1*B1 formula_mode={formula_mode!r}; expected 'legacy', "
@@ -888,6 +905,8 @@ def _theoretical_b1b1_block(
         "kappa0": torch.tensor(kappa0, dtype=torch.int64),
         "effective_t0": torch.tensor(float(effective_t0), dtype=torch.float64),
         "band_t0": torch.tensor(float(band_t0), dtype=torch.float64),
+        "support_lo_beta": torch.tensor(float(support_lo_beta), dtype=torch.float64),
+        "theory_t0_abs": torch.tensor(float(theory_t0_abs), dtype=torch.float64),
     }
 
 # Provide discrete forward/adjoint Jacobian products explicitly so training does
@@ -1314,6 +1333,8 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
             kappa0 = torch.stack([blk["kappa0"] for blk in blocks], dim=0).to(dtype=torch.int64, device=device)
             effective_t0 = torch.stack([blk["effective_t0"] for blk in blocks], dim=0).to(dtype=torch.float32, device=device)
             band_t0 = torch.stack([blk["band_t0"] for blk in blocks], dim=0).to(dtype=torch.float32, device=device)
+            support_lo_beta = torch.stack([blk["support_lo_beta"] for blk in blocks], dim=0).to(dtype=torch.float32, device=device)
+            theory_t0_abs = torch.stack([blk["theory_t0_abs"] for blk in blocks], dim=0).to(dtype=torch.float32, device=device)
             sampling_points_pa = torch.stack([blk["sampling_points"] for blk in blocks], dim=0).to(
                 dtype=torch.float32, device=device
             )
@@ -1329,6 +1350,8 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         self.register_buffer("kappa0_per_angle", kappa0)
         self.register_buffer("effective_t0_per_angle", effective_t0)
         self.register_buffer("band_t0_per_angle", band_t0)
+        self.register_buffer("support_lo_beta_per_angle", support_lo_beta)
+        self.register_buffer("theory_t0_abs_per_angle", theory_t0_abs)
         self.register_buffer("sampling_points_per_angle", sampling_points_pa)
         self.register_buffer("sampling_points", sampling_points_pa.reshape(-1))
         self._morozov_gram_eigvals: Optional[torch.Tensor] = None
