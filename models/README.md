@@ -26,6 +26,9 @@
 - 条件数与采样方案分析：
   - `compare_legacyext_sampling_condition_numbers.py`
   - `plot_beta_k_equals_t_unit_square_compare.py`
+- 结果目录中的补充对比实验脚本：
+  - `results/100 angle/run_100_angle_tikhonov_compare_uniform.py`
+  - `results/100 angle/run_16_angle_gap_v2_vs_sampling_tikhonov_admm600.py`
 
 ## 关键文件
 
@@ -66,6 +69,20 @@
 - [plot_beta_k_equals_t_unit_square_compare.py](/D:/ai_code/ai_project/ct_time/models/plot_beta_k_equals_t_unit_square_compare.py)
   - 画出 `beta·k=t` 在线族与单位正方形中的几何示意
   - 用于解释 `t=0.5` 与 `t=A_beta+0.5` 两类采样规则差异
+
+- `results/100 angle/run_100_angle_tikhonov_compare_uniform.py`
+  - 纯 Tikhonov 多方法对比脚本
+  - 包含：
+    - 固定 8 + 92 随机的 `stacked_tikhonov`
+    - 固定 8 + 92 随机的 `split_triangular_admm`
+    - 纯随机 100 角 `implicit + direct`
+
+- `results/100 angle/run_16_angle_gap_v2_vs_sampling_tikhonov_admm600.py`
+  - 针对 `injective16_pi_best` 的 16 角对比脚本
+  - 比较：
+    - `gap_v2`
+    - `sampling`
+  - 两边都使用 `Morozov + solve_tikhonov_direct + split_triangular_admm`
 
 ## 实验 profile 概览
 
@@ -248,6 +265,31 @@ $env:EXPERIMENT_PROFILE_OVERRIDE = "injective16_pi_best"
 默认输出：
 
 - `D:\ai_code\ai_project\ct_time\models\beta_k_equals_t_unit_square_compare.svg`
+
+### 纯 Tikhonov 多方法对比脚本
+
+```powershell
+& "D:\python_code\anaconda_mini\envs\pytorch_env\python.exe" "D:\ai_code\ai_project\ct_time\results\100 angle\run_100_angle_tikhonov_compare_uniform.py"
+```
+
+该脚本用于比较多角度 Tikhonov 初始化/求解的不同方案，核心包括：
+
+- `fixed8_plus_random92_stacked`
+- `fixed8_plus_random92_split`
+- `random100_implicit_direct`
+
+### 16 角 gap_v2 vs sampling 的 Tikhonov/ADMM 对比脚本
+
+```powershell
+& "D:\python_code\anaconda_mini\envs\pytorch_env\python.exe" "D:\ai_code\ai_project\ct_time\results\100 angle\run_16_angle_gap_v2_vs_sampling_tikhonov_admm600.py"
+```
+
+该脚本用于生成 `injective16_pi_best` 上：
+
+- `gap_v2`
+- `sampling`
+
+两种构造在 `Morozov + solve_tikhonov_direct + split_triangular_admm` 下的对比结果。
 
 ### 与旧的 8特定+8随机 对比
 
