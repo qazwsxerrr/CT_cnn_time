@@ -282,10 +282,14 @@ class LearnedGradientDescent(nn.Module):
                 f"Invalid raw CNN angle channel count {self.raw_cnn_num_angles}; "
                 f"expected a value in [1, {self.learned_num_angles}]."
             )
-        if self.learned_num_angles <= 0 or self.learned_num_angles > self.num_angles:
+        # When cnn_feature_beta_vectors_override is provided, the learned
+        # data-fidelity stream is intentionally allowed to use a separate
+        # feature operator with more angles than the physical operator used by
+        # Dual/Tikhonov initialization.
+        if self.learned_num_angles <= 0:
             raise ValueError(
                 f"Invalid learned gradient angle count {self.learned_num_angles}; "
-                f"expected a value in [1, {self.num_angles}]."
+                "expected a positive value."
             )
         self.angle_adapter_enabled = bool(TIME_DOMAIN_CONFIG.get("cnn_angle_adapter_enabled", False))
         self.angle_adapter_mode = str(TIME_DOMAIN_CONFIG.get("cnn_angle_adapter_mode", "disabled")).strip().lower()
@@ -525,6 +529,10 @@ class LearnedGradientDescent(nn.Module):
             data_grad, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(
                 coeff_current, g_observed_learned, return_per_angle=True
             )
+            if bool(DATA_CONFIG.get("zero_data_grad_channels", False)):
+                data_grad = torch.zeros_like(data_grad)
+                if data_grad_pa is not None:
+                    data_grad_pa = torch.zeros_like(data_grad_pa)
 
             if self.detach_physical_grads:
                 data_grad = data_grad.detach()

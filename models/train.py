@@ -10,6 +10,59 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+
+def _apply_default_train_preset():
+    """Default train.py to the current single-angle Dual init experiment.
+
+    Explicit environment variables still win.  Set
+    TRAIN_PRESET_OVERRIDE=none to recover the raw config.py defaults.
+    """
+    preset = str(os.environ.get("TRAIN_PRESET_OVERRIDE", "dual_init_single_angle_NtN")).strip().lower()
+    if preset in {"", "none", "default", "raw_config"}:
+        return
+    if preset not in {"dual_init_single_angle_ntn", "dual_init_single_angle_nt_n"}:
+        raise ValueError(
+            f"Unsupported TRAIN_PRESET_OVERRIDE={preset!r}; expected "
+            "'dual_init_single_angle_NtN' or 'none'."
+        )
+
+    defaults = {
+        # Single-angle physical / learned data stream.
+        "EXPERIMENT_PROFILE_OVERRIDE": "default",
+        "BETA_VECTORS_OVERRIDE": "1,128",
+        "NUM_ANGLES_TOTAL_OVERRIDE": "1",
+        "MULTI_ANGLE_LAYOUT_OVERRIDE": "full_triangular",
+        "CNN_NUM_ANGLES_OVERRIDE": "1",
+        "CNN_ANGLE_INDICES_OVERRIDE": "0",
+        # Replace Tikhonov initialization by the current best Dual-frequency init.
+        "INIT_METHOD_OVERRIDE": "dual_frequency",
+        # 30dB SNR experiment.
+        "NOISE_MODE_OVERRIDE": "snr",
+        "TARGET_SNR_DB_OVERRIDE": "30",
+        # Current Nt=N best Dual configuration.
+        "DUAL_TIME_NUM_SAMPLES_OVERRIDE": "16384",
+        "DUAL_NUM_FREQUENCY_SAMPLES_OVERRIDE": "196608",
+        "DUAL_INTEGRAL_ALIAS_TRUNCATION_OVERRIDE": "1",
+        "DUAL_GRAMIAN_TRUNCATION_L_OVERRIDE": "1",
+        "DUAL_TIME_RECOVERY_MODE_OVERRIDE": "direct_ck",
+        "DUAL_TIME_SAMPLING_INTERVAL_MODE_OVERRIDE": "beta_support_midpoint",
+        "DUAL_TIME_FOURIER_QUADRATURE_OVERRIDE": "midpoint_cell",
+        "DUAL_TIME_ALIAS_ESTIMATOR_TRUNCATION_OVERRIDE": "1",
+        "DUAL_DIRECT_CK_GRAMIAN_MASK_QUANTILE_OVERRIDE": "0.02",
+        "DUAL_DIRECT_CK_MASK_MODE_OVERRIDE": "hard",
+        "DUAL_DIRECT_CK_WEIGHT_NORM_OVERRIDE": "none",
+        "DUAL_DIRECT_CK_LAMBDA_REL_OVERRIDE": "4e-5",
+        "DUAL_DIRECT_CK_STABILITY_MODE_OVERRIDE": "alias_consistency",
+        "DUAL_DIRECT_CK_ALIAS_TAU_OVERRIDE": "0.07",
+        "DUAL_DIRECT_CK_ALIAS_MODE_OVERRIDE": "soft",
+        "OUTPUT_TAG_OVERRIDE": "dual_init_single_angle_NtN",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+
+_apply_default_train_preset()
+
 from model import (
     initialize_model,
     count_parameters,
@@ -152,11 +205,43 @@ class TheoreticalTrainer:
             "cnn_angle_adapter_enabled": bool(getattr(self.model.optimizer, "angle_feature_adapter", None) is not None),
             "cnn_angle_adapter_mode": str(getattr(self.model.optimizer, "angle_adapter_mode", "disabled")),
             "cnn_angle_adapter_hidden_channels": int(getattr(self.model.optimizer, "angle_adapter_hidden_channels", 0) or 0),
+            "init_method": str(TIME_DOMAIN_CONFIG.get("init_method", "cg")),
+            "cnn_angle_indices_override": (
+                [int(idx) for idx in list(TIME_DOMAIN_CONFIG.get("cnn_angle_indices_override") or [])]
+                if TIME_DOMAIN_CONFIG.get("cnn_angle_indices_override", None) is not None
+                else None
+            ),
+            "cnn_feature_beta_vectors_override": [
+                list(beta)
+                for beta in list(TIME_DOMAIN_CONFIG.get("cnn_feature_beta_vectors_override", []) or [])
+            ],
             "beta_vectors": beta_vectors,
             "explicit_extra_beta_vectors": [
                 list(beta)
                 for beta in list(TIME_DOMAIN_CONFIG.get("explicit_extra_beta_vectors", []) or [])
             ],
+            "data_config": {
+                "noise_mode": str(DATA_CONFIG.get("noise_mode", "additive")),
+                "noise_level": float(DATA_CONFIG.get("noise_level", 0.1)),
+                "target_snr_db": float(DATA_CONFIG.get("target_snr_db", 30.0)),
+                "dual_noise_domain": str(DATA_CONFIG.get("dual_noise_domain", "spectral_samples")),
+                "dual_time_num_samples": int(DATA_CONFIG.get("dual_time_num_samples", 0)),
+                "dual_num_frequency_samples": int(DATA_CONFIG.get("dual_num_frequency_samples", 0)),
+                "dual_integral_alias_truncation": int(DATA_CONFIG.get("dual_integral_alias_truncation", 0)),
+                "dual_gramian_truncation_L": int(DATA_CONFIG.get("dual_gramian_truncation_L", 0)),
+                "dual_time_alias_estimator_truncation": int(DATA_CONFIG.get("dual_time_alias_estimator_truncation", 0)),
+                "dual_time_recovery_mode": str(DATA_CONFIG.get("dual_time_recovery_mode", "")),
+                "dual_time_sampling_interval_mode": str(DATA_CONFIG.get("dual_time_sampling_interval_mode", "")),
+                "dual_time_fourier_quadrature": str(DATA_CONFIG.get("dual_time_fourier_quadrature", "")),
+                "dual_direct_ck_gramian_mask_quantile": float(DATA_CONFIG.get("dual_direct_ck_gramian_mask_quantile", 0.0)),
+                "dual_direct_ck_mask_mode": str(DATA_CONFIG.get("dual_direct_ck_mask_mode", "")),
+                "dual_direct_ck_weight_norm": str(DATA_CONFIG.get("dual_direct_ck_weight_norm", "")),
+                "dual_direct_ck_lambda_rel": float(DATA_CONFIG.get("dual_direct_ck_lambda_rel", 0.0)),
+                "dual_direct_ck_stability_mode": str(DATA_CONFIG.get("dual_direct_ck_stability_mode", "")),
+                "dual_direct_ck_alias_tau": float(DATA_CONFIG.get("dual_direct_ck_alias_tau", 0.0)),
+                "dual_direct_ck_alias_mode": str(DATA_CONFIG.get("dual_direct_ck_alias_mode", "")),
+                "zero_data_grad_channels": bool(DATA_CONFIG.get("zero_data_grad_channels", False)),
+            },
         }
 
     def _setup_logging(self):

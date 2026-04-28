@@ -126,6 +126,7 @@ def _temporary_experiment_config(experiment_metadata: dict):
         return
 
     backup = copy.deepcopy(TIME_DOMAIN_CONFIG)
+    data_backup = copy.deepcopy(DATA_CONFIG)
     beta_vectors = [
         tuple(int(v) for v in beta)
         for beta in experiment_metadata.get("beta_vectors", [])
@@ -160,6 +161,21 @@ def _temporary_experiment_config(experiment_metadata: dict):
                 TIME_DOMAIN_CONFIG["num_angles_total"] = int(len(beta_vectors))
         if "cnn_backbone_only" in experiment_metadata:
             TIME_DOMAIN_CONFIG["cnn_backbone_only"] = bool(experiment_metadata["cnn_backbone_only"])
+        if "init_method" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["init_method"] = str(experiment_metadata["init_method"])
+        if "cnn_feature_beta_vectors_override" in experiment_metadata:
+            feature_betas = [
+                tuple(int(v) for v in beta)
+                for beta in list(experiment_metadata.get("cnn_feature_beta_vectors_override", []) or [])
+            ]
+            TIME_DOMAIN_CONFIG["cnn_feature_beta_vectors_override"] = feature_betas or None
+        if "cnn_angle_indices_override" in experiment_metadata:
+            raw_indices = experiment_metadata.get("cnn_angle_indices_override", None)
+            TIME_DOMAIN_CONFIG["cnn_angle_indices_override"] = (
+                [int(idx) for idx in list(raw_indices)]
+                if raw_indices is not None
+                else None
+            )
         if "learned_num_angles" in experiment_metadata:
             learned_num_angles = int(experiment_metadata["learned_num_angles"])
             TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
@@ -191,10 +207,16 @@ def _temporary_experiment_config(experiment_metadata: dict):
             adapter_output_channels = int(experiment_metadata["cnn_num_angles"])
             if adapter_output_channels > 0:
                 TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = adapter_output_channels
+        if "data_config" in experiment_metadata and isinstance(experiment_metadata["data_config"], dict):
+            for key, value in experiment_metadata["data_config"].items():
+                if key in DATA_CONFIG:
+                    DATA_CONFIG[key] = value
         yield
     finally:
         TIME_DOMAIN_CONFIG.clear()
         TIME_DOMAIN_CONFIG.update(backup)
+        DATA_CONFIG.clear()
+        DATA_CONFIG.update(data_backup)
 
 
 def evaluate(

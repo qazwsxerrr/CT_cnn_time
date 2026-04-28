@@ -266,6 +266,34 @@ $env:EXPERIMENT_PROFILE_OVERRIDE = "injective16_pi_best"
 
 - `D:\ai_code\ai_project\ct_time\models\beta_k_equals_t_unit_square_compare.svg`
 
+### Shepp-Logan 单角 True / Dual / Tikhonov 1×3 对比图
+
+在当前仓库的 `models/` 目录下运行：
+
+```powershell
+& "D:\python_code\anaconda_mini\envs\pytorch_env\python.exe" ".\shepp_logan_dual_tikhonov_triptych.py" --noise_mode snr --target_snr_db 30 --P 65537 --Q 64 --L 8
+```
+
+该脚本会固定使用 `shepp_logan`，生成一张 1 行 3 列对比图：
+
+1. `True`
+2. `Dual Frequency`
+3. `Tikhonov`
+
+常用参数：
+
+- `--noise_mode multiplicative|snr`
+- `--delta 0.1`
+- `--target_snr_db 30`
+- `--P 65537`
+- `--Q 64`
+- `--L 8`
+- `--output <path>`
+
+默认输出文件名格式：
+
+- `shepp_logan_true_dual_tikhonov_<noise>_P_<P>_Q_<Q>_L_<L>.png`
+
 ### 纯 Tikhonov 多方法对比脚本
 
 ```powershell

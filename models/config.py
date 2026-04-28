@@ -388,6 +388,86 @@ DATA_CONFIG = {
     "implicit_eval_lambda_min": 1.0e-02,
     "implicit_eval_cg_iters": 80,
     "implicit_eval_cg_tol": 1.0e-4,
+    # Frequency-domain dual-frame recovery defaults (single-angle v2):
+    # Use a periodic base grid xi_j = -pi + 2*pi*j/P on the principal cell and
+    # include a small number of neighboring 2*pi-shifted cells in the outer
+    # frequency integral.  The actual sampled frequency count is therefore
+    # P * (2 * dual_integral_alias_truncation + 1).
+    #
+    # Empirically for the single-angle beta=(1,128) test:
+    # - P = 8N is still slightly under-resolved in the no-noise roundtrip;
+    # - P = 12N with one alias layer on each side already brings the relative
+    #   roundtrip error below 1e-2 while keeping the total sample count moderate.
+    "dual_xi_grid": "uniform_periodic",
+    # Optional principal-cell phase shift:
+    # xi_j = -pi + dual_xi_phase_shift + 2*pi*j/P.
+    # This is used to avoid "bad" resonance points on the unshifted grid.
+    "dual_xi_phase_shift": 0.0,
+    "dual_num_frequency_samples": 12 * IMAGE_SIZE * IMAGE_SIZE,
+    "dual_integral_alias_truncation": 1,
+    "dual_gramian_truncation_L": 8,
+    # Chunk size used by the direct exponential backend that supports P < N.
+    # The direct backend avoids FFT aliasing but costs O(NP), so we keep the
+    # working set bounded by processing the exponential sums in chunks.
+    "dual_direct_chunk_size": 512,
+    # Time-domain front-end for Dual Frequency:
+    # - keep the current single-angle theorem-grid interval as the reference
+    #   time window;
+    # - rebuild a dense uniform grid on that same interval with N_t points;
+    # - evaluate only a small low-alias subset |q| <= dual_time_alias_estimator_truncation
+    #   by discrete Fourier summation;
+    # - when dual_time_recovery_mode == "gls_low_alias", use the induced
+    #   alias-block covariance to form a GLS estimate of the shared periodic
+    #   factor on the principal cell, then synthesize the requested alias blocks;
+    # - when dual_time_recovery_mode == "simple_ratio", keep the legacy
+    #   unweighted ratio estimator;
+    # - when dual_time_recovery_mode == "direct_ck", keep the full time-to-frequency
+    #   alias samples and insert them directly into the c_k discretized integral.
+    "dual_time_num_samples": IMAGE_SIZE * IMAGE_SIZE,
+    "dual_time_forward_chunk_size": 512,
+    "dual_time_fourier_chunk_size": 512,
+    # Quadrature used by the time-domain Fourier integral:
+    # - "rectangle": legacy Delta_t * sum_r g(t_r) exp(-i xi t_r);
+    # - "midpoint_cell": exact integral of piecewise-constant midpoint cells,
+    #   i.e. the rectangle rule multiplied by sinc(xi * Delta_t / 2).
+    "dual_time_fourier_quadrature": "rectangle",
+    # Time grid used before converting time-domain Radon samples to frequency samples:
+    # - "theorem_grid": legacy interval inherited from the B1*B1 theorem grid;
+    # - "beta_support_midpoint": midpoint rule on the full R_beta f support interval.
+    "dual_time_sampling_interval_mode": "theorem_grid",
+    "dual_time_recovery_mode": "gls_low_alias",
+    "dual_time_alias_estimator_truncation": 1,
+    "dual_time_gls_covariance_ridge_rel": 1.0e-10,
+    # For the current single-angle beta=(1,128) time-domain SNR experiments,
+    # a relative GLS denominator floor around 1e-3 is substantially more stable
+    # than the previous near-zero default 1e-6.
+    "dual_time_gls_lambda_rel": 1.0e-3,
+    # Additional reliability-aware suppression on the recovered principal-cell
+    # common factor. The threshold is relative to max_j h_j^* Sigma^{-1} h_j
+    # (or its simple-ratio counterpart when not using GLS).
+    "dual_time_frequency_mask_rel": 0.0,
+    "dual_time_frequency_mask_mode": "soft",
+    # direct_ck-only controls.  gramian_mask_quantile discards/downweights the
+    # lowest rho_G fraction of G_{beta,L}(xi_j); weight_norm="none" implements
+    # the no-renorm variant in the direct-c_k sampling-constraint plan.
+    "dual_direct_ck_gramian_mask_quantile": 0.0,
+    "dual_direct_ck_mask_mode": "hard",
+    "dual_direct_ck_weight_norm": "none",
+    "dual_direct_ck_lambda_rel": 0.0,
+    # direct_ck-only g/h alias stability controls.  These are disabled by
+    # default so the existing direct_ck baseline remains unchanged unless the
+    # experiment explicitly opts in.
+    "dual_direct_ck_stability_mode": "none",
+    "dual_direct_ck_clip_good_g_rel": 0.1,
+    "dual_direct_ck_clip_quantile": 0.99,
+    "dual_direct_ck_clip_scale": 1.2,
+    "dual_direct_ck_clip_eps": 1.0e-12,
+    "dual_direct_ck_alias_tau": 0.3,
+    "dual_direct_ck_alias_mode": "soft",
+    "dual_direct_ck_norm_ratio_window": 512,
+    "dual_direct_ck_norm_ratio_alias_gate": True,
+    "dual_kernel_lambda_rel_floor": 3.0e-15,
+    "dual_noise_domain": "spectral_samples",
 
     # Data fidelity modeling inside the learned optimizer:
     # - "standard": use residual r = (A c - b) (homoscedastic least squares)
@@ -402,6 +482,10 @@ DATA_CONFIG = {
     # Detach physically-derived gradients (A^T(Ac-b), regularizer grad) from backprop-through-time.
     # This often stabilizes training for deep unrolled optimizers on ill-conditioned operators.
     "detach_physical_grads": False,
+    # Ablation: keep the CNN architecture unchanged, but zero the per-angle
+    # data-fidelity gradient channels.  Then Dual only supplies coeff_initial
+    # and does not influence the learned update through measurement residuals.
+    "zero_data_grad_channels": False,
 
     # Learned-optimizer initialization (network-side, does not affect data generation):
     # A smaller lambda often works better for multiplicative-noise-aware (IRLS) data fidelity.
@@ -470,11 +554,93 @@ _apply_float_override(DATA_CONFIG, "morozov_initial_lambda", "MOROZOV_INITIAL_LA
 _apply_string_override(DATA_CONFIG, "morozov_cache_dir", "MOROZOV_CACHE_DIR_OVERRIDE")
 _apply_string_override(
     DATA_CONFIG,
+    "dual_xi_grid",
+    "DUAL_XI_GRID_OVERRIDE",
+    allowed_values={"uniform_periodic"},
+)
+_apply_float_override(DATA_CONFIG, "dual_xi_phase_shift", "DUAL_XI_PHASE_SHIFT_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "dual_num_frequency_samples", "DUAL_NUM_FREQUENCY_SAMPLES_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "dual_integral_alias_truncation", "DUAL_INTEGRAL_ALIAS_TRUNCATION_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "dual_gramian_truncation_L", "DUAL_GRAMIAN_TRUNCATION_L_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "dual_time_num_samples", "DUAL_TIME_NUM_SAMPLES_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "dual_time_forward_chunk_size", "DUAL_TIME_FORWARD_CHUNK_SIZE_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "dual_time_fourier_chunk_size", "DUAL_TIME_FOURIER_CHUNK_SIZE_OVERRIDE")
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_time_fourier_quadrature",
+    "DUAL_TIME_FOURIER_QUADRATURE_OVERRIDE",
+    allowed_values={"rectangle", "midpoint_cell"},
+)
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_time_sampling_interval_mode",
+    "DUAL_TIME_SAMPLING_INTERVAL_MODE_OVERRIDE",
+    allowed_values={"theorem_grid", "beta_support_midpoint"},
+)
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_time_recovery_mode",
+    "DUAL_TIME_RECOVERY_MODE_OVERRIDE",
+    allowed_values={"simple_ratio", "gls_low_alias", "direct_ck"},
+)
+_apply_int_override(DATA_CONFIG, "dual_time_alias_estimator_truncation", "DUAL_TIME_ALIAS_ESTIMATOR_TRUNCATION_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "dual_time_gls_covariance_ridge_rel", "DUAL_TIME_GLS_COVARIANCE_RIDGE_REL_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "dual_time_gls_lambda_rel", "DUAL_TIME_GLS_LAMBDA_REL_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "dual_time_frequency_mask_rel", "DUAL_TIME_FREQUENCY_MASK_REL_OVERRIDE")
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_time_frequency_mask_mode",
+    "DUAL_TIME_FREQUENCY_MASK_MODE_OVERRIDE",
+    allowed_values={"hard", "soft"},
+)
+_apply_float_override(DATA_CONFIG, "dual_direct_ck_gramian_mask_quantile", "DUAL_DIRECT_CK_GRAMIAN_MASK_QUANTILE_OVERRIDE")
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_direct_ck_mask_mode",
+    "DUAL_DIRECT_CK_MASK_MODE_OVERRIDE",
+    allowed_values={"hard", "soft"},
+)
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_direct_ck_weight_norm",
+    "DUAL_DIRECT_CK_WEIGHT_NORM_OVERRIDE",
+    allowed_values={"none", "renorm"},
+)
+_apply_float_override(DATA_CONFIG, "dual_direct_ck_lambda_rel", "DUAL_DIRECT_CK_LAMBDA_REL_OVERRIDE")
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_direct_ck_stability_mode",
+    "DUAL_DIRECT_CK_STABILITY_MODE_OVERRIDE",
+    allowed_values={"none", "kclip", "alias_consistency", "kclip_alias", "norm_ratio"},
+)
+_apply_float_override(DATA_CONFIG, "dual_direct_ck_clip_good_g_rel", "DUAL_DIRECT_CK_CLIP_GOOD_G_REL_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "dual_direct_ck_clip_quantile", "DUAL_DIRECT_CK_CLIP_QUANTILE_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "dual_direct_ck_clip_scale", "DUAL_DIRECT_CK_CLIP_SCALE_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "dual_direct_ck_clip_eps", "DUAL_DIRECT_CK_CLIP_EPS_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "dual_direct_ck_alias_tau", "DUAL_DIRECT_CK_ALIAS_TAU_OVERRIDE")
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_direct_ck_alias_mode",
+    "DUAL_DIRECT_CK_ALIAS_MODE_OVERRIDE",
+    allowed_values={"soft", "hard"},
+)
+_apply_int_override(DATA_CONFIG, "dual_direct_ck_norm_ratio_window", "DUAL_DIRECT_CK_NORM_RATIO_WINDOW_OVERRIDE")
+_apply_bool_override(DATA_CONFIG, "dual_direct_ck_norm_ratio_alias_gate", "DUAL_DIRECT_CK_NORM_RATIO_ALIAS_GATE_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "dual_kernel_lambda_rel_floor", "DUAL_KERNEL_LAMBDA_REL_FLOOR_OVERRIDE")
+_apply_string_override(
+    DATA_CONFIG,
+    "dual_noise_domain",
+    "DUAL_NOISE_DOMAIN_OVERRIDE",
+    allowed_values={"spectral_samples", "time_radon_samples"},
+)
+_apply_string_override(
+    DATA_CONFIG,
     "data_fidelity_mode",
     "DATA_FIDELITY_MODE_OVERRIDE",
     allowed_values={"standard", "irls"},
 )
 _apply_bool_override(DATA_CONFIG, "detach_physical_grads", "DETACH_PHYSICAL_GRADS_OVERRIDE")
+_apply_bool_override(DATA_CONFIG, "zero_data_grad_channels", "ZERO_DATA_GRAD_CHANNELS_OVERRIDE")
 
 TIME_DOMAIN_CONFIG = {
     # Main experiment uses the theoretical B1*B1 time-domain operator.
@@ -568,6 +734,7 @@ TIME_DOMAIN_CONFIG = {
     # Supported values:
     # - "cg": iterative Tikhonov solve
     # - "tikhonov_direct": direct Tikhonov solve
+    # - "dual_frequency": single-angle time-domain-noise -> frequency-domain dual init
     "init_method": "tikhonov_direct",
     "init_cg_iters": 40,
     "init_cg_tol": 1.0e-4,
@@ -679,7 +846,7 @@ _apply_string_override(
     TIME_DOMAIN_CONFIG,
     "init_method",
     "INIT_METHOD_OVERRIDE",
-    allowed_values={"cg", "tikhonov_direct"},
+    allowed_values={"cg", "tikhonov_direct", "dual_frequency"},
 )
 _apply_string_override(
     TIME_DOMAIN_CONFIG,

@@ -909,6 +909,434 @@ def _theoretical_b1b1_block(
         "theory_t0_abs": torch.tensor(float(theory_t0_abs), dtype=torch.float64),
     }
 
+
+def _uniform_periodic_xi_grid(
+    num_frequency_samples: int,
+    *,
+    target_device: torch.device | str,
+    phase_shift: float = 0.0,
+) -> torch.Tensor:
+    num_frequency_samples = int(num_frequency_samples)
+    if num_frequency_samples <= 0:
+        raise ValueError(f"num_frequency_samples must be positive, got {num_frequency_samples}.")
+    idx = torch.arange(num_frequency_samples, dtype=torch.float64, device=target_device)
+    phase_shift = float(phase_shift)
+    return ((-math.pi) + phase_shift) + ((2.0 * math.pi * idx) / float(num_frequency_samples))
+
+
+def _complex_cardinal_b1_hat(omega: torch.Tensor) -> torch.Tensor:
+    omega64 = omega.to(dtype=torch.float64)
+    out = torch.ones_like(omega64, dtype=torch.complex128)
+    mask = torch.abs(omega64) > 1.0e-12
+    if bool(mask.any()):
+        omega_safe = omega64[mask]
+        out[mask] = (1.0 - torch.exp(-1j * omega_safe)) / (1j * omega_safe)
+    return out
+
+
+def _hat_radon_phi_b1b1_frequency(
+    beta: torch.Tensor,
+    xi: torch.Tensor,
+) -> torch.Tensor:
+    beta = beta.to(dtype=torch.float64).view(-1)
+    if int(beta.numel()) != 2:
+        raise ValueError(f"beta must have shape (2,), got {tuple(beta.shape)}")
+    beta_norm = torch.linalg.norm(beta, ord=2)
+    xi64 = xi.to(dtype=torch.float64)
+    return (
+        beta_norm.to(dtype=torch.complex128)
+        * _complex_cardinal_b1_hat(beta[0] * xi64)
+        * _complex_cardinal_b1_hat(beta[1] * xi64)
+    )
+
+
+class FrequencyDualB1B1Operator2D(torch.nn.Module):
+    """
+    Single-angle B1*B1 operator in the frequency domain.
+
+    We keep a periodic base grid
+
+        u_j = -pi + theta + 2*pi*j/P,  j=0,...,P-1,
+
+    and enlarge the outer frequency integral by sampling a small set of aliased
+    cells ``u_j + 2*pi*q`` with ``q = -Q,...,Q``.
+
+    For ``P >= N`` we keep the original FFT-based implementation. When ``P < N``
+    the length-``P`` periodic FFT no longer has enough modes to store the ordered
+    coefficient sequence without aliasing, so we fall back to a direct exponential
+    summation backend. The direct backend is slower (O(NP)) but preserves the same
+    discretized dual-frame formulas and therefore allows low-cost undersampled
+    experiments with ``P < N``.
+    """
+
+    def __init__(
+        self,
+        beta_vectors: list[tuple[int, int]],
+        height: int = IMAGE_SIZE,
+        width: int = IMAGE_SIZE,
+        num_frequency_samples: Optional[int] = None,
+        integral_alias_truncation: Optional[int] = None,
+        gramian_truncation_L: Optional[int] = None,
+        xi_grid: str = "uniform_periodic",
+        xi_phase_shift: Optional[float] = None,
+    ):
+        super().__init__()
+        if not beta_vectors:
+            raise ValueError("beta_vectors must be a non-empty list of integer pairs.")
+        if len(list(beta_vectors)) != 1:
+            raise ValueError(
+                "FrequencyDualB1B1Operator2D currently supports exactly one beta vector; "
+                f"got {len(list(beta_vectors))}."
+            )
+
+        self.height = int(height)
+        self.width = int(width)
+        self.N = int(self.height * self.width)
+        self.beta_vectors = [tuple(int(v) for v in list(beta_vectors)[0])]
+        self.num_angles = 1
+        self.xi_grid_mode = str(xi_grid).strip().lower()
+        if self.xi_grid_mode != "uniform_periodic":
+            raise ValueError(
+                f"Unsupported xi_grid={xi_grid!r}; expected 'uniform_periodic'."
+            )
+        self.xi_phase_shift = float(
+            xi_phase_shift
+            if xi_phase_shift is not None
+            else DATA_CONFIG.get("dual_xi_phase_shift", 0.0)
+        )
+        if not math.isfinite(self.xi_phase_shift):
+            raise ValueError(f"xi_phase_shift must be finite, got {self.xi_phase_shift}.")
+
+        beta_i = _to_integer_beta(self.beta_vectors[0])
+        k1, k2 = _lex_lattice_indices(self.height, self.width)
+        beta_dot_k = beta_i[0] * k1 + beta_i[1] * k2
+        uniq_sorted = torch.sort(torch.unique(beta_dot_k)).values
+        if int(uniq_sorted.numel()) != int(self.N):
+            raise ValueError(
+                f"beta={tuple(int(x) for x in beta_i.tolist())} does not make beta·k injective on "
+                f"[0,{self.height - 1}]x[0,{self.width - 1}]."
+            )
+        kappa0 = int(uniq_sorted[0].item())
+        kappa_m = int(uniq_sorted[-1].item())
+        expected = torch.arange(kappa0, kappa_m + 1, dtype=torch.int64)
+        if (kappa_m - kappa0 + 1) != int(self.N) or (not torch.equal(uniq_sorted, expected)):
+            raise ValueError(
+                "Frequency-dual single-angle operator requires consecutive integer beta·k values; "
+                f"got range [{kappa0}, {kappa_m}] with N={self.N}."
+            )
+
+        lex_to_d = (beta_dot_k - kappa0).to(torch.int64)
+        d_to_lex = torch.empty(self.N, dtype=torch.int64)
+        d_to_lex[lex_to_d] = torch.arange(self.N, dtype=torch.int64)
+
+        self.base_num_frequency_samples = int(
+            num_frequency_samples
+            if num_frequency_samples is not None
+            else DATA_CONFIG.get("dual_num_frequency_samples", 12 * self.N)
+        )
+        if self.base_num_frequency_samples <= 0:
+            raise ValueError(
+                f"num_frequency_samples must be positive, got P={self.base_num_frequency_samples}."
+            )
+        self.use_direct_backend = bool(self.base_num_frequency_samples < self.N)
+        self.direct_chunk_size = int(DATA_CONFIG.get("dual_direct_chunk_size", 512))
+        if self.direct_chunk_size <= 0:
+            raise ValueError(
+                f"dual_direct_chunk_size must be positive, got {self.direct_chunk_size}."
+            )
+        self.dual_backend_name = "direct_exponential" if self.use_direct_backend else "fft_periodic"
+        self.integral_alias_truncation = int(
+            integral_alias_truncation
+            if integral_alias_truncation is not None
+            else DATA_CONFIG.get("dual_integral_alias_truncation", 1)
+        )
+        if self.integral_alias_truncation < 0:
+            raise ValueError(
+                "integral_alias_truncation must be non-negative, got "
+                f"{self.integral_alias_truncation}."
+            )
+        self.num_integral_aliases = int(2 * self.integral_alias_truncation + 1)
+        self.M_per_angle = int(self.base_num_frequency_samples * self.num_integral_aliases)
+        self.M = int(self.M_per_angle)
+        self.gramian_truncation_L = int(
+            gramian_truncation_L
+            if gramian_truncation_L is not None
+            else DATA_CONFIG.get("dual_gramian_truncation_L", 8)
+        )
+        if self.gramian_truncation_L < 0:
+            raise ValueError(
+                f"gramian_truncation_L must be non-negative, got {self.gramian_truncation_L}."
+            )
+
+        xi_base = _uniform_periodic_xi_grid(
+            self.base_num_frequency_samples,
+            target_device=device,
+            phase_shift=float(self.xi_phase_shift),
+        )
+        alias_offsets = torch.arange(
+            -self.integral_alias_truncation,
+            self.integral_alias_truncation + 1,
+            dtype=torch.int64,
+            device=xi_base.device,
+        )
+        xi_alias = xi_base.view(1, -1) + (2.0 * math.pi * alias_offsets.to(dtype=torch.float64).view(-1, 1))
+        hat_radon_phi_aliases = _hat_radon_phi_b1b1_frequency(beta_i, xi_alias)
+        gramian = torch.zeros((self.base_num_frequency_samples,), dtype=torch.float64, device=xi_base.device)
+        for ell in range(-self.gramian_truncation_L, self.gramian_truncation_L + 1):
+            hat_shift = _hat_radon_phi_b1b1_frequency(beta_i, xi_base + (2.0 * math.pi * float(ell)))
+            gramian = gramian + hat_shift.abs().square().to(dtype=torch.float64)
+
+        alt_sign = torch.where(
+            (torch.arange(self.N, device=xi_base.device, dtype=torch.int64) % 2) == 0,
+            torch.ones((self.N,), dtype=torch.float32, device=xi_base.device),
+            -torch.ones((self.N,), dtype=torch.float32, device=xi_base.device),
+        )
+        phase_neg = torch.exp(-1j * (float(kappa0) * xi_base))
+        phase_pos = torch.conj(phase_neg)
+        principal_alias = int(self.integral_alias_truncation)
+        mode_values = torch.arange(self.N, dtype=torch.float32, device=xi_base.device) + float(kappa0)
+        mode_indices = torch.arange(self.N, dtype=torch.float64, device=xi_base.device)
+        mode_shift_neg = torch.exp(-1j * (mode_indices * float(self.xi_phase_shift)))
+        mode_shift_pos = torch.conj(mode_shift_neg)
+
+        self.register_buffer("beta", beta_i.to(dtype=torch.int64, device=device))
+        self.register_buffer("xi_grid", xi_base.to(dtype=torch.float32, device=device))
+        self.register_buffer("xi_alias_grid", xi_alias.to(dtype=torch.float32, device=device))
+        self.register_buffer("frequency_alias_offsets", alias_offsets.to(dtype=torch.int64, device=device))
+        self.register_buffer("sampling_points", xi_alias.reshape(-1).to(dtype=torch.float32, device=device))
+        self.register_buffer(
+            "sampling_points_per_angle",
+            xi_alias.reshape(1, -1).to(dtype=torch.float32, device=device),
+        )
+        self.register_buffer("lex_to_d_indices", lex_to_d.to(dtype=torch.int64, device=device))
+        self.register_buffer("d_to_lex_indices", d_to_lex.to(dtype=torch.int64, device=device))
+        self.register_buffer(
+            "hat_radon_phi",
+            hat_radon_phi_aliases[principal_alias].to(dtype=torch.complex64, device=device),
+        )
+        self.register_buffer("hat_radon_phi_aliases", hat_radon_phi_aliases.to(dtype=torch.complex64, device=device))
+        self.register_buffer("gramian_diag", gramian.to(dtype=torch.float32, device=device))
+        self.register_buffer("dual_alt_sign", alt_sign.to(dtype=torch.float32, device=device))
+        self.register_buffer("dual_alt_sign_complex", alt_sign.to(dtype=torch.complex64, device=device))
+        self.register_buffer("dual_phase_neg", phase_neg.to(dtype=torch.complex64, device=device))
+        self.register_buffer("dual_phase_pos", phase_pos.to(dtype=torch.complex64, device=device))
+        self.register_buffer("dual_phase_neg_base", phase_neg.to(dtype=torch.complex64, device=device))
+        self.register_buffer("dual_phase_pos_base", phase_pos.to(dtype=torch.complex64, device=device))
+        self.register_buffer("dual_mode_shift_neg", mode_shift_neg.to(dtype=torch.complex64, device=device))
+        self.register_buffer("dual_mode_shift_pos", mode_shift_pos.to(dtype=torch.complex64, device=device))
+        self.register_buffer("dual_mode_values", mode_values.to(dtype=torch.float32, device=device))
+        self.register_buffer("kappa0", torch.tensor(kappa0, dtype=torch.int64, device=device))
+        self.register_buffer("kappa_m", torch.tensor(kappa_m, dtype=torch.int64, device=device))
+        self.last_dual_lambda: Optional[torch.Tensor] = None
+
+    def split_measurements(self, g: torch.Tensor) -> torch.Tensor:
+        if g.dim() == 3 and g.shape[1] == 1:
+            g = g.squeeze(1)
+        if g.dim() != 2:
+            raise ValueError(f"Expected g with shape (B,M), got {tuple(g.shape)}")
+        if int(g.shape[1]) != int(self.M):
+            raise ValueError(f"Expected measurement length M={self.M}, got {g.shape[1]}")
+        return g.view(g.shape[0], 1, self.M_per_angle)
+
+    def _reshape_frequency_measurements(self, g: torch.Tensor) -> torch.Tensor:
+        if g.dim() == 4 and int(g.shape[1]) == 1:
+            if int(g.shape[2]) != self.num_integral_aliases or int(g.shape[3]) != self.base_num_frequency_samples:
+                raise ValueError(
+                    "Expected g with alias shape "
+                    f"(B,1,{self.num_integral_aliases},{self.base_num_frequency_samples}), "
+                    f"got {tuple(g.shape)}."
+                )
+            return g[:, 0, :, :]
+        if g.dim() == 3 and int(g.shape[1]) == 1:
+            g = g[:, 0, :]
+        if g.dim() != 2:
+            raise ValueError(f"Expected g with shape (B,M) or (B,1,M), got {tuple(g.shape)}")
+        if int(g.shape[1]) != int(self.M):
+            raise ValueError(f"Expected measurement length M={self.M}, got {g.shape[1]}")
+        return g.reshape(g.shape[0], self.num_integral_aliases, self.base_num_frequency_samples)
+
+    def _coeff_to_d(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        if coeff_matrix.dim() == 3:
+            coeff_matrix = coeff_matrix.unsqueeze(1)
+        coeff_matrix = coeff_matrix.to(dtype=torch.float32, device=self.hat_radon_phi_aliases.device)
+        batch = int(coeff_matrix.shape[0])
+        coeff_flat = coeff_matrix.view(batch, self.N)
+        return coeff_flat.index_select(1, self.d_to_lex_indices)
+
+    def _d_to_coeff(self, d_vector: torch.Tensor) -> torch.Tensor:
+        batch = int(d_vector.shape[0])
+        coeff_flat = d_vector.gather(1, self.lex_to_d_indices.view(1, -1).expand(batch, -1))
+        return coeff_flat.view(batch, 1, self.height, self.width)
+
+    def _pad_frequency_state(self, d_vector: torch.Tensor) -> torch.Tensor:
+        batch = int(d_vector.shape[0])
+        padded = torch.zeros(
+            (batch, self.base_num_frequency_samples),
+            dtype=torch.complex64,
+            device=d_vector.device,
+        )
+        padded[:, : self.N] = (
+            d_vector.to(dtype=torch.complex64)
+            * self.dual_alt_sign_complex.view(1, -1)
+            * self.dual_mode_shift_neg.view(1, -1)
+        )
+        return padded
+
+    def _direct_sum_modes_to_base(self, d_vector: torch.Tensor) -> torch.Tensor:
+        batch = int(d_vector.shape[0])
+        xi_base = self.xi_grid.to(dtype=torch.float32, device=d_vector.device)
+        mode_values = self.dual_mode_values.to(dtype=torch.float32, device=d_vector.device)
+        out = torch.zeros(
+            (batch, self.base_num_frequency_samples),
+            dtype=torch.complex64,
+            device=d_vector.device,
+        )
+        d_complex = d_vector.to(dtype=torch.complex64)
+        chunk = min(int(self.direct_chunk_size), int(self.N))
+        xi_row = xi_base.view(1, -1)
+        for start in range(0, self.N, chunk):
+            stop = min(start + chunk, self.N)
+            phase = torch.exp(-1j * (mode_values[start:stop].view(-1, 1) * xi_row))
+            out = out + (d_complex[:, start:stop] @ phase)
+        return out
+
+    def _direct_sum_base_to_modes(
+        self,
+        base_values: torch.Tensor,
+        *,
+        scale: float = 1.0,
+    ) -> torch.Tensor:
+        batch = int(base_values.shape[0])
+        xi_base = self.xi_grid.to(dtype=torch.float32, device=base_values.device)
+        mode_values = self.dual_mode_values.to(dtype=torch.float32, device=base_values.device)
+        out = torch.zeros((batch, self.N), dtype=torch.complex64, device=base_values.device)
+        base_complex = base_values.to(dtype=torch.complex64)
+        chunk = min(int(self.direct_chunk_size), int(self.base_num_frequency_samples))
+        mode_row = mode_values.view(1, -1)
+        for start in range(0, self.base_num_frequency_samples, chunk):
+            stop = min(start + chunk, self.base_num_frequency_samples)
+            phase = torch.exp(1j * (xi_base[start:stop].view(-1, 1) * mode_row))
+            out = out + (base_complex[:, start:stop] @ phase)
+        if float(scale) != 1.0:
+            out = out * float(scale)
+        return out
+
+    def forward_per_angle(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        d_vector = self._coeff_to_d(coeff_matrix)
+        if self.use_direct_backend:
+            base_state = self._direct_sum_modes_to_base(d_vector)
+            spectrum = self.hat_radon_phi_aliases.unsqueeze(0) * base_state.unsqueeze(1)
+            return spectrum.reshape(spectrum.shape[0], 1, self.M_per_angle)
+
+        fft_state = torch.fft.fft(self._pad_frequency_state(d_vector), dim=1)
+        base_state = self.dual_phase_neg_base.view(1, -1) * fft_state
+        spectrum = self.hat_radon_phi_aliases.unsqueeze(0) * base_state.unsqueeze(1)
+        return spectrum.reshape(spectrum.shape[0], 1, self.M_per_angle)
+
+    def forward(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        return self.forward_per_angle(coeff_matrix).reshape(coeff_matrix.shape[0], self.M)
+
+    def adjoint_per_angle(self, residual_per_angle: torch.Tensor) -> torch.Tensor:
+        residual_angle = self._reshape_frequency_measurements(residual_per_angle).to(
+            dtype=torch.complex64,
+            device=self.hat_radon_phi_aliases.device,
+        )
+        weighted_aliases = torch.sum(
+            self.hat_radon_phi_aliases.conj().unsqueeze(0) * residual_angle,
+            dim=1,
+        )
+        if self.use_direct_backend:
+            grad_d = self._direct_sum_base_to_modes(weighted_aliases, scale=1.0)
+            grad_coeff = self._d_to_coeff(grad_d.real.to(dtype=torch.float32))
+            return grad_coeff.unsqueeze(1)
+
+        weighted = self.dual_phase_pos_base.view(1, -1) * weighted_aliases
+        grad_d = (
+            torch.fft.ifft(weighted, dim=1)[:, : self.N]
+            * self.dual_alt_sign_complex.view(1, -1)
+            * self.dual_mode_shift_pos.view(1, -1)
+            * float(self.base_num_frequency_samples)
+        )
+        grad_coeff = self._d_to_coeff(grad_d.real.to(dtype=torch.float32))
+        return grad_coeff.unsqueeze(1)
+
+    def adjoint(self, residual: torch.Tensor) -> torch.Tensor:
+        residual_pa = self.split_measurements(residual)
+        return self.adjoint_per_angle(residual_pa).sum(dim=1)
+
+    def apply_normal(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        return self.adjoint(self.forward(coeff_matrix))
+
+    def _resolve_dual_lambda(
+        self,
+        *,
+        batch_size: int,
+        noise_power: Optional[torch.Tensor] = None,
+        lambda_reg: Optional[float | torch.Tensor] = None,
+    ) -> torch.Tensor:
+        floor_rel = float(DATA_CONFIG.get("dual_kernel_lambda_rel_floor", 1.0e-10))
+        lam_floor = float(self.gramian_diag.max().item()) * float(floor_rel)
+        if lambda_reg is not None:
+            if torch.is_tensor(lambda_reg):
+                lam = lambda_reg.detach().to(dtype=torch.float32, device=self.gramian_diag.device).view(-1)
+            else:
+                lam = torch.tensor([float(lambda_reg)], dtype=torch.float32, device=self.gramian_diag.device)
+        elif noise_power is not None:
+            lam = noise_power.detach().to(dtype=torch.float32, device=self.gramian_diag.device).view(-1)
+        else:
+            lam = torch.tensor([lam_floor], dtype=torch.float32, device=self.gramian_diag.device)
+
+        if int(lam.numel()) == 1 and int(batch_size) > 1:
+            lam = lam.expand(int(batch_size))
+        elif int(lam.numel()) != int(batch_size):
+            raise ValueError(
+                f"dual lambda has {int(lam.numel())} entries, expected 1 or batch={int(batch_size)}."
+            )
+        lam = lam.clamp_min(float(lam_floor))
+        self.last_dual_lambda = lam.detach().clone()
+        return lam
+
+    @torch.no_grad()
+    def solve_dual_frame_direct(
+        self,
+        g_obs: torch.Tensor,
+        *,
+        noise_power: Optional[torch.Tensor] = None,
+        lambda_reg: Optional[float | torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if g_obs.dim() == 1:
+            g_obs = g_obs.unsqueeze(0)
+        g_obs_alias = self._reshape_frequency_measurements(g_obs).to(
+            dtype=torch.complex64,
+            device=self.hat_radon_phi_aliases.device,
+        )
+        lam = self._resolve_dual_lambda(
+            batch_size=int(g_obs_alias.shape[0]),
+            noise_power=noise_power,
+            lambda_reg=lambda_reg,
+        )
+        aggregated_numerator = torch.sum(
+            g_obs_alias * self.hat_radon_phi_aliases.conj().unsqueeze(0),
+            dim=1,
+        )
+        kernel = aggregated_numerator / (
+            self.gramian_diag.view(1, -1).to(dtype=torch.complex64) + lam.view(-1, 1).to(dtype=torch.complex64)
+        )
+        if self.use_direct_backend:
+            d_vector = self._direct_sum_base_to_modes(
+                kernel,
+                scale=(1.0 / float(self.base_num_frequency_samples)),
+            )
+            return self._d_to_coeff(d_vector.real.to(dtype=torch.float32))
+
+        weighted = self.dual_phase_pos_base.view(1, -1) * kernel
+        d_vector = (
+            torch.fft.ifft(weighted, dim=1)[:, : self.N]
+            * self.dual_alt_sign_complex.view(1, -1)
+            * self.dual_mode_shift_pos.view(1, -1)
+        )
+        return self._d_to_coeff(d_vector.real.to(dtype=torch.float32))
+
 # Provide discrete forward/adjoint Jacobian products explicitly so training does
 # not rely on unsupported second-order derivatives through grid_sample.
 class _ImplicitForwardProjectFunction(torch.autograd.Function):
@@ -2689,6 +3117,7 @@ class TheoreticalDataGenerator:
     Init (feeds the learned iterative optimizer):
     - "cg": solve (A^T A + lambda I)c0 = A^T g approximately with a few CG iterations
     - "tikhonov_direct": solve (A^T A + lambda I)c0 = A^T g directly
+    - "dual_frequency": recover c0 with the single-angle frequency-dual direct_ck pipeline
     """
 
     def __init__(self, data_source: Optional[str] = None):
@@ -2742,6 +3171,8 @@ class TheoreticalDataGenerator:
         self._chol_factor: Optional[torch.Tensor] = None
         self._ata_factor: Optional[torch.Tensor] = None
         self._first_batch_progress_logged = False
+        self._dual_init_operator = None
+        self.last_dual_init_info: dict[str, object] = {}
 
     def _normalize_lambda_reg(
         self,
@@ -2922,6 +3353,72 @@ class TheoreticalDataGenerator:
 
         return x.view(-1, 1, self.img_size, self.img_size)
 
+    @torch.no_grad()
+    def _dual_frequency_init_from_coeff(self, coeff_true: torch.Tensor) -> torch.Tensor:
+        """
+        Build the learned-optimizer initial coefficient map with the current
+        single-angle time-domain -> frequency-domain dual recovery pipeline.
+
+        This path is intended for controlled synthetic experiments: the dense
+        time-domain observation used by the dual front-end is generated from
+        coeff_true, then corrupted with the configured measurement noise.
+        """
+        beta_vectors = getattr(self.time_operator, "beta_vectors", None)
+        if beta_vectors is None:
+            beta_vectors = [tuple(int(v) for v in THEORETICAL_CONFIG["beta_vector"])]
+        beta_vectors = [tuple(int(v) for v in beta) for beta in list(beta_vectors)]
+        if len(beta_vectors) != 1:
+            raise ValueError(
+                "init_method='dual_frequency' currently supports exactly one physical angle; "
+                f"got {len(beta_vectors)} beta vectors. Set BETA_VECTORS_OVERRIDE='1,128' "
+                "and NUM_ANGLES_TOTAL_OVERRIDE=1 for the current best single-angle trial."
+            )
+
+        from tikhonov_eval import (  # Lazy import avoids a module-level circular dependency.
+            _build_current_dual_frequency_operator,
+            _build_dual_frequency_observation_from_time_domain,
+            _prepare_dual_time_domain_frontend,
+            _solve_dual_coeff_from_common_factor,
+        )
+
+        if self._dual_init_operator is None:
+            self._dual_init_operator = _build_current_dual_frequency_operator(beta_vectors)
+
+        frontend = _prepare_dual_time_domain_frontend(
+            coeff_true.to(device=device, dtype=torch.float32),
+            beta_vectors=beta_vectors,
+            operator_time=self.time_operator,
+            operator_dual=self._dual_init_operator,
+        )
+        obs = _build_dual_frequency_observation_from_time_domain(
+            frontend,
+            noise_mode=self.noise_mode,
+            delta=float(self.noise_level),
+            target_snr_db=float(self.target_snr_db),
+        )
+        coeff_initial = _solve_dual_coeff_from_common_factor(
+            obs["g_obs_common_factor"].to(dtype=torch.complex64),
+            operator_dual=self._dual_init_operator,
+        )
+
+        self.last_lambda = float(obs.get("frequency_mask_threshold", 0.0))
+        self.last_dual_init_info = {
+            "beta_vectors": beta_vectors,
+            "frequency_build_mode": str(frontend["frequency_build_mode"]),
+            "s_num_samples": int(obs["s_num_samples"]),
+            "delta_t": float(obs["delta_t"]),
+            "delta_s": float(obs["delta_s"]),
+            "frequency_mask_keep_ratio": float(obs["frequency_mask_keep_ratio"]),
+            "direct_ck_stability_mode": str(obs.get("direct_ck_stability_mode", "none")),
+            "direct_ck_stability_alias_residual_mean": float(
+                obs.get("direct_ck_stability_alias_residual_mean", 0.0)
+            ),
+            "direct_ck_stability_alias_weight_mean": float(
+                obs.get("direct_ck_stability_alias_weight_mean", 1.0)
+            ),
+        }
+        return coeff_initial.to(device=device, dtype=torch.float32).view(-1, 1, self.img_size, self.img_size)
+
     def _sample_coefficients(self, batch_size: int = 1) -> torch.Tensor:
         """Return B1*B1 coefficient maps for the active data source."""
         if self.data_source == "shepp_logan":
@@ -2985,7 +3482,11 @@ class TheoreticalDataGenerator:
                 observed = torch.cat([observed, g_feature_observed], dim=-1)
 
         # Coefficient init (feeds the learned iterative optimizer).
-        if lambda_reg is not None:
+        init_method = str(TIME_DOMAIN_CONFIG.get("init_method", "cg")).strip().lower()
+        init_cg_iters = int(TIME_DOMAIN_CONFIG.get("init_cg_iters", 0))
+        if init_method == "dual_frequency":
+            lambda_eff = 0.0
+        elif lambda_reg is not None:
             if torch.is_tensor(lambda_reg):
                 lambda_eff = float(lambda_reg.detach().view(-1)[0].item())
             else:
@@ -3010,10 +3511,10 @@ class TheoreticalDataGenerator:
             else:
                 lambda_eff = float(DATA_CONFIG.get("lambda_reg", 1e-2))
         self.last_lambda = lambda_eff
-        init_method = str(TIME_DOMAIN_CONFIG.get("init_method", "cg")).strip().lower()
-        init_cg_iters = int(TIME_DOMAIN_CONFIG.get("init_cg_iters", 0))
 
-        if init_method == "tikhonov_direct":
+        if init_method == "dual_frequency":
+            coeff_initial = self._dual_frequency_init_from_coeff(coeff_true)
+        elif init_method == "tikhonov_direct":
             coeff_initial = self._tikhonov_direct_init(g_observed, lambda_reg=lambda_eff)
         elif init_method == "cg" and init_cg_iters > 0:
             coeff_initial = self._tikhonov_cg_init(
@@ -3023,7 +3524,7 @@ class TheoreticalDataGenerator:
             )
         else:
             raise ValueError(
-                f"Unsupported init_method={init_method!r}; expected 'cg' or 'tikhonov_direct'."
+                f"Unsupported init_method={init_method!r}; expected 'cg', 'tikhonov_direct', or 'dual_frequency'."
             )
 
         return (
@@ -3075,7 +3576,9 @@ class TheoreticalDataGenerator:
                 g_observed_full = torch.cat([g_observed, g_feature_observed], dim=-1)
 
         # 5. Coefficient init
-        if lambda_reg is not None:
+        if init_method == "dual_frequency":
+            lambda_eff = torch.zeros((int(batch_size),), dtype=torch.float32, device=g_observed.device)
+        elif lambda_reg is not None:
             lambda_eff = self._normalize_lambda_reg(
                 lambda_reg,
                 batch_size=int(batch_size),
@@ -3111,7 +3614,9 @@ class TheoreticalDataGenerator:
         init_cg_iters = int(TIME_DOMAIN_CONFIG.get("init_cg_iters", 0))
 
         coeff_init_started = time.perf_counter()
-        if init_method == "tikhonov_direct":
+        if init_method == "dual_frequency":
+            coeff_initial = self._dual_frequency_init_from_coeff(coeff_true)
+        elif init_method == "tikhonov_direct":
             coeff_initial = self._tikhonov_direct_init(g_observed, lambda_reg=lambda_eff)
         elif init_method == "cg" and init_cg_iters > 0:
             coeff_initial = self._tikhonov_cg_init(
@@ -3119,7 +3624,7 @@ class TheoreticalDataGenerator:
             )
         else:
             raise ValueError(
-                f"Unsupported init_method={init_method!r}; expected 'cg' or 'tikhonov_direct'."
+                f"Unsupported init_method={init_method!r}; expected 'cg', 'tikhonov_direct', or 'dual_frequency'."
             )
         if progress_enabled:
             print(
