@@ -1,0 +1,529 @@
+{
+  "meta": {
+    "image_size": 128,
+    "top_k": 8,
+    "angle_interval": "[0,pi)",
+    "candidate_definition": "primitive boundary directions with max(abs(a),abs(b))=128, beta ~ -beta canonicalized to [0,pi)",
+    "selection_source": "D:\\ai_code\\ai_project\\ct_time\\models\\full_condition_constrained_top_refine_grid.json",
+    "selection_method": "expand refined representative best rows by sign and coordinate symmetries, then keep the first 8 unique [0,pi) directions",
+    "condition_constrained_tau_selection": "tau = support_lo + refined_fraction * (support_hi-support_lo); coordinate swaps use 1-refined_fraction",
+    "triangular_tau": "A_beta + 0.5 where A_beta=min(0,beta1,beta2,beta1+beta2)",
+    "elapsed_seconds": 52.698819199999996
+  },
+  "top8": [
+    {
+      "beta": [
+        128,
+        1
+      ],
+      "support_lo_beta": 0.0,
+      "support_hi_beta": 129.0,
+      "angle_rad_0_pi": 0.007812341060101111,
+      "fraction": 0.45,
+      "tau_star": 58.050000000000004,
+      "source_representative_beta": [
+        128,
+        1
+      ],
+      "source_representative_fraction": 0.45,
+      "symmetry": "representative",
+      "representative_refined_cond": 28289.923101948436,
+      "injective": true,
+      "cond": 28289.923103096506,
+      "sigma_min": 0.004524604313537312,
+      "sigma_max": 128.0007081019093,
+      "lambda_min": 2.0472044194080456e-05,
+      "lambda_max": 16384.181274590195,
+      "matrix_nnz": 2109340,
+      "lower_bandwidth": 71,
+      "upper_bandwidth": 59,
+      "delta_min": -58,
+      "delta_max": 70,
+      "diag0": 1.000030517112478,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 58.05) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        -128,
+        1
+      ],
+      "support_lo_beta": -128.0,
+      "support_hi_beta": 1.0,
+      "angle_rad_0_pi": 3.133780312529692,
+      "fraction": 0.45,
+      "tau_star": -69.94999999999999,
+      "source_representative_beta": [
+        128,
+        1
+      ],
+      "source_representative_fraction": 0.45,
+      "symmetry": "sign_reflection",
+      "representative_refined_cond": 28289.923101948436,
+      "injective": true,
+      "cond": 28289.9231080039,
+      "sigma_min": 0.004524604312749809,
+      "sigma_max": 128.00070810183493,
+      "lambda_min": 2.047204418695417e-05,
+      "lambda_max": 16384.18127457115,
+      "matrix_nnz": 2109340,
+      "lower_bandwidth": 71,
+      "upper_bandwidth": 59,
+      "delta_min": -58,
+      "delta_max": 70,
+      "diag0": 1.000030517112478,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + -69.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        1,
+        128
+      ],
+      "support_lo_beta": 0.0,
+      "support_hi_beta": 129.0,
+      "angle_rad_0_pi": 1.5629839857347956,
+      "fraction": 0.55,
+      "tau_star": 70.95,
+      "source_representative_beta": [
+        128,
+        1
+      ],
+      "source_representative_fraction": 0.45,
+      "symmetry": "coordinate_swap",
+      "representative_refined_cond": 28289.923101948436,
+      "injective": true,
+      "cond": 28289.923097976913,
+      "sigma_min": 0.004524604314336391,
+      "sigma_max": 128.00070810135105,
+      "lambda_min": 2.0472044201311485e-05,
+      "lambda_max": 16384.181274447274,
+      "matrix_nnz": 2109340,
+      "lower_bandwidth": 59,
+      "upper_bandwidth": 71,
+      "delta_min": -70,
+      "delta_max": 58,
+      "diag0": 1.000030517112478,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 70.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        -1,
+        128
+      ],
+      "support_lo_beta": -1.0,
+      "support_hi_beta": 128.0,
+      "angle_rad_0_pi": 1.5786086678549978,
+      "fraction": 0.55,
+      "tau_star": 69.95,
+      "source_representative_beta": [
+        128,
+        1
+      ],
+      "source_representative_fraction": 0.45,
+      "symmetry": "coordinate_swap_sign_reflection",
+      "representative_refined_cond": 28289.923101948436,
+      "injective": true,
+      "cond": 28289.923103225614,
+      "sigma_min": 0.004524604313499325,
+      "sigma_max": 128.00070810141884,
+      "lambda_min": 2.04720441937367e-05,
+      "lambda_max": 16384.18127446463,
+      "matrix_nnz": 2109340,
+      "lower_bandwidth": 59,
+      "upper_bandwidth": 71,
+      "delta_min": -70,
+      "delta_max": 58,
+      "diag0": 1.000030517112478,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 69.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        128,
+        3
+      ],
+      "support_lo_beta": 0.0,
+      "support_hi_beta": 131.0,
+      "angle_rad_0_pi": 0.023433209879467586,
+      "fraction": 0.55,
+      "tau_star": 72.05000000000001,
+      "source_representative_beta": [
+        128,
+        3
+      ],
+      "source_representative_fraction": 0.55,
+      "symmetry": "representative",
+      "representative_refined_cond": 5606086.220095187,
+      "injective": true,
+      "cond": 5606087.446928641,
+      "sigma_min": 2.2838007402559652e-05,
+      "sigma_max": 128.03186661235304,
+      "lambda_min": 5.215745821193695e-10,
+      "lambda_max": 16392.158868243365,
+      "matrix_nnz": 2129981,
+      "lower_bandwidth": 59,
+      "upper_bandwidth": 73,
+      "delta_min": -72,
+      "delta_max": 58,
+      "diag0": 1.0002746204949169,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 72.05) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        -128,
+        3
+      ],
+      "support_lo_beta": -128.0,
+      "support_hi_beta": 3.0,
+      "angle_rad_0_pi": 3.1181594437103257,
+      "fraction": 0.55,
+      "tau_star": -55.94999999999999,
+      "source_representative_beta": [
+        128,
+        3
+      ],
+      "source_representative_fraction": 0.55,
+      "symmetry": "sign_reflection",
+      "representative_refined_cond": 5606086.220095187,
+      "injective": true,
+      "cond": 5605807.59029313,
+      "sigma_min": 2.2839147535857533e-05,
+      "sigma_max": 128.0318666123348,
+      "lambda_min": 5.216266601646673e-10,
+      "lambda_max": 16392.158868238686,
+      "matrix_nnz": 2129981,
+      "lower_bandwidth": 59,
+      "upper_bandwidth": 73,
+      "delta_min": -72,
+      "delta_max": 58,
+      "diag0": 1.0002746204949169,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + -55.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        3,
+        128
+      ],
+      "support_lo_beta": 0.0,
+      "support_hi_beta": 131.0,
+      "angle_rad_0_pi": 1.547363116915429,
+      "fraction": 0.44999999999999996,
+      "tau_star": 58.949999999999996,
+      "source_representative_beta": [
+        128,
+        3
+      ],
+      "source_representative_fraction": 0.55,
+      "symmetry": "coordinate_swap",
+      "representative_refined_cond": 5606086.220095187,
+      "injective": true,
+      "cond": 5605935.817103182,
+      "sigma_min": 2.2838625126941443e-05,
+      "sigma_max": 128.03186661251374,
+      "lambda_min": 5.216027976889611e-10,
+      "lambda_max": 16392.15886828451,
+      "matrix_nnz": 2129981,
+      "lower_bandwidth": 73,
+      "upper_bandwidth": 59,
+      "delta_min": -58,
+      "delta_max": 72,
+      "diag0": 1.0002746204949169,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 58.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        -3,
+        128
+      ],
+      "support_lo_beta": -3.0,
+      "support_hi_beta": 128.0,
+      "angle_rad_0_pi": 1.5942295366743642,
+      "fraction": 0.44999999999999996,
+      "tau_star": 55.949999999999996,
+      "source_representative_beta": [
+        128,
+        3
+      ],
+      "source_representative_fraction": 0.55,
+      "symmetry": "coordinate_swap_sign_reflection",
+      "representative_refined_cond": 5606086.220095187,
+      "injective": true,
+      "cond": 5605904.154712777,
+      "sigma_min": 2.283875412045114e-05,
+      "sigma_max": 128.0318666123006,
+      "lambda_min": 5.216086897744239e-10,
+      "lambda_max": 16392.158868229933,
+      "matrix_nnz": 2129981,
+      "lower_bandwidth": 73,
+      "upper_bandwidth": 59,
+      "delta_min": -58,
+      "delta_max": 72,
+      "diag0": 1.0002746204949169,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 55.95) / ||beta||_2 : i=0,...,16383}"
+    }
+  ],
+  "results": [
+    {
+      "beta": [
+        128,
+        1
+      ],
+      "support_lo_beta": 0.0,
+      "support_hi_beta": 129.0,
+      "angle_rad_0_pi": 0.007812341060101111,
+      "fraction": 0.45,
+      "tau_star": 58.050000000000004,
+      "source_representative_beta": [
+        128,
+        1
+      ],
+      "source_representative_fraction": 0.45,
+      "symmetry": "representative",
+      "representative_refined_cond": 28289.923101948436,
+      "injective": true,
+      "cond": 28289.923103096506,
+      "sigma_min": 0.004524604313537312,
+      "sigma_max": 128.0007081019093,
+      "lambda_min": 2.0472044194080456e-05,
+      "lambda_max": 16384.181274590195,
+      "matrix_nnz": 2109340,
+      "lower_bandwidth": 71,
+      "upper_bandwidth": 59,
+      "delta_min": -58,
+      "delta_max": 70,
+      "diag0": 1.000030517112478,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 58.05) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        -128,
+        1
+      ],
+      "support_lo_beta": -128.0,
+      "support_hi_beta": 1.0,
+      "angle_rad_0_pi": 3.133780312529692,
+      "fraction": 0.45,
+      "tau_star": -69.94999999999999,
+      "source_representative_beta": [
+        128,
+        1
+      ],
+      "source_representative_fraction": 0.45,
+      "symmetry": "sign_reflection",
+      "representative_refined_cond": 28289.923101948436,
+      "injective": true,
+      "cond": 28289.9231080039,
+      "sigma_min": 0.004524604312749809,
+      "sigma_max": 128.00070810183493,
+      "lambda_min": 2.047204418695417e-05,
+      "lambda_max": 16384.18127457115,
+      "matrix_nnz": 2109340,
+      "lower_bandwidth": 71,
+      "upper_bandwidth": 59,
+      "delta_min": -58,
+      "delta_max": 70,
+      "diag0": 1.000030517112478,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + -69.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        1,
+        128
+      ],
+      "support_lo_beta": 0.0,
+      "support_hi_beta": 129.0,
+      "angle_rad_0_pi": 1.5629839857347956,
+      "fraction": 0.55,
+      "tau_star": 70.95,
+      "source_representative_beta": [
+        128,
+        1
+      ],
+      "source_representative_fraction": 0.45,
+      "symmetry": "coordinate_swap",
+      "representative_refined_cond": 28289.923101948436,
+      "injective": true,
+      "cond": 28289.923097976913,
+      "sigma_min": 0.004524604314336391,
+      "sigma_max": 128.00070810135105,
+      "lambda_min": 2.0472044201311485e-05,
+      "lambda_max": 16384.181274447274,
+      "matrix_nnz": 2109340,
+      "lower_bandwidth": 59,
+      "upper_bandwidth": 71,
+      "delta_min": -70,
+      "delta_max": 58,
+      "diag0": 1.000030517112478,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 70.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        -1,
+        128
+      ],
+      "support_lo_beta": -1.0,
+      "support_hi_beta": 128.0,
+      "angle_rad_0_pi": 1.5786086678549978,
+      "fraction": 0.55,
+      "tau_star": 69.95,
+      "source_representative_beta": [
+        128,
+        1
+      ],
+      "source_representative_fraction": 0.45,
+      "symmetry": "coordinate_swap_sign_reflection",
+      "representative_refined_cond": 28289.923101948436,
+      "injective": true,
+      "cond": 28289.923103225614,
+      "sigma_min": 0.004524604313499325,
+      "sigma_max": 128.00070810141884,
+      "lambda_min": 2.04720441937367e-05,
+      "lambda_max": 16384.18127446463,
+      "matrix_nnz": 2109340,
+      "lower_bandwidth": 59,
+      "upper_bandwidth": 71,
+      "delta_min": -70,
+      "delta_max": 58,
+      "diag0": 1.000030517112478,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 69.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        128,
+        3
+      ],
+      "support_lo_beta": 0.0,
+      "support_hi_beta": 131.0,
+      "angle_rad_0_pi": 0.023433209879467586,
+      "fraction": 0.55,
+      "tau_star": 72.05000000000001,
+      "source_representative_beta": [
+        128,
+        3
+      ],
+      "source_representative_fraction": 0.55,
+      "symmetry": "representative",
+      "representative_refined_cond": 5606086.220095187,
+      "injective": true,
+      "cond": 5606087.446928641,
+      "sigma_min": 2.2838007402559652e-05,
+      "sigma_max": 128.03186661235304,
+      "lambda_min": 5.215745821193695e-10,
+      "lambda_max": 16392.158868243365,
+      "matrix_nnz": 2129981,
+      "lower_bandwidth": 59,
+      "upper_bandwidth": 73,
+      "delta_min": -72,
+      "delta_max": 58,
+      "diag0": 1.0002746204949169,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 72.05) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        -128,
+        3
+      ],
+      "support_lo_beta": -128.0,
+      "support_hi_beta": 3.0,
+      "angle_rad_0_pi": 3.1181594437103257,
+      "fraction": 0.55,
+      "tau_star": -55.94999999999999,
+      "source_representative_beta": [
+        128,
+        3
+      ],
+      "source_representative_fraction": 0.55,
+      "symmetry": "sign_reflection",
+      "representative_refined_cond": 5606086.220095187,
+      "injective": true,
+      "cond": 5605807.59029313,
+      "sigma_min": 2.2839147535857533e-05,
+      "sigma_max": 128.0318666123348,
+      "lambda_min": 5.216266601646673e-10,
+      "lambda_max": 16392.158868238686,
+      "matrix_nnz": 2129981,
+      "lower_bandwidth": 59,
+      "upper_bandwidth": 73,
+      "delta_min": -72,
+      "delta_max": 58,
+      "diag0": 1.0002746204949169,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + -55.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        3,
+        128
+      ],
+      "support_lo_beta": 0.0,
+      "support_hi_beta": 131.0,
+      "angle_rad_0_pi": 1.547363116915429,
+      "fraction": 0.44999999999999996,
+      "tau_star": 58.949999999999996,
+      "source_representative_beta": [
+        128,
+        3
+      ],
+      "source_representative_fraction": 0.55,
+      "symmetry": "coordinate_swap",
+      "representative_refined_cond": 5606086.220095187,
+      "injective": true,
+      "cond": 5605935.817103182,
+      "sigma_min": 2.2838625126941443e-05,
+      "sigma_max": 128.03186661251374,
+      "lambda_min": 5.216027976889611e-10,
+      "lambda_max": 16392.15886828451,
+      "matrix_nnz": 2129981,
+      "lower_bandwidth": 73,
+      "upper_bandwidth": 59,
+      "delta_min": -58,
+      "delta_max": 72,
+      "diag0": 1.0002746204949169,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 58.95) / ||beta||_2 : i=0,...,16383}"
+    },
+    {
+      "beta": [
+        -3,
+        128
+      ],
+      "support_lo_beta": -3.0,
+      "support_hi_beta": 128.0,
+      "angle_rad_0_pi": 1.5942295366743642,
+      "fraction": 0.44999999999999996,
+      "tau_star": 55.949999999999996,
+      "source_representative_beta": [
+        128,
+        3
+      ],
+      "source_representative_fraction": 0.55,
+      "symmetry": "coordinate_swap_sign_reflection",
+      "representative_refined_cond": 5606086.220095187,
+      "injective": true,
+      "cond": 5605904.154712777,
+      "sigma_min": 2.283875412045114e-05,
+      "sigma_max": 128.0318666123006,
+      "lambda_min": 5.216086897744239e-10,
+      "lambda_max": 16392.158868229933,
+      "matrix_nnz": 2129981,
+      "lower_bandwidth": 73,
+      "upper_bandwidth": 59,
+      "delta_min": -58,
+      "delta_max": 72,
+      "diag0": 1.0002746204949169,
+      "is_condition_infinite": false,
+      "sampling_formula": "X_beta={(kappa_i + 55.95) / ||beta||_2 : i=0,...,16383}"
+    }
+  ]
+}

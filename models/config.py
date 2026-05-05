@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import torch
-import numpy as np
-import math
 
 # Paths
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,213 +49,159 @@ if _n_iter_override is not None:
 n_data = 8
 n_train = 5000
 
-BACKBONE_MULTI8_BETA_VECTORS = [
-    (1, IMAGE_SIZE),
-    (-1, IMAGE_SIZE),
-    (1, -IMAGE_SIZE),
-    (-1, -IMAGE_SIZE),
-    (IMAGE_SIZE, 1),
-    (-IMAGE_SIZE, 1),
-    (IMAGE_SIZE, -1),
-    (-IMAGE_SIZE, -1),
-]
-
-DEFAULT_EXPERIMENT_PROFILE = "injective16_pi_best"
-FULL_TRIANGULAR_16ANGLE_COUNT = 16
-INJECTIVE16_PI_BEST_CNN_ANGLE_INDICES = (0, 5, 6, 8, 9, 10, 13, 14)
-
-# Best-performing 16-angle full-triangular set observed in the archived
-# "(0,pi)" experiment. We keep it fixed for reproducible Tikhonov
-# initialization and learned-optimizer training/testing.
-BEST_PI16_BETA_VECTORS = [
-    (128, 1),
-    (1, -128),
-    (127, 128),
-    (128, -127),
-    (128, -53),
-    (53, 128),
-    (53, -128),
-    (128, 53),
-    (25, 128),
-    (128, -25),
-    (128, -85),
-    (85, 128),
-    (128, 85),
-    (85, -128),
-    (25, -128),
-    (128, 25),
-]
+DEFAULT_EXPERIMENT_PROFILE = "condition_constrained8_pi"
+CONDITION_CONSTRAINED8_PI_JSON = os.path.join(MODEL_DIR, "best_condition_constrained8_pi.json")
 
 
-def _primitive_signed_beta(beta) -> tuple[int, int]:
-    a = int(beta[0])
-    b = int(beta[1])
-    g = math.gcd(abs(a), abs(b))
-    if g > 1:
-        a //= g
-        b //= g
-    return (a, b)
+def _condition_record_float(record: dict, *keys: str) -> float:
+    for key in keys:
+        if key in record:
+            return float(record[key])
+    raise ValueError(f"Condition-constrained record is missing one of keys={keys!r}: {record!r}")
 
 
-def _is_injective_beta_for_square(beta, image_size: int) -> bool:
-    a, b = _primitive_signed_beta(beta)
-    return a != 0 and b != 0 and max(abs(a), abs(b)) >= int(image_size)
+def _extract_condition_constrained_records(payload) -> list[dict]:
+    if isinstance(payload, dict):
+        for key in ("top8", "best8", "results"):
+            records = payload.get(key, None)
+            if isinstance(records, list):
+                return [dict(item) for item in records]
+    if isinstance(payload, list):
+        return [dict(item) for item in payload]
+    raise ValueError(
+        "Condition-constrained JSON must be a list or contain a list under 'top8', 'best8', or 'results'."
+    )
 
 
-def _injective_boundary_beta_candidates(image_size: int) -> list[tuple[int, int]]:
-    size = int(image_size)
-    used = set()
-    candidates = []
-    for a in range(-size, size + 1):
-        for b in (-size, size):
-            beta = _primitive_signed_beta((a, b))
-            if (
-                beta in used
-                or max(abs(beta[0]), abs(beta[1])) != size
-                or not _is_injective_beta_for_square(beta, size)
-            ):
-                continue
-            used.add(beta)
-            candidates.append(beta)
-    for b in range(-size + 1, size):
-        for a in (-size, size):
-            beta = _primitive_signed_beta((a, b))
-            if (
-                beta in used
-                or max(abs(beta[0]), abs(beta[1])) != size
-                or not _is_injective_beta_for_square(beta, size)
-            ):
-                continue
-            used.add(beta)
-            candidates.append(beta)
-    candidates.sort(key=lambda beta: (beta[0], beta[1]))
-    return candidates
-
-
-def _current_random_beta_seed() -> int:
-    override = os.environ.get("EXTRA_ANGLE_SEED_OVERRIDE", None)
-    if override is not None and str(override).strip():
-        return int(str(override).strip())
-    return int(TIME_DOMAIN_CONFIG.get("extra_angle_seed", 20260322))
-
-
-def _select_random_beta_vectors(
-    *,
-    image_size: int,
-    count: int,
-    excluded_betas=None,
-    seed: int | None = None,
-) -> list[tuple[int, int]]:
-    count = int(count)
-    if count <= 0:
-        return []
-
-    excluded = {_primitive_signed_beta(beta) for beta in list(excluded_betas or [])}
-    pool = [
-        beta
-        for beta in _injective_boundary_beta_candidates(int(image_size))
-        if _primitive_signed_beta(beta) not in excluded
-    ]
-    if len(pool) < count:
-        raise ValueError(
-            f"Not enough injective beta candidates for count={count}; only {len(pool)} available after exclusions."
+def _load_condition_constrained8_records(path: str | None = None) -> list[dict]:
+    json_path = str(
+        path
+        or os.environ.get("CONDITION_CONSTRAINED8_PI_JSON_OVERRIDE", "").strip()
+        or CONDITION_CONSTRAINED8_PI_JSON
+    )
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(
+            "condition_constrained8_pi profile requires best-condition JSON. "
+            f"Missing file: {json_path}. Run models/condition_constrained_sampling.py first "
+            "or set CONDITION_CONSTRAINED8_PI_JSON_OVERRIDE."
         )
+    with open(json_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    records = _extract_condition_constrained_records(payload)
+    if len(records) < 8:
+        raise ValueError(f"condition_constrained8_pi requires at least 8 records, got {len(records)} from {json_path}.")
 
-    rng = np.random.default_rng(int(_current_random_beta_seed() if seed is None else seed))
-    picked = rng.choice(len(pool), size=count, replace=False)
-    return [pool[int(idx)] for idx in picked.tolist()]
-
-
-def _apply_full_triangular_16angle_profile(
-    *,
-    beta_vectors,
-    solver_mode: str,
-    formula_mode: str | None = None,
-) -> None:
-    beta_list = [tuple(int(v) for v in beta) for beta in list(beta_vectors)]
-    if len(beta_list) != FULL_TRIANGULAR_16ANGLE_COUNT:
-        raise ValueError(
-            "Full-triangular 16-angle profile requires exactly "
-            f"{FULL_TRIANGULAR_16ANGLE_COUNT} beta vectors; got {len(beta_list)}."
+    normalized: list[dict] = []
+    for idx, record in enumerate(records[:8], start=1):
+        if "beta" not in record:
+            raise ValueError(f"Condition-constrained record #{idx} is missing 'beta': {record!r}")
+        beta = tuple(int(v) for v in list(record["beta"]))
+        if len(beta) != 2:
+            raise ValueError(f"Condition-constrained record #{idx} beta must have length 2, got {record['beta']!r}")
+        normalized.append(
+            {
+                "beta": beta,
+                "tau_star": _condition_record_float(record, "tau_star", "tau", "band_t0"),
+                "cond": _condition_record_float(record, "cond", "condition_number"),
+                "sigma_min": float(record.get("sigma_min", float("nan"))),
+                "sigma_max": float(record.get("sigma_max", float("nan"))),
+            }
         )
-    solver_mode = str(solver_mode).strip().lower()
-    if solver_mode not in {"stacked_tikhonov", "split_triangular_admm"}:
-        raise ValueError(
-            f"Unsupported solver_mode={solver_mode!r}; expected 'stacked_tikhonov' "
-            "or 'split_triangular_admm'."
-        )
+    if len({item["beta"] for item in normalized}) != 8:
+        raise ValueError("condition_constrained8_pi JSON must contain 8 distinct beta vectors.")
+    return normalized
 
-    TIME_DOMAIN_CONFIG["multi_angle_solver_mode"] = solver_mode
+
+def _apply_condition_constrained8_pi_profile(json_path: str | None = None) -> None:
+    records = _load_condition_constrained8_records(path=json_path)
+    beta_list = [item["beta"] for item in records]
+    tau_offsets = [float(item["tau_star"]) for item in records]
+
+    # Keep the best absolute Tikhonov initialization as the only retained
+    # initialization path for the condition-constrained experiment.
+    TIME_DOMAIN_CONFIG["multi_angle_solver_mode"] = "stacked_tikhonov"
     TIME_DOMAIN_CONFIG["multi_angle_layout"] = "full_triangular"
     TIME_DOMAIN_CONFIG["beta_vectors"] = beta_list
-    TIME_DOMAIN_CONFIG["explicit_extra_beta_vectors"] = None
-    TIME_DOMAIN_CONFIG["num_angles_total"] = FULL_TRIANGULAR_16ANGLE_COUNT
-    TIME_DOMAIN_CONFIG["num_angles"] = FULL_TRIANGULAR_16ANGLE_COUNT
+    TIME_DOMAIN_CONFIG["num_angles_total"] = 8
+    TIME_DOMAIN_CONFIG["num_angles"] = 8
     TIME_DOMAIN_CONFIG["cnn_backbone_only"] = False
-    TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = FULL_TRIANGULAR_16ANGLE_COUNT
+    TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = 8
     TIME_DOMAIN_CONFIG["cnn_angle_indices_override"] = None
     TIME_DOMAIN_CONFIG["cnn_feature_beta_vectors_override"] = None
     TIME_DOMAIN_CONFIG["cnn_angle_adapter_enabled"] = False
     TIME_DOMAIN_CONFIG["cnn_angle_adapter_mode"] = "disabled"
     TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = 8
     TIME_DOMAIN_CONFIG["cnn_angle_adapter_hidden_channels"] = 8
-    if formula_mode is not None:
-        TIME_DOMAIN_CONFIG["theoretical_formula_mode"] = str(formula_mode).strip().lower()
+    TIME_DOMAIN_CONFIG["theoretical_formula_mode"] = "condition_constrained_offset"
+    TIME_DOMAIN_CONFIG["data_formula_mode"] = "auto_complete"
+    TIME_DOMAIN_CONFIG["condition_constrained_tau_offsets"] = tau_offsets
+    TIME_DOMAIN_CONFIG["condition_constrained_records"] = records
+    TIME_DOMAIN_CONFIG["condition_constrained_json"] = str(
+        json_path
+        or os.environ.get("CONDITION_CONSTRAINED8_PI_JSON_OVERRIDE", "").strip()
+        or CONDITION_CONSTRAINED8_PI_JSON
+    )
+    TIME_DOMAIN_CONFIG["auto_angle_t0"] = False
+
+
+def _apply_same8_shifted_support_triangular_pi_profile(json_path: str | None = None) -> None:
+    """Same 8 angles as condition_constrained8_pi, using the exact triangular legacy baseline."""
+    records = _load_condition_constrained8_records(
+        path=json_path
+        or os.environ.get("CONDITION_CONSTRAINED8_PI_JSON_OVERRIDE", "").strip()
+        or CONDITION_CONSTRAINED8_PI_JSON
+    )
+    beta_list = [item["beta"] for item in records]
+
+    TIME_DOMAIN_CONFIG["multi_angle_solver_mode"] = "stacked_tikhonov"
+    TIME_DOMAIN_CONFIG["multi_angle_layout"] = "full_triangular"
+    TIME_DOMAIN_CONFIG["beta_vectors"] = beta_list
+    TIME_DOMAIN_CONFIG["num_angles_total"] = 8
+    TIME_DOMAIN_CONFIG["num_angles"] = 8
+    TIME_DOMAIN_CONFIG["cnn_backbone_only"] = False
+    TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = 8
+    TIME_DOMAIN_CONFIG["cnn_angle_indices_override"] = None
+    TIME_DOMAIN_CONFIG["cnn_feature_beta_vectors_override"] = None
+    TIME_DOMAIN_CONFIG["cnn_angle_adapter_enabled"] = False
+    TIME_DOMAIN_CONFIG["cnn_angle_adapter_mode"] = "disabled"
+    TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = 8
+    TIME_DOMAIN_CONFIG["cnn_angle_adapter_hidden_channels"] = 8
+    TIME_DOMAIN_CONFIG["theoretical_formula_mode"] = "legacy_injective_extension"
+    TIME_DOMAIN_CONFIG["data_formula_mode"] = "auto_complete"
+    TIME_DOMAIN_CONFIG["condition_constrained_tau_offsets"] = None
+    TIME_DOMAIN_CONFIG["condition_constrained_records"] = None
+    TIME_DOMAIN_CONFIG["condition_constrained_json"] = None
+    TIME_DOMAIN_CONFIG["auto_angle_t0"] = True
 
 
 def _apply_experiment_profile(profile_name: str) -> None:
     profile = str(profile_name or "").strip().lower()
     if profile in ("", "default", "none"):
-        TIME_DOMAIN_CONFIG["experiment_profile"] = "default"
-        TIME_DOMAIN_CONFIG["multi_angle_layout"] = "structured_backbone_extra"
-        TIME_DOMAIN_CONFIG["explicit_extra_beta_vectors"] = None
-        return
+        profile = DEFAULT_EXPERIMENT_PROFILE
 
     TIME_DOMAIN_CONFIG["experiment_profile"] = profile
     TIME_DOMAIN_CONFIG["operator_mode"] = "theoretical_b1b1"
     TIME_DOMAIN_CONFIG["use_multi_angle"] = True
+    TIME_DOMAIN_CONFIG["multi_angle_layout"] = "full_triangular"
     TIME_DOMAIN_CONFIG["auto_angle_t0"] = True
-    TIME_DOMAIN_CONFIG["multi_angle_solver_mode"] = "split_triangular_admm"
+    TIME_DOMAIN_CONFIG["multi_angle_solver_mode"] = "stacked_tikhonov"
+    TIME_DOMAIN_CONFIG["data_formula_mode"] = "auto_complete"
 
-    if profile == "structured16_injective_extra":
-        _apply_full_triangular_16angle_profile(
-            beta_vectors=list(BACKBONE_MULTI8_BETA_VECTORS)
-            + _select_random_beta_vectors(
-                image_size=IMAGE_SIZE,
-                count=8,
-                excluded_betas=BACKBONE_MULTI8_BETA_VECTORS,
-            ),
-            solver_mode="split_triangular_admm",
-            formula_mode="legacy_injective_extension",
+    if profile == "condition_constrained8_pi":
+        _apply_condition_constrained8_pi_profile(
+            json_path=os.environ.get("CONDITION_CONSTRAINED8_PI_JSON_OVERRIDE", "").strip()
+            or CONDITION_CONSTRAINED8_PI_JSON
         )
         return
 
-    if profile == "injective16_full_triangular":
-        _apply_full_triangular_16angle_profile(
-            beta_vectors=_select_random_beta_vectors(
-                image_size=IMAGE_SIZE,
-                count=FULL_TRIANGULAR_16ANGLE_COUNT,
-                excluded_betas=None,
-            ),
-            solver_mode="split_triangular_admm",
-            formula_mode="legacy_injective_extension",
-        )
-        return
-
-    if profile == "injective16_pi_best":
-        _apply_full_triangular_16angle_profile(
-            beta_vectors=BEST_PI16_BETA_VECTORS,
-            solver_mode="stacked_tikhonov",
-            formula_mode="legacy_injective_extension",
-        )
-        TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = FULL_TRIANGULAR_16ANGLE_COUNT
-        TIME_DOMAIN_CONFIG["cnn_feature_beta_vectors_override"] = None
+    if profile == "same8_shifted_support_triangular_pi":
+        _apply_same8_shifted_support_triangular_pi_profile()
         return
 
     raise ValueError(
         f"Unsupported EXPERIMENT_PROFILE_OVERRIDE={profile_name!r}; "
-        "expected one of 'structured16_injective_extra', 'injective16_full_triangular', "
-        "'injective16_pi_best'."
+        "expected one of 'condition_constrained8_pi' or "
+        "'same8_shifted_support_triangular_pi'."
     )
 
 
@@ -482,11 +427,9 @@ TIME_DOMAIN_CONFIG = {
     "experiment_profile": DEFAULT_EXPERIMENT_PROFILE,
     "sampling_scheme": "paper_grid_t0",
     "sampling_t0": 0.5,
-    # Used only by the split_triangular_admm-internal shifted-support B1*B1 formula.
-    # For the 8 backbone eligible directions we shift each per-angle sampling grid by
-    # the lower support bound of R_alpha phi so every theoretical block remains valid.
-    "auto_angle_t0": True,
-    # Used only when sampling_scheme == "uniform_random_support"
+    # legacy_injective_extension uses the exact triangular support-left shift,
+    # while condition_constrained_offset uses per-angle tau offsets.
+    "auto_angle_t0": False,
     "sampling_seed": 123,
 
     # Angle mode switch:
@@ -494,31 +437,20 @@ TIME_DOMAIN_CONFIG = {
     # - False: single-angle, uses the paper's eligible direction beta=(1,21)
     "use_multi_angle": True,
 
-    # Multi-angle configuration (only used when use_multi_angle is True).
-    # beta_vectors are the fixed 8 backbone directions that must always be present.
-    # The effective num_angles is derived later from num_angles_total.
+    # Only the 8-angle full-triangular layout is retained.
     "num_angles_total": 8,
-    "beta_vectors": list(BACKBONE_MULTI8_BETA_VECTORS),
-    # - "structured_backbone_extra": first 8 backbone angles are theoretical split blocks,
-    #   any additional angles are handled by the legacy extra-angle refinement path.
-    # - "full_triangular": every listed beta_vector is treated as a theoretical
-    #   split-triangular angle (requires each beta to satisfy injectivity).
-    "multi_angle_layout": "structured_backbone_extra",
-    # Optional explicit extra angles used only by structured_backbone_extra.
-    "explicit_extra_beta_vectors": None,
-    # Multi-angle solver:
-    # - "stacked_tikhonov": reduced stacked solve in the common c-coordinate
-    # - "split_triangular_admm": backbone 8 angles solved in split variables d_i=P_i c
+    "beta_vectors": [],
+    "multi_angle_layout": "full_triangular",
     "multi_angle_solver_mode": "stacked_tikhonov",
-    # Theoretical B1*B1 per-angle block construction:
-    # - "auto": derive from multi_angle_solver_mode for backward compatibility
-    # - "legacy": effective_t0 = t0 - kappa0
-    # - "shifted_support": choose effective_t0 = support_left * ||beta|| + t0
-    # - "legacy_injective_extension": keep t0=0.5 on the reordered d-axis and
-    #   build lower bands from relative sorted injective gaps n_j - n_i
-    "theoretical_formula_mode": "auto",
-    # Random seed for extra angles when num_angles_total > len(beta_vectors).
-    "extra_angle_seed": 20260322,
+    # Only the two retained sampling/matrix constructions remain:
+    # - condition_constrained_offset: full sparse matrix with per-angle tau offsets
+    # - legacy_injective_extension: exact lower-banded triangular matrix
+    "theoretical_formula_mode": "condition_constrained_offset",
+    # Observation generation reuses the same exact operator for each retained method.
+    "data_formula_mode": "auto_complete",
+    "condition_constrained_tau_offsets": None,
+    "condition_constrained_records": None,
+    "condition_constrained_json": CONDITION_CONSTRAINED8_PI_JSON,
     # CNN-side angle channels:
     # - True:  only expose the fixed backbone angles to the learned update network
     # - False: expose all physical angles to the learned update network
@@ -542,28 +474,6 @@ TIME_DOMAIN_CONFIG = {
     "cnn_angle_adapter_mode": "disabled",
     "cnn_angle_adapter_output_channels": 8,
     "cnn_angle_adapter_hidden_channels": 8,
-    # Weight mu for extra (non-backbone) generic refinement views.
-    "extra_angle_weight_mu": 1.0,
-    # ADMM controls for the split-triangular backbone solver.
-    "split_admm_rho": 0.5,
-    # 16-angle full-triangular initialization becomes prohibitively slow with
-    # very large iteration budgets. Use a moderate default and override it
-    # explicitly for high-accuracy runs when needed.
-    "split_admm_max_iter": 400,
-    "split_admm_tol": 5.0e-5,
-    # Progress heartbeat for the first split-ADMM initialization call.
-    "split_admm_progress_interval": 50,
-    # Extra-angle refinement controls for K > 8 structured solves.
-    # The refinement solves for delta_c around the backbone solution:
-    #   mu ||A_extra delta_c - r_extra||^2 + gamma ||delta_c||^2
-    # with gamma = extra_refine_gamma_scale * lambda_backbone
-    #           + extra_refine_residual_scale * ||r_extra|| / sqrt(M_extra).
-    "extra_refine_gamma_scale": 32.0,
-    "extra_refine_residual_scale": 32.0,
-    "extra_refine_solver": "direct",
-    "extra_refine_cg_iters": 20,
-    "extra_refine_cg_tol": 1.0e-4,
-
     # Initialization strategy used by train.py / test.py before the learned updates.
     # Supported values:
     # - "cg": iterative Tikhonov solve
@@ -596,7 +506,6 @@ _apply_experiment_profile(
 # - "1,21;-1,21;..." or "1:21;-1:21;..." : semicolon-separated integer beta pairs
 _betas_override = os.environ.get("BETA_VECTORS_OVERRIDE", None)
 _total_angles_override_raw = os.environ.get("NUM_ANGLES_TOTAL_OVERRIDE", None)
-_explicit_extra_betas_override = os.environ.get("EXPLICIT_EXTRA_BETA_VECTORS_OVERRIDE", None)
 if _betas_override is not None:
     _s = str(_betas_override).strip()
     if _s == "" or _s.lower() in ("single", "none", "0"):
@@ -626,24 +535,6 @@ if _betas_override is not None:
         if _total_angles_override_raw is None:
             TIME_DOMAIN_CONFIG["num_angles_total"] = int(len(_parsed))
         TIME_DOMAIN_CONFIG["use_multi_angle"] = True
-
-if _explicit_extra_betas_override is not None:
-    _s = str(_explicit_extra_betas_override).strip()
-    if _s:
-        _parsed_extra = []
-        try:
-            for token in [t.strip() for t in _s.split(";") if t.strip()]:
-                token = token.replace(":", ",")
-                parts = [p.strip() for p in token.split(",") if p.strip()]
-                if len(parts) != 2:
-                    raise ValueError(f"Invalid extra beta token: {token!r}")
-                _parsed_extra.append((int(parts[0]), int(parts[1])))
-        except ValueError as e:
-            raise ValueError(
-                "Invalid EXPLICIT_EXTRA_BETA_VECTORS_OVERRIDE="
-                f"{_explicit_extra_betas_override!r}; expected semicolon-separated integer pairs."
-            ) from e
-        TIME_DOMAIN_CONFIG["explicit_extra_beta_vectors"] = _parsed_extra
 
 if _total_angles_override_raw is not None:
     _s = str(_total_angles_override_raw).strip()
@@ -685,19 +576,22 @@ _apply_string_override(
     TIME_DOMAIN_CONFIG,
     "multi_angle_solver_mode",
     "MULTI_ANGLE_SOLVER_MODE_OVERRIDE",
-    allowed_values={"stacked_tikhonov", "split_triangular_admm"},
+    allowed_values={"stacked_tikhonov"},
 )
 _apply_string_override(
     TIME_DOMAIN_CONFIG,
     "multi_angle_layout",
     "MULTI_ANGLE_LAYOUT_OVERRIDE",
-    allowed_values={"structured_backbone_extra", "full_triangular"},
+    allowed_values={"full_triangular"},
 )
 _apply_string_override(
     TIME_DOMAIN_CONFIG,
     "theoretical_formula_mode",
     "THEORETICAL_FORMULA_MODE_OVERRIDE",
-    allowed_values={"auto", "legacy", "shifted_support", "legacy_injective_extension"},
+    allowed_values={
+        "legacy_injective_extension",
+        "condition_constrained_offset",
+    },
 )
 _apply_bool_override(TIME_DOMAIN_CONFIG, "cnn_backbone_only", "CNN_BACKBONE_ONLY_OVERRIDE")
 _apply_int_override(TIME_DOMAIN_CONFIG, "cnn_num_angles_override", "CNN_NUM_ANGLES_OVERRIDE")
@@ -725,30 +619,6 @@ _apply_int_override(
     "CNN_ANGLE_ADAPTER_HIDDEN_CHANNELS_OVERRIDE",
 )
 _apply_bool_override(TIME_DOMAIN_CONFIG, "auto_angle_t0", "AUTO_ANGLE_T0_OVERRIDE")
-_apply_float_override(TIME_DOMAIN_CONFIG, "extra_angle_weight_mu", "EXTRA_ANGLE_WEIGHT_MU_OVERRIDE")
-_apply_float_override(TIME_DOMAIN_CONFIG, "split_admm_rho", "SPLIT_ADMM_RHO_OVERRIDE")
-_apply_float_override(TIME_DOMAIN_CONFIG, "split_admm_tol", "SPLIT_ADMM_TOL_OVERRIDE")
-_apply_float_override(TIME_DOMAIN_CONFIG, "extra_refine_gamma_scale", "EXTRA_REFINE_GAMMA_SCALE_OVERRIDE")
-_apply_float_override(TIME_DOMAIN_CONFIG, "extra_refine_residual_scale", "EXTRA_REFINE_RESIDUAL_SCALE_OVERRIDE")
-_apply_string_override(
-    TIME_DOMAIN_CONFIG,
-    "extra_refine_solver",
-    "EXTRA_REFINE_SOLVER_OVERRIDE",
-    allowed_values={"direct", "cg"},
-)
-_split_iter_override = os.environ.get("SPLIT_ADMM_MAX_ITER_OVERRIDE", None)
-if _split_iter_override is not None and str(_split_iter_override).strip():
-    TIME_DOMAIN_CONFIG["split_admm_max_iter"] = int(str(_split_iter_override).strip())
-_split_progress_interval_override = os.environ.get("SPLIT_ADMM_PROGRESS_INTERVAL_OVERRIDE", None)
-if _split_progress_interval_override is not None and str(_split_progress_interval_override).strip():
-    TIME_DOMAIN_CONFIG["split_admm_progress_interval"] = int(str(_split_progress_interval_override).strip())
-_extra_refine_iters_override = os.environ.get("EXTRA_REFINE_CG_ITERS_OVERRIDE", None)
-if _extra_refine_iters_override is not None and str(_extra_refine_iters_override).strip():
-    TIME_DOMAIN_CONFIG["extra_refine_cg_iters"] = int(str(_extra_refine_iters_override).strip())
-_apply_float_override(TIME_DOMAIN_CONFIG, "extra_refine_cg_tol", "EXTRA_REFINE_CG_TOL_OVERRIDE")
-_seed_override = os.environ.get("EXTRA_ANGLE_SEED_OVERRIDE", None)
-if _seed_override is not None and str(_seed_override).strip():
-    TIME_DOMAIN_CONFIG["extra_angle_seed"] = int(str(_seed_override).strip())
 TIME_DOMAIN_CONFIG["num_angles"] = int(TIME_DOMAIN_CONFIG.get("num_angles_total", TIME_DOMAIN_CONFIG.get("num_angles", 1)))
 
 TRAINING_CONFIG = {
@@ -768,9 +638,8 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 _default_profile_tag = {
-    "structured16_injective_extra": "structured16_injective_extra",
-    "injective16_full_triangular": "injective16_full_triangular",
-    "injective16_pi_best": "injective16_pi_best",
+    "condition_constrained8_pi": "condition_constrained8_pi",
+    "same8_shifted_support_triangular_pi": "same8_shifted_support_triangular_pi",
 }.get(str(TIME_DOMAIN_CONFIG.get("experiment_profile", "default")).strip().lower(), "")
 EXPERIMENT_OUTPUT_TAG = str(os.environ.get("OUTPUT_TAG_OVERRIDE", "") or _default_profile_tag).strip()
 _model_stem = "theoretical_ct"
@@ -826,11 +695,12 @@ def print_config():
     print(f"Data fidelity mode: {DATA_CONFIG['data_fidelity_mode']}")
     print(f"Operator mode: {TIME_DOMAIN_CONFIG['operator_mode']}")
     print(f"Experiment profile: {TIME_DOMAIN_CONFIG.get('experiment_profile', 'default')}")
-    print(f"Multi-angle layout: {TIME_DOMAIN_CONFIG.get('multi_angle_layout', 'structured_backbone_extra')}")
+    print(f"Multi-angle layout: {TIME_DOMAIN_CONFIG.get('multi_angle_layout', 'full_triangular')}")
     print(f"Lambda mode: {DATA_CONFIG['lambda_select_mode']}")
     print(f"Init method: {TIME_DOMAIN_CONFIG['init_method']}")
     print(f"Multi-angle solver mode: {TIME_DOMAIN_CONFIG['multi_angle_solver_mode']}")
     print(f"Theoretical formula mode: {TIME_DOMAIN_CONFIG.get('theoretical_formula_mode', 'auto')}")
+    print(f"Data formula mode: {TIME_DOMAIN_CONFIG.get('data_formula_mode', 'auto_complete')}")
     print(f"Backbone angles: {len(TIME_DOMAIN_CONFIG['beta_vectors'])}")
     print(f"Total angles: {TIME_DOMAIN_CONFIG['num_angles_total']}")
     print(f"CNN backbone only: {TIME_DOMAIN_CONFIG['cnn_backbone_only']}")

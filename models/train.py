@@ -56,13 +56,32 @@ class TheoreticalTrainer:
         val_data_source = str(
             DATA_CONFIG.get("val_data_source", DATA_CONFIG.get("data_source", train_data_source))
         ).strip().lower()
-        self.data_generator = TheoreticalDataGenerator(data_source=train_data_source)
-        self.val_data_generator = TheoreticalDataGenerator(data_source=val_data_source)
+        shared_time_operator = getattr(self.model.optimizer, "operator", None)
+        self.data_generator = TheoreticalDataGenerator(
+            data_source=train_data_source,
+            time_operator=shared_time_operator,
+        )
+        self.val_data_generator = TheoreticalDataGenerator(
+            data_source=val_data_source,
+            time_operator=shared_time_operator,
+        )
         self.logger.info("Train data source: %s", train_data_source)
         self.logger.info("Validation data source: %s", val_data_source)
         self.logger.info("Experiment tag: %s", self.experiment_metadata["output_tag"])
         self.logger.info("Operator mode: %s", self.experiment_metadata["operator_mode"])
         self.logger.info("Operator class: %s", self.experiment_metadata["operator_class"])
+        self.logger.info("Theoretical formula mode: %s", self.experiment_metadata["theoretical_formula_mode"])
+        self.logger.info("Data formula mode: %s", self.experiment_metadata["data_formula_mode"])
+        self.logger.info(
+            "Resolved data formula mode: %s | data/recon operator reused=%s",
+            getattr(self.data_generator, "data_formula_mode", self.experiment_metadata["data_formula_mode"]),
+            bool(getattr(self.data_generator, "data_time_operator", None) is getattr(self.data_generator, "time_operator", None)),
+        )
+        self.logger.info(
+            "Generator/model operator shared: train=%s val=%s",
+            bool(getattr(self.data_generator, "time_operator", None) is shared_time_operator),
+            bool(getattr(self.val_data_generator, "time_operator", None) is shared_time_operator),
+        )
         self.logger.info(
             "Angle usage: total=%d, learned=%d, raw_cnn_channels=%d, mixed_cnn_channels=%d",
             self.experiment_metadata["num_angles"],
@@ -140,7 +159,7 @@ class TheoreticalTrainer:
             "output_tag": EXPERIMENT_OUTPUT_TAG or "default",
             "experiment_profile": str(TIME_DOMAIN_CONFIG.get("experiment_profile", "default")),
             "operator_mode": str(TIME_DOMAIN_CONFIG.get("operator_mode", "")),
-            "multi_angle_layout": str(TIME_DOMAIN_CONFIG.get("multi_angle_layout", "structured_backbone_extra")),
+            "multi_angle_layout": str(TIME_DOMAIN_CONFIG.get("multi_angle_layout", "full_triangular")),
             "operator_class": operator.__class__.__name__,
             "num_angles": int(getattr(operator, "num_angles", 1) or 1),
             "num_angles_total": int(TIME_DOMAIN_CONFIG.get("num_angles_total", getattr(operator, "num_angles", 1) or 1)),
@@ -153,10 +172,15 @@ class TheoreticalTrainer:
             "cnn_angle_adapter_mode": str(getattr(self.model.optimizer, "angle_adapter_mode", "disabled")),
             "cnn_angle_adapter_hidden_channels": int(getattr(self.model.optimizer, "angle_adapter_hidden_channels", 0) or 0),
             "beta_vectors": beta_vectors,
-            "explicit_extra_beta_vectors": [
-                list(beta)
-                for beta in list(TIME_DOMAIN_CONFIG.get("explicit_extra_beta_vectors", []) or [])
-            ],
+            "theoretical_formula_mode": str(TIME_DOMAIN_CONFIG.get("theoretical_formula_mode", "auto")),
+            "data_formula_mode": str(TIME_DOMAIN_CONFIG.get("data_formula_mode", "auto_complete")),
+            "auto_angle_t0": bool(TIME_DOMAIN_CONFIG.get("auto_angle_t0", True)),
+            "condition_constrained_tau_offsets": (
+                list(TIME_DOMAIN_CONFIG.get("condition_constrained_tau_offsets") or [])
+                if TIME_DOMAIN_CONFIG.get("condition_constrained_tau_offsets") is not None
+                else None
+            ),
+            "condition_constrained_json": TIME_DOMAIN_CONFIG.get("condition_constrained_json", None),
         }
 
     def _setup_logging(self):
