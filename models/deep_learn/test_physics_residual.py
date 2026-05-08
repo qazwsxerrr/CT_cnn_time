@@ -47,6 +47,66 @@ class ZeroUpdateNetwork(nn.Module):
 
 
 class PhysicsResidualChannelTests(unittest.TestCase):
+    def test_lgd_selects_matching_data_gradient_and_physics_residual_angle_channels(self):
+        with ConfigPatch(
+            operator_mode="theoretical_b1b1",
+            use_multi_angle=True,
+            alpha_values=[0.23, 0.57, 1.11, 1.43],
+            alpha_tau_offsets=[0.15, 0.25, 0.35, 0.45],
+            num_angles_total=4,
+            num_angles=4,
+            cnn_backbone_only=False,
+            cnn_num_angles_override=None,
+            cnn_angle_indices_override=[0, 2],
+            cnn_angle_adapter_enabled=False,
+            cnn_angle_adapter_mode="disabled",
+            cnn_angle_adapter_output_channels=2,
+            cnn_angle_adapter_hidden_channels=2,
+            theoretical_formula_mode="alpha_continuous",
+            multi_angle_solver_mode="stacked_tikhonov",
+            physics_residual_channel_enabled=True,
+            physics_residual_mode="per_angle_cg",
+            physics_residual_damping=1.0e-2,
+            physics_residual_cg_iters=1,
+            physics_residual_detach=True,
+            physics_residual_normalize=False,
+            physics_explicit_update_enabled=False,
+        ):
+            from model import LearnedGradientDescent
+
+            lgd = LearnedGradientDescent(height=4, width=4, n_iter=1, n_memory=1).to(device)
+            self.assertEqual(lgd.cnn_channel_indices, [0, 2])
+            self.assertEqual(lgd.raw_cnn_num_angles, 2)
+            self.assertEqual(lgd.physics_residual_channels, 2)
+            self.assertEqual(lgd.input_channels, 2 + 2 + 2 + 1)
+
+            coeff = torch.zeros(1, 1, 4, 4, device=device)
+            reg_grad = torch.full_like(coeff, 70.0)
+            memory = torch.full((1, 1, 4, 4), 80.0, device=device)
+            data_grad_pa = torch.stack(
+                [torch.full_like(coeff, float(10 * (idx + 1))) for idx in range(4)],
+                dim=1,
+            )
+            physics_corr = torch.cat(
+                [torch.full((1, 1, 4, 4), float(100 * (idx + 1)), device=device) for idx in range(4)],
+                dim=1,
+            )
+
+            cnn_input = lgd._compose_cnn_input(
+                coeff,
+                torch.zeros(1, lgd.operator.M, device=device),
+                reg_grad,
+                memory,
+                data_grad_pa=data_grad_pa,
+                physics_corr=physics_corr,
+            )
+
+            self.assertEqual(tuple(cnn_input.shape), (1, 7, 4, 4))
+            self.assertTrue(torch.allclose(cnn_input[:, 1], torch.full((1, 4, 4), 10.0, device=device)))
+            self.assertTrue(torch.allclose(cnn_input[:, 2], torch.full((1, 4, 4), 30.0, device=device)))
+            self.assertTrue(torch.allclose(cnn_input[:, 3], torch.full((1, 4, 4), 100.0, device=device)))
+            self.assertTrue(torch.allclose(cnn_input[:, 4], torch.full((1, 4, 4), 300.0, device=device)))
+
     def test_alpha_operator_per_angle_residual_inverse_correction_solves_each_angle_system(self):
         torch.manual_seed(0)
         op = AlphaContinuousB1B1Operator2D(

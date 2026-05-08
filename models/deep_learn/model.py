@@ -267,7 +267,7 @@ class LearnedGradientDescent(nn.Module):
         self.physics_residual_detach = bool(TIME_DOMAIN_CONFIG.get("physics_residual_detach", True))
         self.physics_residual_normalize = bool(TIME_DOMAIN_CONFIG.get("physics_residual_normalize", True))
         if self.physics_residual_enabled and self.physics_residual_mode == "per_angle_cg":
-            self.physics_residual_channels = self.num_angles
+            self.physics_residual_channels = self.raw_cnn_num_angles
         else:
             self.physics_residual_channels = 1 if self.physics_residual_enabled else 0
         self.physics_explicit_update_enabled = bool(TIME_DOMAIN_CONFIG.get("physics_explicit_update_enabled", False))
@@ -309,6 +309,21 @@ class LearnedGradientDescent(nn.Module):
             return list(range(int(self.requested_cnn_num_angles)))
         return list(range(self.learned_num_angles))
 
+    def _cnn_angle_index_tensor(self, target_device):
+        return torch.as_tensor(self.cnn_channel_indices, device=target_device, dtype=torch.long)
+
+    def _select_cnn_angle_channels(self, per_angle_tensor: torch.Tensor) -> torch.Tensor:
+        if int(per_angle_tensor.shape[1]) < int(max(self.cnn_channel_indices) + 1):
+            raise ValueError(
+                f"Per-angle tensor has {int(per_angle_tensor.shape[1])} channels, "
+                f"but requested indices are {self.cnn_channel_indices!r}."
+            )
+        return torch.index_select(
+            per_angle_tensor,
+            dim=1,
+            index=self._cnn_angle_index_tensor(per_angle_tensor.device),
+        )
+
     def _build_update_network(self, input_channels):
         return nn.Sequential(
             nn.InstanceNorm2d(input_channels, affine=True),
@@ -332,14 +347,15 @@ class LearnedGradientDescent(nn.Module):
             _, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(coeff_current, g_observed, return_per_angle=True)
         if int(data_grad_pa.shape[1]) < int(self.raw_cnn_num_angles):
             raise ValueError(f"Per-angle gradient only has {int(data_grad_pa.shape[1])} channels, but CNN expects at least {int(self.raw_cnn_num_angles)} raw channels.")
-        index_tensor = torch.as_tensor(self.cnn_channel_indices, device=data_grad_pa.device, dtype=torch.long)
-        grad_channels = torch.index_select(data_grad_pa, dim=1, index=index_tensor).squeeze(2)
+        grad_channels = self._select_cnn_angle_channels(data_grad_pa).squeeze(2)
         if self.angle_feature_adapter is not None:
             grad_channels = self.angle_feature_adapter(grad_channels)
         parts = [coeff_current, grad_channels]
         if self.physics_residual_enabled:
             if physics_corr is None:
                 raise ValueError("physics_residual_channel_enabled=True, but physics_corr is None.")
+            if self.physics_residual_mode == "per_angle_cg" and int(physics_corr.shape[1]) != int(self.physics_residual_channels):
+                physics_corr = self._select_cnn_angle_channels(physics_corr)
             if int(physics_corr.shape[1]) != int(self.physics_residual_channels):
                 raise ValueError(
                     f"physics residual has {int(physics_corr.shape[1])} channels, "
@@ -426,8 +442,9 @@ class LearnedGradientDescent(nn.Module):
                         detach=self.physics_residual_detach,
                         normalize=self.physics_residual_normalize,
                     )
-                    physics_corr = physics_corr_pa.squeeze(2)
-                    physics_update_corr = physics_corr_pa.mean(dim=1)
+                    selected_physics_corr_pa = self._select_cnn_angle_channels(physics_corr_pa)
+                    physics_corr = selected_physics_corr_pa.squeeze(2)
+                    physics_update_corr = selected_physics_corr_pa.mean(dim=1)
                 else:
                     if not hasattr(op, "residual_inverse_correction"):
                         raise ValueError("The active operator does not implement residual_inverse_correction().")
