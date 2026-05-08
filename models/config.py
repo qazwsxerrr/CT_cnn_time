@@ -261,7 +261,7 @@ TIME_DOMAIN_CONFIG = {
     "cnn_angle_adapter_output_channels": DEFAULT_ALPHA_CONDITION_TOP_K,
     "cnn_angle_adapter_hidden_channels": min(DEFAULT_ALPHA_CONDITION_TOP_K, 8),
     "physics_residual_channel_enabled": True,
-    "physics_residual_mode": "stacked_cg",
+    "physics_residual_mode": "per_angle_cg",
     "physics_residual_damping": 1.0e-2,
     "physics_residual_cg_iters": 8,
     "physics_residual_detach": True,
@@ -302,7 +302,7 @@ def _apply_alpha_condition_profile(json_path: str | None = None) -> None:
     TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = num_angles
     TIME_DOMAIN_CONFIG["cnn_angle_adapter_hidden_channels"] = min(num_angles, 8)
     TIME_DOMAIN_CONFIG["physics_residual_channel_enabled"] = True
-    TIME_DOMAIN_CONFIG["physics_residual_mode"] = "stacked_cg"
+    TIME_DOMAIN_CONFIG["physics_residual_mode"] = "per_angle_cg"
     TIME_DOMAIN_CONFIG["physics_residual_damping"] = 1.0e-2
     TIME_DOMAIN_CONFIG["physics_residual_cg_iters"] = 8
     TIME_DOMAIN_CONFIG["physics_residual_detach"] = True
@@ -392,7 +392,7 @@ _apply_string_override(TIME_DOMAIN_CONFIG, "cnn_angle_adapter_mode", "CNN_ANGLE_
 _apply_int_override(TIME_DOMAIN_CONFIG, "cnn_angle_adapter_output_channels", "CNN_ANGLE_ADAPTER_OUTPUT_CHANNELS_OVERRIDE")
 _apply_int_override(TIME_DOMAIN_CONFIG, "cnn_angle_adapter_hidden_channels", "CNN_ANGLE_ADAPTER_HIDDEN_CHANNELS_OVERRIDE")
 _apply_bool_override(TIME_DOMAIN_CONFIG, "physics_residual_channel_enabled", "PHYSICS_RESIDUAL_CHANNEL_ENABLED_OVERRIDE")
-_apply_string_override(TIME_DOMAIN_CONFIG, "physics_residual_mode", "PHYSICS_RESIDUAL_MODE_OVERRIDE", allowed_values={"stacked_cg"})
+_apply_string_override(TIME_DOMAIN_CONFIG, "physics_residual_mode", "PHYSICS_RESIDUAL_MODE_OVERRIDE", allowed_values={"stacked_cg", "per_angle_cg"})
 _apply_float_override(TIME_DOMAIN_CONFIG, "physics_residual_damping", "PHYSICS_RESIDUAL_DAMPING_OVERRIDE")
 _apply_int_override(TIME_DOMAIN_CONFIG, "physics_residual_cg_iters", "PHYSICS_RESIDUAL_CG_ITERS_OVERRIDE")
 _apply_bool_override(TIME_DOMAIN_CONFIG, "physics_residual_detach", "PHYSICS_RESIDUAL_DETACH_OVERRIDE")

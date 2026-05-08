@@ -47,6 +47,47 @@ class ZeroUpdateNetwork(nn.Module):
 
 
 class PhysicsResidualChannelTests(unittest.TestCase):
+    def test_alpha_operator_per_angle_residual_inverse_correction_solves_each_angle_system(self):
+        torch.manual_seed(0)
+        op = AlphaContinuousB1B1Operator2D(
+            alpha_values=[0.23, 1.11],
+            height=4,
+            width=4,
+            tau_offsets=[0.15, 0.35],
+        ).to(device)
+
+        coeff_true = torch.randn(1, 1, 4, 4, device=device)
+        coeff_current = torch.randn(1, 1, 4, 4, device=device)
+        observed = op(coeff_true)
+
+        correction_pa = op.residual_inverse_correction_per_angle(
+            coeff_current,
+            observed,
+            damping=1.0e-2,
+            cg_iters=16,
+            detach=True,
+            normalize=False,
+        )
+
+        self.assertEqual(tuple(correction_pa.shape), (1, 2, 1, 4, 4))
+        rhs_pa = op.adjoint_per_angle(op.split_measurements(observed - op(coeff_current)))
+        normal_residual_pa = op.apply_normal_per_angle(correction_pa) + 1.0e-2 * correction_pa - rhs_pa
+        self.assertLess(
+            torch.norm(normal_residual_pa).item(),
+            1.0e-3 * torch.norm(rhs_pa).item(),
+        )
+
+        normalized_pa = op.residual_inverse_correction_per_angle(
+            coeff_current,
+            observed,
+            damping=1.0e-2,
+            cg_iters=4,
+            detach=True,
+            normalize=True,
+        )
+        norms = torch.norm(normalized_pa.view(1, 2, -1), dim=2)
+        self.assertTrue(torch.allclose(norms, torch.ones_like(norms), atol=1.0e-5, rtol=1.0e-5))
+
     def test_alpha_operator_residual_inverse_correction_solves_shifted_normal_system(self):
         torch.manual_seed(0)
         op = AlphaContinuousB1B1Operator2D(
@@ -109,6 +150,7 @@ class PhysicsResidualChannelTests(unittest.TestCase):
             theoretical_formula_mode="alpha_continuous",
             multi_angle_solver_mode="stacked_tikhonov",
             physics_residual_channel_enabled=True,
+            physics_residual_mode="per_angle_cg",
             physics_residual_damping=1.0e-2,
             physics_residual_cg_iters=4,
             physics_residual_detach=True,
@@ -124,14 +166,14 @@ class PhysicsResidualChannelTests(unittest.TestCase):
             lgd.update_network = ZeroUpdateNetwork(n_memory=1).to(device)
 
             self.assertTrue(lgd.physics_residual_enabled)
-            self.assertEqual(lgd.physics_residual_channels, 1)
-            self.assertEqual(lgd.input_channels, 2 + 2 + 1 + 1)
+            self.assertEqual(lgd.physics_residual_channels, 2)
+            self.assertEqual(lgd.input_channels, 2 + 2 + 2 + 1)
             self.assertIn("physics_alpha_raw", dict(lgd.named_parameters()))
 
             coeff_initial = torch.zeros(1, 1, 4, 4, device=device)
             coeff_true = torch.randn(1, 1, 4, 4, device=device)
             observed = lgd.operator(coeff_true)
-            expected_corr = lgd.operator.residual_inverse_correction(
+            expected_corr_pa = lgd.operator.residual_inverse_correction_per_angle(
                 coeff_initial,
                 observed,
                 damping=lgd.physics_residual_damping,
@@ -139,6 +181,7 @@ class PhysicsResidualChannelTests(unittest.TestCase):
                 detach=lgd.physics_residual_detach,
                 normalize=lgd.physics_residual_normalize,
             )
+            expected_corr = expected_corr_pa.mean(dim=1)
             expected = coeff_initial + lgd.current_physics_alpha() * expected_corr
 
             coeff_final, history = lgd(coeff_initial, observed)

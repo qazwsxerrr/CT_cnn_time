@@ -595,6 +595,84 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
     def apply_normal(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.adjoint(self.forward(coeff_matrix))
 
+    def apply_normal_per_angle(self, coeff_per_angle: torch.Tensor) -> torch.Tensor:
+        """Apply each single-angle normal matrix independently.
+
+        Args:
+            coeff_per_angle: Tensor with shape ``(B,K,1,H,W)`` or ``(B,K,H,W)``.
+
+        Returns:
+            Tensor with shape ``(B,K,1,H,W)`` containing
+            ``A_k^T A_k coeff_per_angle[:, k]`` for every angle ``k``.
+        """
+        if coeff_per_angle.dim() == 4:
+            coeff_per_angle = coeff_per_angle.unsqueeze(2)
+        if coeff_per_angle.dim() != 5:
+            raise ValueError(f"coeff_per_angle must have shape (B,K,1,H,W), got {tuple(coeff_per_angle.shape)}")
+        if int(coeff_per_angle.shape[1]) != int(self.num_angles):
+            raise ValueError(f"Expected K={self.num_angles} angle channels, got {int(coeff_per_angle.shape[1])}.")
+        if int(coeff_per_angle.shape[2]) != 1 or int(coeff_per_angle.shape[3]) != int(self.height) or int(coeff_per_angle.shape[4]) != int(self.width):
+            raise ValueError(
+                f"Expected coeff_per_angle shape (B,{self.num_angles},1,{self.height},{self.width}), "
+                f"got {tuple(coeff_per_angle.shape)}."
+            )
+        coeff_per_angle = coeff_per_angle.to(dtype=torch.float32, device=self.sampling_points.device)
+        batch = int(coeff_per_angle.shape[0])
+        coeff_flat = coeff_per_angle.reshape(batch, self.num_angles, self.N)
+        order_to_lex = self.order_to_lex_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
+        ordered = coeff_flat.gather(2, order_to_lex)
+        measurement_pa = _sparse_blocks_apply_batched(
+            self.sparse_rows,
+            self.sparse_cols,
+            self.sparse_values,
+            self.sparse_nnz,
+            ordered,
+        )
+        grad_ordered = _sparse_blocks_adjoint_apply_batched(
+            self.sparse_rows,
+            self.sparse_cols,
+            self.sparse_values,
+            self.sparse_nnz,
+            measurement_pa,
+        )
+        lex_to_order = self.lex_to_order_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
+        grad_lex = grad_ordered.gather(2, lex_to_order)
+        return grad_lex.view(batch, self.num_angles, 1, self.height, self.width)
+
+    def solve_shifted_angle_normal_cg(self, rhs_per_angle: torch.Tensor, damping: float = 1.0e-2, cg_iters: int = 8) -> torch.Tensor:
+        """Solve ``(A_k^T A_k + damping I)x_k = rhs_k`` for each angle independently."""
+        if rhs_per_angle.dim() == 4:
+            rhs_per_angle = rhs_per_angle.unsqueeze(2)
+        if rhs_per_angle.dim() != 5:
+            raise ValueError(f"rhs_per_angle must have shape (B,K,1,H,W), got {tuple(rhs_per_angle.shape)}")
+        rhs_per_angle = rhs_per_angle.to(dtype=torch.float32, device=self.sampling_points.device)
+        x = torch.zeros_like(rhs_per_angle)
+        mu = float(damping)
+
+        def normal_plus_mu(z: torch.Tensor) -> torch.Tensor:
+            return self.apply_normal_per_angle(z) + mu * z
+
+        r = rhs_per_angle - normal_plus_mu(x)
+        p = r.clone()
+        rs_old = torch.sum(r.reshape(r.shape[0], r.shape[1], -1).square(), dim=2, keepdim=True)
+        eps = rhs_per_angle.new_tensor(1.0e-12)
+        for _ in range(max(int(cg_iters), 0)):
+            Ap = normal_plus_mu(p)
+            denom = torch.sum(
+                p.reshape(p.shape[0], p.shape[1], -1) * Ap.reshape(Ap.shape[0], Ap.shape[1], -1),
+                dim=2,
+                keepdim=True,
+            ).clamp_min(eps)
+            alpha = rs_old / denom
+            alpha_view = alpha.view(alpha.shape[0], alpha.shape[1], 1, 1, 1)
+            x = x + alpha_view * p
+            r = r - alpha_view * Ap
+            rs_new = torch.sum(r.reshape(r.shape[0], r.shape[1], -1).square(), dim=2, keepdim=True)
+            cg_ratio = rs_new / rs_old.clamp_min(eps)
+            p = r + cg_ratio.view(cg_ratio.shape[0], cg_ratio.shape[1], 1, 1, 1) * p
+            rs_old = rs_new
+        return x
+
     def solve_shifted_normal_cg(self, rhs: torch.Tensor, damping: float = 1.0e-2, cg_iters: int = 8) -> torch.Tensor:
         if rhs.dim() == 3:
             rhs = rhs.unsqueeze(1)
@@ -647,6 +725,41 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             norm = torch.norm(flat, dim=1, keepdim=True).clamp_min(1.0e-6)
             correction = correction / norm.view(-1, 1, 1, 1)
         return correction
+
+    def residual_inverse_correction_per_angle(
+        self,
+        coeff: torch.Tensor,
+        g_observed: torch.Tensor,
+        damping: float = 1.0e-2,
+        cg_iters: int = 8,
+        detach: bool = True,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """Return one inverse-residual correction image per alpha angle.
+
+        For each angle ``k`` this approximates
+
+            ``(A_k^T A_k + damping I)^-1 A_k^T (g_k - A_k c)``.
+
+        The returned shape is ``(B,K,1,H,W)`` so learned models can use the
+        corrections as per-angle feature channels instead of a single stacked
+        correction.
+        """
+        if g_observed.dim() == 3 and g_observed.shape[1] == 1:
+            g_observed = g_observed.squeeze(1)
+        if detach:
+            coeff = coeff.detach()
+            g_observed = g_observed.detach()
+        pred_pa = self.forward_per_angle(coeff)
+        observed_pa = self.split_measurements(g_observed).to(dtype=pred_pa.dtype, device=pred_pa.device)
+        residual_pa = observed_pa - pred_pa
+        rhs_pa = self.adjoint_per_angle(residual_pa)
+        correction_pa = self.solve_shifted_angle_normal_cg(rhs_pa, damping=damping, cg_iters=cg_iters)
+        if normalize:
+            flat = correction_pa.reshape(correction_pa.shape[0], correction_pa.shape[1], -1)
+            norm = torch.norm(flat, dim=2, keepdim=True).clamp_min(1.0e-6)
+            correction_pa = correction_pa / norm.view(correction_pa.shape[0], correction_pa.shape[1], 1, 1, 1)
+        return correction_pa
 
     @torch.no_grad()
     def solve_tikhonov_direct(self, b: torch.Tensor, lambda_reg: float | torch.Tensor) -> torch.Tensor:

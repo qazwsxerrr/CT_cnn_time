@@ -256,14 +256,20 @@ class LearnedGradientDescent(nn.Module):
         self.theoretical_gd = TheoreticalGradientDescent(height, width, regularizer_type, operator=self.learned_operator)
 
         self.physics_residual_enabled = bool(TIME_DOMAIN_CONFIG.get("physics_residual_channel_enabled", False))
-        self.physics_residual_mode = str(TIME_DOMAIN_CONFIG.get("physics_residual_mode", "stacked_cg")).strip().lower()
-        if self.physics_residual_mode != "stacked_cg":
-            raise ValueError(f"physics_residual_mode={self.physics_residual_mode!r}; only 'stacked_cg' is supported.")
+        self.physics_residual_mode = str(TIME_DOMAIN_CONFIG.get("physics_residual_mode", "per_angle_cg")).strip().lower()
+        if self.physics_residual_mode not in {"stacked_cg", "per_angle_cg"}:
+            raise ValueError(
+                f"physics_residual_mode={self.physics_residual_mode!r}; "
+                "expected 'per_angle_cg' or 'stacked_cg'."
+            )
         self.physics_residual_damping = float(TIME_DOMAIN_CONFIG.get("physics_residual_damping", 1.0e-2))
         self.physics_residual_cg_iters = int(TIME_DOMAIN_CONFIG.get("physics_residual_cg_iters", 8))
         self.physics_residual_detach = bool(TIME_DOMAIN_CONFIG.get("physics_residual_detach", True))
         self.physics_residual_normalize = bool(TIME_DOMAIN_CONFIG.get("physics_residual_normalize", True))
-        self.physics_residual_channels = 1 if self.physics_residual_enabled else 0
+        if self.physics_residual_enabled and self.physics_residual_mode == "per_angle_cg":
+            self.physics_residual_channels = self.num_angles
+        else:
+            self.physics_residual_channels = 1 if self.physics_residual_enabled else 0
         self.physics_explicit_update_enabled = bool(TIME_DOMAIN_CONFIG.get("physics_explicit_update_enabled", False))
         self.physics_explicit_update_max = float(TIME_DOMAIN_CONFIG.get("physics_explicit_update_max", 0.10))
         phys_alpha_init = max(float(TIME_DOMAIN_CONFIG.get("physics_explicit_update_alpha_init", 0.02)), 1.0e-8)
@@ -334,6 +340,11 @@ class LearnedGradientDescent(nn.Module):
         if self.physics_residual_enabled:
             if physics_corr is None:
                 raise ValueError("physics_residual_channel_enabled=True, but physics_corr is None.")
+            if int(physics_corr.shape[1]) != int(self.physics_residual_channels):
+                raise ValueError(
+                    f"physics residual has {int(physics_corr.shape[1])} channels, "
+                    f"expected {int(self.physics_residual_channels)}."
+                )
             parts.append(physics_corr)
         parts.extend([reg_grad, memory])
         return torch.cat(parts, dim=1)
@@ -401,18 +412,34 @@ class LearnedGradientDescent(nn.Module):
             data_grad, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(coeff_current, g_observed_learned, return_per_angle=True)
 
             physics_corr = None
+            physics_update_corr = None
             if self.physics_residual_enabled or self.physics_explicit_update_enabled:
                 op = self.theoretical_gd.operator
-                if not hasattr(op, "residual_inverse_correction"):
-                    raise ValueError("The active operator does not implement residual_inverse_correction().")
-                physics_corr = op.residual_inverse_correction(
-                    coeff_current,
-                    g_observed_learned,
-                    damping=self.physics_residual_damping,
-                    cg_iters=self.physics_residual_cg_iters,
-                    detach=self.physics_residual_detach,
-                    normalize=self.physics_residual_normalize,
-                )
+                if self.physics_residual_mode == "per_angle_cg":
+                    if not hasattr(op, "residual_inverse_correction_per_angle"):
+                        raise ValueError("The active operator does not implement residual_inverse_correction_per_angle().")
+                    physics_corr_pa = op.residual_inverse_correction_per_angle(
+                        coeff_current,
+                        g_observed_learned,
+                        damping=self.physics_residual_damping,
+                        cg_iters=self.physics_residual_cg_iters,
+                        detach=self.physics_residual_detach,
+                        normalize=self.physics_residual_normalize,
+                    )
+                    physics_corr = physics_corr_pa.squeeze(2)
+                    physics_update_corr = physics_corr_pa.mean(dim=1)
+                else:
+                    if not hasattr(op, "residual_inverse_correction"):
+                        raise ValueError("The active operator does not implement residual_inverse_correction().")
+                    physics_corr = op.residual_inverse_correction(
+                        coeff_current,
+                        g_observed_learned,
+                        damping=self.physics_residual_damping,
+                        cg_iters=self.physics_residual_cg_iters,
+                        detach=self.physics_residual_detach,
+                        normalize=self.physics_residual_normalize,
+                    )
+                    physics_update_corr = physics_corr
             if self.detach_physical_grads:
                 data_grad = data_grad.detach()
                 reg_grad_base = reg_grad_base.detach()
@@ -420,6 +447,8 @@ class LearnedGradientDescent(nn.Module):
                     data_grad_pa = data_grad_pa.detach()
             if self.physics_residual_detach and physics_corr is not None:
                 physics_corr = physics_corr.detach()
+                if physics_update_corr is not None:
+                    physics_update_corr = physics_update_corr.detach()
             reg_grad = reg_grad_base * lambda_i
             cnn_input = self._compose_cnn_input(coeff_current, g_observed_learned, reg_grad, memory, data_grad_pa=data_grad_pa, physics_corr=physics_corr)
             cnn_output = self.update_network(cnn_input)
@@ -427,8 +456,8 @@ class LearnedGradientDescent(nn.Module):
             new_memory = cnn_output[:, 1:, :, :]
             learned_update = self._cap_correction(raw_update) * self.current_step_size()
             phys_update = torch.zeros_like(learned_update)
-            if self.physics_explicit_update_enabled and physics_corr is not None:
-                phys_update = self.current_physics_alpha() * physics_corr
+            if self.physics_explicit_update_enabled and physics_update_corr is not None:
+                phys_update = self.current_physics_alpha() * physics_update_corr
             total_update = self._clip_update_norm(learned_update - phys_update)
             coeff_current = coeff_current - total_update
             memory = torch.relu(new_memory)
