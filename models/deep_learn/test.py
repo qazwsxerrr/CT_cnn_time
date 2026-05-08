@@ -135,10 +135,6 @@ def _temporary_experiment_config(experiment_metadata: dict):
         return
 
     backup = copy.deepcopy(TIME_DOMAIN_CONFIG)
-    beta_vectors = [
-        tuple(int(v) for v in beta)
-        for beta in experiment_metadata.get("beta_vectors", [])
-    ]
     try:
         profile_name = str(experiment_metadata.get("experiment_profile", "") or "").strip()
         if profile_name:
@@ -148,8 +144,6 @@ def _temporary_experiment_config(experiment_metadata: dict):
                 TIME_DOMAIN_CONFIG["experiment_profile"] = profile_name
         if experiment_metadata.get("operator_mode"):
             TIME_DOMAIN_CONFIG["operator_mode"] = str(experiment_metadata["operator_mode"])
-        if experiment_metadata.get("multi_angle_layout"):
-            TIME_DOMAIN_CONFIG["multi_angle_layout"] = str(experiment_metadata["multi_angle_layout"])
         if experiment_metadata.get("theoretical_formula_mode"):
             TIME_DOMAIN_CONFIG["theoretical_formula_mode"] = str(
                 experiment_metadata["theoretical_formula_mode"]
@@ -158,22 +152,20 @@ def _temporary_experiment_config(experiment_metadata: dict):
             TIME_DOMAIN_CONFIG["data_formula_mode"] = str(
                 experiment_metadata["data_formula_mode"]
             )
-        if "auto_angle_t0" in experiment_metadata:
-            TIME_DOMAIN_CONFIG["auto_angle_t0"] = bool(experiment_metadata["auto_angle_t0"])
-        if "condition_constrained_tau_offsets" in experiment_metadata:
-            tau_offsets = experiment_metadata.get("condition_constrained_tau_offsets")
-            TIME_DOMAIN_CONFIG["condition_constrained_tau_offsets"] = (
-                [float(v) for v in tau_offsets] if tau_offsets is not None else None
+        if "alpha_values" in experiment_metadata:
+            alpha_values = [float(v) for v in (experiment_metadata.get("alpha_values") or [])]
+            TIME_DOMAIN_CONFIG["alpha_values"] = alpha_values
+            TIME_DOMAIN_CONFIG["use_multi_angle"] = len(alpha_values) > 1
+            TIME_DOMAIN_CONFIG["num_angles"] = int(len(alpha_values))
+            TIME_DOMAIN_CONFIG["num_angles_total"] = int(len(alpha_values))
+        if "alpha_tau_offsets" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["alpha_tau_offsets"] = [
+                float(v) for v in (experiment_metadata.get("alpha_tau_offsets") or [])
+            ]
+        if "alpha_condition_constrained_json" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["alpha_condition_constrained_json"] = experiment_metadata.get(
+                "alpha_condition_constrained_json"
             )
-        if "condition_constrained_json" in experiment_metadata:
-            TIME_DOMAIN_CONFIG["condition_constrained_json"] = experiment_metadata.get(
-                "condition_constrained_json"
-            )
-        if beta_vectors:
-            TIME_DOMAIN_CONFIG["beta_vectors"] = list(beta_vectors)
-            TIME_DOMAIN_CONFIG["use_multi_angle"] = len(beta_vectors) > 1
-            TIME_DOMAIN_CONFIG["num_angles"] = int(len(beta_vectors))
-            TIME_DOMAIN_CONFIG["num_angles_total"] = int(len(beta_vectors))
         if "cnn_backbone_only" in experiment_metadata:
             TIME_DOMAIN_CONFIG["cnn_backbone_only"] = bool(experiment_metadata["cnn_backbone_only"])
         if "learned_num_angles" in experiment_metadata:

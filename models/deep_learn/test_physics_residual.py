@@ -12,7 +12,7 @@ for path in (THIS_DIR, MODELS_DIR):
         sys.path.insert(0, str(path))
 
 from config import TIME_DOMAIN_CONFIG, device
-from radon_transform import TheoreticalAlphaB1B1Operator2D
+from radon_transform import AlphaContinuousB1B1Operator2D
 
 
 class ConfigPatch:
@@ -49,7 +49,7 @@ class ZeroUpdateNetwork(nn.Module):
 class PhysicsResidualChannelTests(unittest.TestCase):
     def test_alpha_operator_residual_inverse_correction_solves_shifted_normal_system(self):
         torch.manual_seed(0)
-        op = TheoreticalAlphaB1B1Operator2D(
+        op = AlphaContinuousB1B1Operator2D(
             alpha_values=[0.23, 1.11],
             height=4,
             width=4,
@@ -95,25 +95,19 @@ class PhysicsResidualChannelTests(unittest.TestCase):
         with ConfigPatch(
             operator_mode="theoretical_b1b1",
             use_multi_angle=True,
-            angle_parameterization="alpha",
             alpha_values=[0.23, 1.11],
             alpha_tau_offsets=[0.15, 0.35],
             num_angles_total=2,
             num_angles=2,
-            beta_vectors=[],
             cnn_backbone_only=False,
             cnn_num_angles_override=2,
             cnn_angle_indices_override=None,
-            cnn_feature_beta_vectors_override=None,
             cnn_angle_adapter_enabled=False,
             cnn_angle_adapter_mode="disabled",
             cnn_angle_adapter_output_channels=2,
             cnn_angle_adapter_hidden_channels=2,
             theoretical_formula_mode="alpha_continuous",
             multi_angle_solver_mode="stacked_tikhonov",
-            triangular_residual_channel_enabled=False,
-            triangular_explicit_update_enabled=False,
-            triangular_angle_attention_enabled=False,
             physics_residual_channel_enabled=True,
             physics_residual_damping=1.0e-2,
             physics_residual_cg_iters=4,

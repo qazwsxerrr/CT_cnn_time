@@ -195,23 +195,19 @@ def apply_alpha_runtime_config(
     tau_offsets = [float(item["tau_star"]) for item in records]
     num_angles = int(len(alpha_values))
 
-    TIME_DOMAIN_CONFIG["experiment_profile"] = "alpha_condition_constrained8"
-    TIME_DOMAIN_CONFIG["angle_parameterization"] = "alpha"
+    TIME_DOMAIN_CONFIG["experiment_profile"] = "alpha_condition"
     TIME_DOMAIN_CONFIG["alpha_values"] = alpha_values
     TIME_DOMAIN_CONFIG["alpha_tau_offsets"] = tau_offsets
     TIME_DOMAIN_CONFIG["alpha_condition_constrained_records"] = list(records)
     TIME_DOMAIN_CONFIG["alpha_condition_constrained_json"] = str(alpha_json)
     TIME_DOMAIN_CONFIG["num_angles_total"] = num_angles
     TIME_DOMAIN_CONFIG["num_angles"] = num_angles
-    TIME_DOMAIN_CONFIG["beta_vectors"] = []
     TIME_DOMAIN_CONFIG["operator_mode"] = "theoretical_b1b1"
     TIME_DOMAIN_CONFIG["use_multi_angle"] = True
     TIME_DOMAIN_CONFIG["multi_angle_solver_mode"] = "stacked_tikhonov"
-    TIME_DOMAIN_CONFIG["multi_angle_layout"] = "full_triangular"
     TIME_DOMAIN_CONFIG["theoretical_formula_mode"] = "alpha_continuous"
     TIME_DOMAIN_CONFIG["data_formula_mode"] = "auto_complete"
     TIME_DOMAIN_CONFIG["init_method"] = "tikhonov_direct"
-    TIME_DOMAIN_CONFIG["auto_angle_t0"] = False
     TIME_DOMAIN_CONFIG["cnn_backbone_only"] = False
     TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = num_angles
 

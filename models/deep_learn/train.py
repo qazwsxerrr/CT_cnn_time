@@ -106,19 +106,19 @@ class TheoreticalTrainer:
             self.experiment_metadata["cnn_num_angles"],
         )
         self.logger.info(
-            "Active beta vectors (%d): %s",
-            len(self.experiment_metadata["beta_vectors"]),
-            self.experiment_metadata["beta_vectors"],
+            "Active alpha JSON: %s",
+            self.experiment_metadata.get("alpha_condition_constrained_json"),
         )
-        if self.experiment_metadata.get("angle_parameterization") == "alpha":
-            self.logger.info(
-                "Active alpha JSON: %s",
-                self.experiment_metadata.get("alpha_condition_constrained_json"),
-            )
-            self.logger.info(
-                "Active alpha count: %d",
-                len(self.experiment_metadata.get("alpha_values") or []),
-            )
+        self.logger.info(
+            "Active alpha angles (%d): %s",
+            len(self.experiment_metadata.get("alpha_values") or []),
+            self.experiment_metadata.get("alpha_values") or [],
+        )
+        self.logger.info(
+            "Active alpha tau offsets (%d): %s",
+            len(self.experiment_metadata.get("alpha_tau_offsets") or []),
+            self.experiment_metadata.get("alpha_tau_offsets") or [],
+        )
         noise_mode = str(DATA_CONFIG.get("noise_mode", "additive")).strip().lower()
         if noise_mode == "snr":
             self.logger.info("Noise setting: SNR=%sdB", DATA_CONFIG.get("target_snr_db", 30.0))
@@ -135,8 +135,6 @@ class TheoreticalTrainer:
         scalar_names = (
             "step_size_raw",
             "reg_lambda_raw",
-            "triangular_alpha_raw",
-            "triangular_angle_logits",
             "physics_alpha_raw",
         )
         for name, param in self.model.named_parameters():
@@ -176,19 +174,13 @@ class TheoreticalTrainer:
 
     def _build_experiment_metadata(self):
         operator = self.model.optimizer.operator
-        beta_vectors = [
-            tuple(int(v) for v in beta)
-            for beta in getattr(operator, "beta_vectors", TIME_DOMAIN_CONFIG.get("beta_vectors", []))
-        ]
         return {
             "output_tag": EXPERIMENT_OUTPUT_TAG or "default",
             "experiment_profile": str(TIME_DOMAIN_CONFIG.get("experiment_profile", "default")),
             "operator_mode": str(TIME_DOMAIN_CONFIG.get("operator_mode", "")),
-            "multi_angle_layout": str(TIME_DOMAIN_CONFIG.get("multi_angle_layout", "full_triangular")),
             "operator_class": operator.__class__.__name__,
             "num_angles": int(getattr(operator, "num_angles", 1) or 1),
             "num_angles_total": int(TIME_DOMAIN_CONFIG.get("num_angles_total", getattr(operator, "num_angles", 1) or 1)),
-            "num_backbone": int(getattr(operator, "num_backbone", getattr(operator, "num_angles", 1)) or 1),
             "cnn_backbone_only": bool(TIME_DOMAIN_CONFIG.get("cnn_backbone_only", True)),
             "learned_num_angles": int(getattr(self.model.optimizer, "learned_num_angles", 1) or 1),
             "raw_cnn_angle_channels": int(getattr(self.model.optimizer, "raw_cnn_num_angles", getattr(self.model.optimizer, "cnn_num_angles", 1)) or 1),
@@ -196,20 +188,11 @@ class TheoreticalTrainer:
             "cnn_angle_adapter_enabled": bool(getattr(self.model.optimizer, "angle_feature_adapter", None) is not None),
             "cnn_angle_adapter_mode": str(getattr(self.model.optimizer, "angle_adapter_mode", "disabled")),
             "cnn_angle_adapter_hidden_channels": int(getattr(self.model.optimizer, "angle_adapter_hidden_channels", 0) or 0),
-            "beta_vectors": beta_vectors,
-            "angle_parameterization": str(TIME_DOMAIN_CONFIG.get("angle_parameterization", "beta")),
             "alpha_values": list(TIME_DOMAIN_CONFIG.get("alpha_values") or []),
             "alpha_tau_offsets": list(TIME_DOMAIN_CONFIG.get("alpha_tau_offsets") or []),
             "alpha_condition_constrained_json": TIME_DOMAIN_CONFIG.get("alpha_condition_constrained_json", None),
             "theoretical_formula_mode": str(TIME_DOMAIN_CONFIG.get("theoretical_formula_mode", "auto")),
             "data_formula_mode": str(TIME_DOMAIN_CONFIG.get("data_formula_mode", "auto_complete")),
-            "auto_angle_t0": bool(TIME_DOMAIN_CONFIG.get("auto_angle_t0", True)),
-            "condition_constrained_tau_offsets": (
-                list(TIME_DOMAIN_CONFIG.get("condition_constrained_tau_offsets") or [])
-                if TIME_DOMAIN_CONFIG.get("condition_constrained_tau_offsets") is not None
-                else None
-            ),
-            "condition_constrained_json": TIME_DOMAIN_CONFIG.get("condition_constrained_json", None),
         }
 
     def _setup_logging(self):
