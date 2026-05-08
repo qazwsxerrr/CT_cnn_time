@@ -25,6 +25,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+try:
+    from scipy.linalg import cholesky_banded, cho_solve_banded, solve_banded
+except Exception:  # pragma: no cover - exercised only when SciPy is unavailable
+    cholesky_banded = None
+    cho_solve_banded = None
+    solve_banded = None
+
 from config import DATA_CONFIG, IMAGE_SIZE, THEORETICAL_CONFIG, TIME_DOMAIN_CONFIG, device
 from image_generator import (
     DifferentiableImageGenerator,
@@ -197,7 +204,10 @@ def _ensure_implicit_gram_spectrum(
     if getattr(operator, "_morozov_gram_eigvals", None) is not None and getattr(operator, "_morozov_gram_eigvecs", None) is not None:
         return operator._morozov_gram_eigvals, operator._morozov_gram_eigvecs
 
-    cache_dir = str(DATA_CONFIG.get("morozov_cache_dir", "")).strip()
+    cache_dir = str(
+        getattr(operator, "_gram_cache_dir_override", None)
+        or DATA_CONFIG.get("morozov_cache_dir", "")
+    ).strip()
     if not cache_dir:
         raise ValueError("DATA_CONFIG['morozov_cache_dir'] must be a non-empty path.")
     os.makedirs(cache_dir, exist_ok=True)
@@ -433,6 +443,8 @@ def _beta_support_bounds_b1b1(beta: torch.Tensor) -> tuple[float, float]:
 
 def _formula_mode_from_solver_mode(solver_mode: str) -> str:
     profile = str(TIME_DOMAIN_CONFIG.get("experiment_profile", "")).strip().lower()
+    if profile == "alpha_condition_constrained8":
+        return "alpha_continuous"
     if profile == "same8_shifted_support_triangular_pi":
         return "legacy_injective_extension"
     return "condition_constrained_offset"
@@ -445,12 +457,13 @@ def _resolve_theoretical_formula_mode(formula_mode: str | None, solver_mode: str
     if resolved in {
         "legacy_injective_extension",
         "condition_constrained_offset",
+        "alpha_continuous",
     }:
         return resolved
     raise ValueError(
         f"Unsupported theoretical_formula_mode={formula_mode!r}; "
         "expected 'auto', 'legacy_injective_extension', or "
-        "'condition_constrained_offset'."
+        "'condition_constrained_offset', or 'alpha_continuous'."
     )
 
 
@@ -468,6 +481,40 @@ def _trim_lower_banded_ab(lower_ab: np.ndarray, tol: float = 1.0e-12) -> np.ndar
     if keep.size == 0:
         return lower_ab[:1].copy()
     return lower_ab[: int(keep[-1]) + 1].copy()
+
+
+def _require_scipy_banded() -> None:
+    if cholesky_banded is None or cho_solve_banded is None or solve_banded is None:
+        raise ImportError(
+            "SciPy banded linear algebra is required for split_triangular_admm. "
+            "Install scipy or switch TIME_DOMAIN_CONFIG['multi_angle_solver_mode'] to 'stacked_tikhonov'."
+        )
+
+
+def _build_upper_normal_banded_from_lower_ab(
+    lower_ab: np.ndarray,
+    *,
+    rho: float,
+    weight: float,
+) -> np.ndarray:
+    lower_ab = np.asarray(lower_ab, dtype=np.float64)
+    if lower_ab.ndim != 2:
+        raise ValueError(f"lower_ab must be 2D, got shape {lower_ab.shape}")
+    bw, n = int(lower_ab.shape[0]), int(lower_ab.shape[1])
+    upper_ab = np.zeros((bw, n), dtype=np.float64)
+    scale = 2.0 * float(weight)
+    for offset in range(bw):
+        diag = np.zeros(n - offset, dtype=np.float64)
+        for subdiag in range(bw - offset):
+            length = n - offset - subdiag
+            if length <= 0:
+                continue
+            diag[:length] += lower_ab[offset + subdiag, :length] * lower_ab[subdiag, offset : offset + length]
+        diag *= scale
+        if offset == 0:
+            diag += float(rho)
+        upper_ab[bw - 1 - offset, offset:] = diag
+    return upper_ab
 
 
 def _lower_banded_apply(lower_bands: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -629,6 +676,122 @@ def _lex_lattice_indices(height: int, width: int) -> tuple[torch.Tensor, torch.T
     k1 = torch.arange(int(height), dtype=torch.int64).repeat_interleave(int(width))
     k2 = torch.arange(int(width), dtype=torch.int64).repeat(int(height))
     return k1, k2
+
+
+def _theta_to_unit_direction(theta: float) -> torch.Tensor:
+    theta = float(theta) % math.pi
+    return torch.tensor(
+        [math.cos(theta), math.sin(theta)],
+        dtype=torch.float64,
+    )
+
+
+def _continuous_projection_indices(
+    theta: float,
+    height: int,
+    width: int,
+    *,
+    injective_tol: float = 1.0e-12,
+) -> dict[str, torch.Tensor]:
+    """Return projection-order metadata for continuous α sampling."""
+    k1, k2 = _lex_lattice_indices(int(height), int(width))
+    direction = _theta_to_unit_direction(float(theta))
+    proj = k1.to(torch.float64) * direction[0] + k2.to(torch.float64) * direction[1]
+    sort_idx = torch.argsort(proj, stable=True)
+    sorted_proj = proj.index_select(0, sort_idx)
+    gaps = torch.diff(sorted_proj)
+    min_gap = float(gaps.min().item()) if int(gaps.numel()) > 0 else float("inf")
+    if min_gap <= float(injective_tol):
+        raise ValueError(
+            f"theta={float(theta):.16f} is numerically non-injective on "
+            f"{int(height)}x{int(width)}: min_gap={min_gap:.3e} <= {float(injective_tol):.3e}"
+        )
+    lex_to_d = torch.empty(int(height) * int(width), dtype=torch.int64)
+    lex_to_d[sort_idx] = torch.arange(int(height) * int(width), dtype=torch.int64)
+    return {
+        "theta": torch.tensor(float(theta) % math.pi, dtype=torch.float64),
+        "direction": direction,
+        "proj_lex": proj,
+        "sort_idx": sort_idx.to(torch.int64),
+        "sorted_proj": sorted_proj,
+        "lex_to_d": lex_to_d,
+        "d_to_lex": sort_idx.to(torch.int64),
+        "min_gap": torch.tensor(min_gap, dtype=torch.float64),
+    }
+
+
+def _build_sparse_b1b1_block_from_continuous_proj(
+    *,
+    sorted_proj: torch.Tensor,
+    direction: torch.Tensor,
+    tau: float,
+    value_tol: float = 1.0e-15,
+) -> dict[str, torch.Tensor]:
+    """Build the full sparse projection-order block for α continuous sampling."""
+    sorted_proj = sorted_proj.detach().to(dtype=torch.float64, device="cpu")
+    direction = direction.detach().to(dtype=torch.float64, device="cpu")
+    tau = float(tau)
+    proj_np = sorted_proj.numpy()
+    n = int(proj_np.shape[0])
+    support_lo, support_hi = phi_support_bounds_b1b1(direction)
+    support_lo = float(support_lo)
+    support_hi = float(support_hi)
+
+    row_parts: list[np.ndarray] = []
+    col_parts: list[np.ndarray] = []
+    val_parts: list[np.ndarray] = []
+    lower_bw = 0
+    upper_bw = 0
+
+    for row_idx in range(n):
+        t_i = float(proj_np[row_idx] + tau)
+        left = t_i - support_hi
+        right = t_i - support_lo
+        col0 = int(np.searchsorted(proj_np, left, side="left"))
+        col1 = int(np.searchsorted(proj_np, right, side="right"))
+        if col1 <= col0:
+            continue
+        cols = np.arange(col0, col1, dtype=np.int64)
+        diffs = torch.from_numpy(t_i - proj_np[col0:col1]).to(dtype=torch.float64)
+        vals = radon_phi_b1b1(diffs, direction).detach().to(dtype=torch.float64, device="cpu").numpy()
+        mask = np.abs(vals) > float(value_tol)
+        if not np.any(mask):
+            continue
+        rows = np.full((int(np.count_nonzero(mask)),), row_idx, dtype=np.int64)
+        cols = cols[mask]
+        vals = vals[mask].astype(np.float64, copy=False)
+        row_parts.append(rows)
+        col_parts.append(cols)
+        val_parts.append(vals)
+        lower_bw = max(lower_bw, int(np.max(rows - cols, initial=0)) + 1)
+        upper_bw = max(upper_bw, int(np.max(cols - rows, initial=0)) + 1)
+
+    if row_parts:
+        rows_np = np.concatenate(row_parts).astype(np.int64, copy=False)
+        cols_np = np.concatenate(col_parts).astype(np.int64, copy=False)
+        vals_np = np.concatenate(val_parts).astype(np.float64, copy=False)
+    else:
+        rows_np = np.empty((0,), dtype=np.int64)
+        cols_np = np.empty((0,), dtype=np.int64)
+        vals_np = np.empty((0,), dtype=np.float64)
+
+    diag0 = float(
+        radon_phi_b1b1(
+            torch.tensor([tau], dtype=torch.float64),
+            direction,
+        )[0].item()
+    )
+    return {
+        "sparse_rows": torch.from_numpy(rows_np),
+        "sparse_cols": torch.from_numpy(cols_np),
+        "sparse_values": torch.from_numpy(vals_np),
+        "sparse_nnz": torch.tensor(int(vals_np.shape[0]), dtype=torch.int64),
+        "lower_bandwidth": torch.tensor(int(lower_bw), dtype=torch.int64),
+        "upper_bandwidth": torch.tensor(int(upper_bw), dtype=torch.int64),
+        "diag0": torch.tensor(float(diag0), dtype=torch.float64),
+        "support_lo": torch.tensor(float(support_lo), dtype=torch.float64),
+        "support_hi": torch.tensor(float(support_hi), dtype=torch.float64),
+    }
 
 
 def _build_lower_toeplitz_from_r(r: torch.Tensor) -> torch.Tensor:
@@ -1305,6 +1468,346 @@ class ImplicitPixelRadonOperator2D(torch.nn.Module):
         )
 
 
+class TheoreticalAlphaB1B1Operator2D(torch.nn.Module):
+    """Continuous-α B1*B1 operator with one full sparse block per angle."""
+
+    def __init__(
+        self,
+        alpha_values,
+        height: int = IMAGE_SIZE,
+        width: int = IMAGE_SIZE,
+        tau_offsets=None,
+        t0: float = 0.5,
+        injective_tol: float = 1.0e-12,
+    ):
+        super().__init__()
+        self.height = int(height)
+        self.width = int(width)
+        self.N = int(self.height * self.width)
+        self.alpha_values = [float(v) % math.pi for v in list(alpha_values or [])]
+        if not self.alpha_values:
+            raise ValueError("alpha_values must be a non-empty list of angles in radians.")
+        self.num_angles = int(len(self.alpha_values))
+        self.M_per_angle = int(self.N)
+        self.M = int(self.num_angles * self.M_per_angle)
+        self.t0 = float(t0)
+        self.formula_mode = "alpha_continuous"
+        self.uses_sparse_blocks = True
+        self.beta_vectors: list[tuple[int, int]] = []
+        self._gram_cache_dir_override = str(
+            DATA_CONFIG.get(
+                "alpha_gram_cache_dir",
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "alpha_gram_cache"),
+            )
+        )
+        if tau_offsets is None:
+            tau_list = None
+        else:
+            tau_list = [float(v) for v in list(tau_offsets)]
+            if len(tau_list) != self.num_angles:
+                raise ValueError(
+                    f"tau_offsets length={len(tau_list)} but num_angles={self.num_angles}."
+                )
+        self.tau_offsets = tau_list
+
+        with torch.no_grad():
+            directions = []
+            sorted_proj_list = []
+            sampling_points_list = []
+            lex_to_d_list = []
+            d_to_lex_list = []
+            min_gap_list = []
+            support_lo_list = []
+            support_hi_list = []
+            blocks = []
+            effective_tau = []
+
+            for angle_idx, alpha in enumerate(self.alpha_values):
+                info = _continuous_projection_indices(
+                    alpha,
+                    self.height,
+                    self.width,
+                    injective_tol=float(injective_tol),
+                )
+                direction = info["direction"]
+                support_lo, support_hi = phi_support_bounds_b1b1(direction)
+                tau = (
+                    float(support_lo) + float(t0) * (float(support_hi) - float(support_lo))
+                    if tau_list is None
+                    else float(tau_list[angle_idx])
+                )
+                block = _build_sparse_b1b1_block_from_continuous_proj(
+                    sorted_proj=info["sorted_proj"],
+                    direction=direction,
+                    tau=tau,
+                )
+                directions.append(direction)
+                sorted_proj_list.append(info["sorted_proj"])
+                sampling_points_list.append(info["sorted_proj"] + float(tau))
+                lex_to_d_list.append(info["lex_to_d"])
+                d_to_lex_list.append(info["d_to_lex"])
+                min_gap_list.append(info["min_gap"])
+                support_lo_list.append(torch.tensor(float(support_lo), dtype=torch.float64))
+                support_hi_list.append(torch.tensor(float(support_hi), dtype=torch.float64))
+                blocks.append(block)
+                effective_tau.append(float(tau))
+
+            sparse_nnz = torch.stack([blk["sparse_nnz"] for blk in blocks], dim=0).to(
+                dtype=torch.int64,
+                device=device,
+            )
+            max_nnz = int(sparse_nnz.max().item()) if int(sparse_nnz.numel()) > 0 else 0
+            sparse_rows = torch.zeros((self.num_angles, max_nnz), dtype=torch.int64, device=device)
+            sparse_cols = torch.zeros((self.num_angles, max_nnz), dtype=torch.int64, device=device)
+            sparse_values = torch.zeros((self.num_angles, max_nnz), dtype=torch.float32, device=device)
+            for idx, block in enumerate(blocks):
+                count = int(block["sparse_nnz"].item())
+                if count > 0:
+                    sparse_rows[idx, :count] = block["sparse_rows"].to(dtype=torch.int64, device=device)
+                    sparse_cols[idx, :count] = block["sparse_cols"].to(dtype=torch.int64, device=device)
+                    sparse_values[idx, :count] = block["sparse_values"].to(dtype=torch.float32, device=device)
+
+            r_vectors = torch.zeros((self.num_angles, self.N), dtype=torch.float32, device=device)
+            for idx, block in enumerate(blocks):
+                r_vectors[idx, 0] = block["diag0"].to(dtype=torch.float32, device=device)
+
+            self.register_buffer("r_vectors", r_vectors)
+            self.register_buffer("lower_bands", torch.zeros((self.num_angles, 0, self.N), dtype=torch.float32, device=device))
+            self.register_buffer("lower_bandwidths", torch.stack([blk["lower_bandwidth"] for blk in blocks]).to(dtype=torch.int64, device=device))
+            self.register_buffer("upper_bandwidths", torch.stack([blk["upper_bandwidth"] for blk in blocks]).to(dtype=torch.int64, device=device))
+            self.register_buffer("sparse_rows", sparse_rows)
+            self.register_buffer("sparse_cols", sparse_cols)
+            self.register_buffer("sparse_values", sparse_values)
+            self.register_buffer("sparse_nnz", sparse_nnz)
+            self.register_buffer("directions", torch.stack(directions, dim=0).to(dtype=torch.float32, device=device))
+            self.register_buffer("alphas", torch.stack(directions, dim=0).to(dtype=torch.float32, device=device))
+            self.register_buffer("alpha_values_tensor", torch.tensor(self.alpha_values, dtype=torch.float32, device=device))
+            self.register_buffer("tau_offsets_tensor", torch.tensor(effective_tau, dtype=torch.float32, device=device))
+            self.register_buffer("sorted_proj_per_angle", torch.stack(sorted_proj_list, dim=0).to(dtype=torch.float32, device=device))
+            self.register_buffer("sampling_points_per_angle", torch.stack(sampling_points_list, dim=0).to(dtype=torch.float32, device=device))
+            self.register_buffer("sampling_points", self.sampling_points_per_angle.reshape(-1))
+            self.register_buffer("lex_to_d_indices", torch.stack(lex_to_d_list, dim=0).to(dtype=torch.int64, device=device))
+            self.register_buffer("d_to_lex_indices", torch.stack(d_to_lex_list, dim=0).to(dtype=torch.int64, device=device))
+            self.register_buffer("min_projected_gaps", torch.stack(min_gap_list, dim=0).to(dtype=torch.float32, device=device))
+            self.register_buffer("support_lo_per_angle", torch.stack(support_lo_list, dim=0).to(dtype=torch.float32, device=device))
+            self.register_buffer("support_hi_per_angle", torch.stack(support_hi_list, dim=0).to(dtype=torch.float32, device=device))
+
+        self._morozov_gram_eigvals: Optional[torch.Tensor] = None
+        self._morozov_gram_eigvecs: Optional[torch.Tensor] = None
+        self._morozov_gram_eigvals_gpu: Optional[torch.Tensor] = None
+        self._morozov_gram_eigvecs_gpu: Optional[torch.Tensor] = None
+        self._morozov_gram_runtime_device: Optional[str] = None
+        self._morozov_gpu_fallback_warned = False
+        self.last_morozov_cache_hit: Optional[bool] = None
+        self.last_morozov_cache_build_seconds: Optional[float] = None
+        self.last_split_admm_stats: Optional[dict[str, object]] = None
+        self._last_gram_context_signature: Optional[tuple[object, ...]] = None
+        self._last_gram_context: Optional[dict[str, torch.Tensor]] = None
+
+    def _morozov_cache_fingerprint(self) -> dict[str, object]:
+        return {
+            "class_name": self.__class__.__name__,
+            "height": int(self.height),
+            "width": int(self.width),
+            "num_angles": int(self.num_angles),
+            "alpha_values": [round(float(v), 15) for v in self.alpha_values],
+            "tau_offsets": [round(float(v), 15) for v in self.tau_offsets_tensor.detach().cpu().tolist()],
+            "sparse_nnz_per_angle": [int(v.item()) for v in self.sparse_nnz],
+            "formula_mode": "alpha_continuous",
+            "basis": "b1b1",
+            "implementation_version": "alpha_continuous_full_sparse_v1",
+        }
+
+    def _gram_context_signature(self, b: torch.Tensor) -> tuple[object, ...]:
+        return (
+            int(b.data_ptr()),
+            tuple(int(v) for v in b.shape),
+            str(b.device),
+            str(b.dtype),
+            int(getattr(b, "_version", 0)),
+        )
+
+    @torch.no_grad()
+    def _prepare_gram_context(self, b: torch.Tensor) -> dict[str, torch.Tensor]:
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        signature = self._gram_context_signature(b)
+        if self._last_gram_context_signature == signature and self._last_gram_context is not None:
+            return self._last_gram_context
+        rhs = self.adjoint(b).view(b.shape[0], self.N)
+        eigvals, eigvecs = _ensure_implicit_gram_spectrum(
+            self,
+            self._morozov_cache_fingerprint(),
+        )
+        rhs_cpu = rhs.detach().to(dtype=torch.float32, device="cpu")
+        eigvecs_cpu = eigvecs.detach().to(dtype=torch.float32, device="cpu")
+        rhs_proj = rhs_cpu @ eigvecs_cpu
+        b_norm2 = torch.sum(b.detach().to(dtype=torch.float32, device="cpu").square(), dim=1)
+        context = {
+            "b": b,
+            "rhs": rhs,
+            "rhs_proj": rhs_proj,
+            "b_norm2": b_norm2,
+            "eigvals": eigvals,
+            "eigvecs": eigvecs,
+        }
+        self._last_gram_context_signature = signature
+        self._last_gram_context = context
+        return context
+
+    def split_measurements(self, g: torch.Tensor) -> torch.Tensor:
+        if g.dim() == 3 and g.shape[1] == 1:
+            g = g.squeeze(1)
+        if g.dim() != 2:
+            raise ValueError(f"Expected g with shape (B,M), got {tuple(g.shape)}")
+        if int(g.shape[1]) != int(self.M):
+            raise ValueError(f"Expected measurement length M={self.M}, got {g.shape[1]}")
+        return g.view(g.shape[0], self.num_angles, self.M_per_angle)
+
+    def forward_per_angle(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        if coeff_matrix.dim() == 3:
+            coeff_matrix = coeff_matrix.unsqueeze(1)
+        if coeff_matrix.dim() != 4:
+            raise ValueError(f"coeff_matrix must have shape (B,1,H,W), got {tuple(coeff_matrix.shape)}")
+        coeff_matrix = coeff_matrix.to(dtype=torch.float32, device=self.sampling_points.device)
+        batch = int(coeff_matrix.shape[0])
+        coeff_flat = coeff_matrix.view(batch, self.N)
+        gather_index = self.d_to_lex_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
+        d_all = coeff_flat.unsqueeze(1).expand(-1, self.num_angles, -1).gather(2, gather_index)
+        return _sparse_blocks_apply_batched(
+            self.sparse_rows,
+            self.sparse_cols,
+            self.sparse_values,
+            self.sparse_nnz,
+            d_all,
+        )
+
+    def forward(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        return self.forward_per_angle(coeff_matrix).reshape(coeff_matrix.shape[0], self.M)
+
+    def adjoint_per_angle(self, residual_per_angle: torch.Tensor) -> torch.Tensor:
+        if residual_per_angle.dim() == 4 and residual_per_angle.shape[2] == 1:
+            residual_per_angle = residual_per_angle.squeeze(2)
+        if residual_per_angle.dim() != 3:
+            raise ValueError(
+                f"Expected residual_per_angle with shape (B,K,M_per_angle), got {tuple(residual_per_angle.shape)}"
+            )
+        residual_per_angle = residual_per_angle.to(dtype=torch.float32, device=self.sampling_points.device)
+        batch = int(residual_per_angle.shape[0])
+        grad_d_all = _sparse_blocks_adjoint_apply_batched(
+            self.sparse_rows,
+            self.sparse_cols,
+            self.sparse_values,
+            self.sparse_nnz,
+            residual_per_angle,
+        )
+        gather_index = self.lex_to_d_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
+        grad_c_all = grad_d_all.gather(2, gather_index)
+        return grad_c_all.view(batch, self.num_angles, 1, self.height, self.width)
+
+    def adjoint(self, residual: torch.Tensor) -> torch.Tensor:
+        residual_pa = self.split_measurements(residual)
+        return self.adjoint_per_angle(residual_pa).sum(dim=1)
+
+    def apply_normal(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        return self.adjoint(self.forward(coeff_matrix))
+
+    @torch.no_grad()
+    def solve_tikhonov_direct(
+        self,
+        b: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        *,
+        rho: Optional[float] = None,
+        max_iter: Optional[int] = None,
+        tol: Optional[float] = None,
+    ) -> torch.Tensor:
+        solver_mode = str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "stacked_tikhonov")).strip().lower()
+        if solver_mode != "stacked_tikhonov":
+            raise ValueError(
+                "alpha_continuous currently supports only multi_angle_solver_mode='stacked_tikhonov'; "
+                f"got {solver_mode!r}."
+            )
+        self.last_split_admm_stats = None
+        context = self._prepare_gram_context(b)
+        coeff = _solve_tikhonov_from_gram_spectrum(
+            context["rhs"],
+            eigvals=context["eigvals"],
+            eigvecs=context["eigvecs"],
+            lambda_reg=lambda_reg,
+            rhs_proj=context["rhs_proj"],
+        )
+        return coeff.to(device=self.sampling_points.device, dtype=torch.float32).view(-1, 1, self.height, self.width)
+
+    @torch.no_grad()
+    def solve_tikhonov_cg(
+        self,
+        b: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        max_iter: int,
+        tol: float = 1e-4,
+        x0: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        rhs = self.adjoint(b)
+        x = torch.zeros_like(rhs) if x0 is None else x0.to(dtype=torch.float32, device=rhs.device).clone()
+        if torch.is_tensor(lambda_reg):
+            lam = lambda_reg.detach().to(dtype=torch.float32, device=rhs.device).view(-1)
+            if int(lam.numel()) == 1 and int(rhs.shape[0]) > 1:
+                lam = lam.expand(int(rhs.shape[0]))
+            elif int(lam.numel()) != int(rhs.shape[0]):
+                raise ValueError(
+                    f"lambda_reg has {int(lam.numel())} entries, expected 1 or batch={int(rhs.shape[0])}."
+                )
+        else:
+            lam = torch.full((int(rhs.shape[0]),), float(lambda_reg), dtype=torch.float32, device=rhs.device)
+        lam = lam.view(-1, 1, 1, 1)
+        r = rhs - (self.apply_normal(x) + lam * x)
+        p = r.clone()
+        rr = torch.sum(r * r, dim=(1, 2, 3), keepdim=True)
+        eps = rhs.new_tensor(1e-12)
+        for _ in range(int(max_iter)):
+            Ap = self.apply_normal(p) + lam * p
+            denom = torch.sum(p * Ap, dim=(1, 2, 3), keepdim=True).clamp_min(eps)
+            alpha = rr / denom
+            x = x + alpha * p
+            r = r - alpha * Ap
+            rr_new = torch.sum(r * r, dim=(1, 2, 3), keepdim=True)
+            if torch.sqrt(rr_new.max()).item() < float(tol):
+                break
+            beta = rr_new / (rr + eps)
+            p = r + beta * p
+            rr = rr_new
+        return x
+
+    @torch.no_grad()
+    def choose_lambda_morozov(
+        self,
+        b: torch.Tensor,
+        noise_norm: torch.Tensor,
+        tau: float = 1.0,
+        max_iter: int = 8,
+        lambda_min: float = 1e-12,
+        lambda_max: float = 1e12,
+    ) -> torch.Tensor:
+        context = self._prepare_gram_context(b)
+        settings = _morozov_settings(max_iter=max_iter, lambda_min=lambda_min, lambda_max=lambda_max)
+        return _choose_lambda_morozov_from_gram_spectrum(
+            b=context["b"],
+            rhs=context["rhs"],
+            noise_norm=noise_norm.to(dtype=torch.float32, device=context["b"].device),
+            eigvals=context["eigvals"],
+            eigvecs=context["eigvecs"],
+            tau=float(tau),
+            settings=settings,
+            rhs_proj=context["rhs_proj"],
+            b_norm2=context["b_norm2"],
+        )
+
+
 class TheoreticalB1B1Operator2D(torch.nn.Module):
     """
     Theoretical B1*B1 operator on the pixel coefficient lattice:
@@ -1453,6 +1956,7 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         self.last_morozov_cache_hit: Optional[bool] = None
         self.last_morozov_cache_build_seconds: Optional[float] = None
         self.last_split_admm_stats: Optional[dict[str, object]] = None
+        self._split_linear_cache: dict[tuple[int, float, float], dict[str, object]] = {}
         self._last_gram_context_signature: Optional[tuple[object, ...]] = None
         self._last_gram_context: Optional[dict[str, torch.Tensor]] = None
 
@@ -1492,11 +1996,120 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
     def _lower_adjoint_apply(self, angle_idx: int, x: torch.Tensor) -> torch.Tensor:
         return _lower_banded_adjoint_apply(self._get_lower_bands(angle_idx), x)
 
+    def _sparse_adjoint_apply(self, angle_idx: int, x: torch.Tensor) -> torch.Tensor:
+        angle_idx = int(angle_idx)
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        rows = self.sparse_rows[angle_idx : angle_idx + 1]
+        cols = self.sparse_cols[angle_idx : angle_idx + 1]
+        values = self.sparse_values[angle_idx : angle_idx + 1]
+        nnz = self.sparse_nnz[angle_idx : angle_idx + 1]
+        return _sparse_blocks_adjoint_apply_batched(rows, cols, values, nnz, x.unsqueeze(1)).squeeze(1)
+
+    def _block_adjoint_apply(self, angle_idx: int, x: torch.Tensor) -> torch.Tensor:
+        if bool(self.uses_sparse_blocks):
+            return self._sparse_adjoint_apply(angle_idx, x)
+        return self._lower_adjoint_apply(angle_idx, x)
+
     def _permute_c_to_d(self, coeff_flat: torch.Tensor, angle_idx: int) -> torch.Tensor:
         return coeff_flat.index_select(1, self.d_to_lex_indices[int(angle_idx)])
 
     def _permute_d_to_c(self, d_vector: torch.Tensor, angle_idx: int) -> torch.Tensor:
         return d_vector.gather(1, self.lex_to_d_indices[int(angle_idx)].view(1, -1).expand(d_vector.shape[0], -1))
+
+    def _lower_ab_np(self, angle_idx: int) -> np.ndarray:
+        lower = self._get_lower_bands(angle_idx).detach().to(dtype=torch.float64, device="cpu").numpy()
+        return _trim_lower_banded_ab(lower)
+
+    def _sparse_block_csc(self, angle_idx: int):
+        try:
+            from scipy.sparse import coo_matrix
+        except Exception as exc:  # pragma: no cover - requires SciPy sparse runtime
+            raise ImportError(
+                "SciPy sparse linear algebra is required for split_triangular_admm on sparse theoretical blocks."
+            ) from exc
+        angle_idx = int(angle_idx)
+        count = int(self.sparse_nnz[angle_idx].item())
+        rows = self.sparse_rows[angle_idx, :count].detach().to(dtype=torch.int64, device="cpu").numpy()
+        cols = self.sparse_cols[angle_idx, :count].detach().to(dtype=torch.int64, device="cpu").numpy()
+        values = self.sparse_values[angle_idx, :count].detach().to(dtype=torch.float64, device="cpu").numpy()
+        return coo_matrix((values, (rows, cols)), shape=(self.N, self.N), dtype=np.float64).tocsc()
+
+    def _solve_single_lower_direct(self, angle_idx: int, rhs: torch.Tensor) -> torch.Tensor:
+        _require_scipy_banded()
+        angle_idx = int(angle_idx)
+        if rhs.dim() == 1:
+            rhs = rhs.unsqueeze(0)
+        rhs_np = rhs.detach().to(dtype=torch.float64, device="cpu").numpy().T
+        lower_ab = self._lower_ab_np(angle_idx)
+        solved = solve_banded((lower_ab.shape[0] - 1, 0), lower_ab, rhs_np, check_finite=False)
+        return torch.from_numpy(np.asarray(solved.T, dtype=np.float32)).to(
+            device=self.lower_bands.device,
+            dtype=torch.float32,
+        )
+
+    def _get_split_linear_cache(self, angle_idx: int, rho: float, weight: float) -> dict[str, object]:
+        key = (int(angle_idx), round(float(rho), 12), round(float(weight), 12))
+        cached = self._split_linear_cache.get(key, None)
+        if cached is not None:
+            return cached
+        if bool(self.uses_sparse_blocks):
+            try:
+                from scipy.sparse import csc_matrix
+            except Exception as exc:  # pragma: no cover - requires SciPy sparse runtime
+                raise ImportError(
+                    "SciPy sparse linear algebra is required for split_triangular_admm on sparse theoretical blocks."
+                ) from exc
+            _require_scipy_banded()
+            sparse_block = self._sparse_block_csc(angle_idx)
+            gram = csc_matrix((sparse_block.T @ sparse_block).tocsc(), dtype=np.float64)
+            gram_bw = max(
+                1,
+                int(self.lower_bandwidths[int(angle_idx)].item()) + int(self.upper_bandwidths[int(angle_idx)].item()) - 1,
+            )
+            upper_ab = np.zeros((gram_bw, self.N), dtype=np.float64)
+            for offset in range(gram_bw):
+                diag = np.asarray(gram.diagonal(offset), dtype=np.float64)
+                if diag.size == 0:
+                    break
+                upper_ab[gram_bw - 1 - offset, offset : offset + diag.size] = (2.0 * float(weight)) * diag
+            upper_ab[-1, :] += float(rho)
+            cached = {
+                "kind": "banded",
+                "chol": cholesky_banded(upper_ab, lower=False, check_finite=False),
+            }
+        else:
+            _require_scipy_banded()
+            lower_ab = self._lower_ab_np(angle_idx)
+            upper_ab = _build_upper_normal_banded_from_lower_ab(lower_ab, rho=float(rho), weight=float(weight))
+            chol = cholesky_banded(upper_ab, lower=False, check_finite=False)
+            cached = {
+                "kind": "banded",
+                "chol": chol,
+            }
+        self._split_linear_cache[key] = cached
+        return cached
+
+    def _solve_single_split_quadratic(
+        self,
+        angle_idx: int,
+        rhs: torch.Tensor,
+        *,
+        rho: float,
+        weight: float,
+    ) -> torch.Tensor:
+        cache = self._get_split_linear_cache(angle_idx, rho=float(rho), weight=float(weight))
+        if rhs.dim() == 1:
+            rhs = rhs.unsqueeze(0)
+        rhs_np = rhs.detach().to(dtype=torch.float64, device="cpu").numpy().T
+        if cache.get("kind") == "sparse":
+            solved = cache["lu"].solve(rhs_np)
+        else:
+            solved = cho_solve_banded((cache["chol"], False), rhs_np, check_finite=False)
+        return torch.from_numpy(np.asarray(solved.T, dtype=np.float32)).to(
+            device=self.lower_bands.device,
+            dtype=torch.float32,
+        )
 
     def _gram_context_signature(self, b: torch.Tensor) -> tuple[object, ...]:
         return (
@@ -1614,6 +2227,162 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         return coeff.to(device=self.lower_bands.device, dtype=torch.float32).view(-1, 1, self.height, self.width)
 
     @torch.no_grad()
+    def solve_split_triangular_admm(
+        self,
+        b: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        *,
+        rho: Optional[float] = None,
+        max_iter: Optional[int] = None,
+        tol: Optional[float] = None,
+        weights: Optional[torch.Tensor] = None,
+        extra_operator: Optional[torch.nn.Module] = None,
+        extra_measurements: Optional[torch.Tensor] = None,
+        extra_weight: Optional[float] = None,
+    ) -> torch.Tensor:
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        if extra_operator is not None or extra_measurements is not None or extra_weight is not None:
+            raise ValueError(
+                "solve_split_triangular_admm only supports the configured backbone angles. "
+                "Extra-angle refinement must be applied outside the backbone ADMM."
+            )
+
+        _require_scipy_banded()
+        self.last_split_admm_stats = None
+        batch = int(b.shape[0])
+        b = b.to(dtype=torch.float32, device=self.lower_bands.device)
+        g_backbone = self.split_measurements(b)
+
+        if torch.is_tensor(lambda_reg):
+            lam = lambda_reg.detach().to(dtype=torch.float32, device=self.lower_bands.device).view(-1)
+            if int(lam.numel()) == 1 and batch > 1:
+                lam = lam.expand(batch)
+            elif int(lam.numel()) != batch:
+                raise ValueError(
+                    f"lambda_reg has {int(lam.numel())} entries, expected 1 or batch={batch}."
+                )
+        else:
+            lam = torch.full((batch,), float(lambda_reg), dtype=torch.float32, device=self.lower_bands.device)
+
+        rho_eff = float(TIME_DOMAIN_CONFIG.get("split_admm_rho", 1.0) if rho is None else rho)
+        max_iter_eff = int(TIME_DOMAIN_CONFIG.get("split_admm_max_iter", 20) if max_iter is None else max_iter)
+        tol_eff = float(TIME_DOMAIN_CONFIG.get("split_admm_tol", 1.0e-4) if tol is None else tol)
+        if weights is None:
+            weight_vec = torch.ones((self.num_angles,), dtype=torch.float32, device=self.lower_bands.device)
+        else:
+            weight_vec = weights.detach().to(dtype=torch.float32, device=self.lower_bands.device).view(-1)
+            if int(weight_vec.numel()) != int(self.num_angles):
+                raise ValueError(
+                    f"weights has {int(weight_vec.numel())} entries, expected num_angles={int(self.num_angles)}."
+                )
+
+        d_stack = []
+        for angle_idx in range(self.num_angles):
+            rhs_init = (
+                2.0
+                * float(weight_vec[angle_idx].item())
+                * self._block_adjoint_apply(angle_idx, g_backbone[:, angle_idx, :])
+            )
+            d_stack.append(
+                self._solve_single_split_quadratic(
+                    angle_idx,
+                    rhs_init,
+                    rho=rho_eff,
+                    weight=float(weight_vec[angle_idx].item()),
+                )
+            )
+        d_stack = torch.stack(d_stack, dim=1)
+
+        c_flat = torch.zeros((batch, self.N), dtype=torch.float32, device=self.lower_bands.device)
+        for angle_idx in range(self.num_angles):
+            c_flat = c_flat + self._permute_d_to_c(d_stack[:, angle_idx, :], angle_idx)
+        c_flat = c_flat / float(self.num_angles)
+        u_stack = torch.zeros_like(d_stack)
+
+        sqrt_k = math.sqrt(float(self.num_angles))
+        primal = float("inf")
+        dual = float("inf")
+        primal_rel = float("inf")
+        dual_rel = float("inf")
+        converged = False
+        iterations_run = 0
+        for iter_idx in range(max_iter_eff):
+            c_prev = c_flat.clone()
+
+            for angle_idx in range(self.num_angles):
+                consensus = self._permute_c_to_d(c_flat, angle_idx) - u_stack[:, angle_idx, :]
+                rhs = (
+                    2.0
+                    * float(weight_vec[angle_idx].item())
+                    * self._block_adjoint_apply(angle_idx, g_backbone[:, angle_idx, :])
+                    + rho_eff * consensus
+                )
+                d_stack[:, angle_idx, :] = self._solve_single_split_quadratic(
+                    angle_idx,
+                    rhs,
+                    rho=rho_eff,
+                    weight=float(weight_vec[angle_idx].item()),
+                )
+
+            consensus_sum = torch.zeros_like(c_flat)
+            for angle_idx in range(self.num_angles):
+                consensus_sum = consensus_sum + self._permute_d_to_c(
+                    d_stack[:, angle_idx, :] + u_stack[:, angle_idx, :],
+                    angle_idx,
+                )
+
+            denom = (2.0 * lam) + (rho_eff * float(self.num_angles))
+            c_flat = (rho_eff * consensus_sum) / denom.view(-1, 1).clamp_min(1.0e-8)
+
+            primal_sq = c_flat.new_zeros((batch,))
+            d_norm_sq = c_flat.new_zeros((batch,))
+            pc_norm_sq = c_flat.new_zeros((batch,))
+            for angle_idx in range(self.num_angles):
+                permuted = self._permute_c_to_d(c_flat, angle_idx)
+                diff = d_stack[:, angle_idx, :] - permuted
+                u_stack[:, angle_idx, :] = u_stack[:, angle_idx, :] + diff
+                primal_sq = primal_sq + torch.sum(diff * diff, dim=1)
+                d_norm_sq = d_norm_sq + torch.sum(d_stack[:, angle_idx, :] * d_stack[:, angle_idx, :], dim=1)
+                pc_norm_sq = pc_norm_sq + torch.sum(permuted * permuted, dim=1)
+
+            primal_abs_batch = torch.sqrt(primal_sq).div(math.sqrt(float(self.N) * float(self.num_angles)))
+            dual_abs_batch = rho_eff * sqrt_k * torch.norm(c_flat - c_prev, dim=1).div(math.sqrt(float(self.N)))
+            primal_scale = torch.maximum(
+                torch.sqrt(d_norm_sq).div(math.sqrt(float(self.N) * float(self.num_angles))),
+                torch.sqrt(pc_norm_sq).div(math.sqrt(float(self.N) * float(self.num_angles))),
+            ).clamp_min(1.0e-8)
+            dual_scale = (rho_eff * sqrt_k * torch.norm(c_flat, dim=1).div(math.sqrt(float(self.N)))).clamp_min(
+                1.0e-8
+            )
+            primal_rel_batch = primal_abs_batch / primal_scale
+            dual_rel_batch = dual_abs_batch / dual_scale
+
+            primal = primal_abs_batch.max().item()
+            dual = dual_abs_batch.max().item()
+            primal_rel = primal_rel_batch.max().item()
+            dual_rel = dual_rel_batch.max().item()
+            iterations_run = int(iter_idx + 1)
+            if max(primal_rel, dual_rel) <= tol_eff:
+                converged = True
+                break
+
+        self.last_split_admm_stats = {
+            "iterations": int(iterations_run),
+            "max_iter": int(max_iter_eff),
+            "converged": bool(converged),
+            "primal_residual": float(primal),
+            "dual_residual": float(dual),
+            "relative_primal_residual": float(primal_rel),
+            "relative_dual_residual": float(dual_rel),
+            "rho": float(rho_eff),
+            "tol": float(tol_eff),
+            "used_extra_angles": False,
+            "num_angles": int(self.num_angles),
+        }
+        return c_flat.view(-1, 1, self.height, self.width)
+
+    @torch.no_grad()
     def solve_tikhonov_direct(
         self,
         b: torch.Tensor,
@@ -1624,10 +2393,18 @@ class TheoreticalB1B1Operator2D(torch.nn.Module):
         tol: Optional[float] = None,
     ) -> torch.Tensor:
         solver_mode = str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "stacked_tikhonov")).strip().lower()
+        if solver_mode == "split_triangular_admm":
+            return self.solve_split_triangular_admm(
+                b,
+                lambda_reg=lambda_reg,
+                rho=rho,
+                max_iter=max_iter,
+                tol=tol,
+            )
         if solver_mode != "stacked_tikhonov":
             raise ValueError(
                 "Unsupported multi_angle_solver_mode="
-                f"{solver_mode!r}; only 'stacked_tikhonov' is retained."
+                f"{solver_mode!r}; expected 'stacked_tikhonov' or 'split_triangular_admm'."
             )
         self.last_split_admm_stats = None
         return self._solve_gram_tikhonov_direct(b, lambda_reg=lambda_reg)
@@ -1727,11 +2504,6 @@ def build_time_domain_operator(
     use_multi = TIME_DOMAIN_CONFIG.get("use_multi_angle", False)
     beta_vectors = TIME_DOMAIN_CONFIG.get("beta_vectors", None)
     if operator_mode == "theoretical_b1b1":
-        if use_multi:
-            backbone_betas = _normalize_backbone_beta_vectors(beta_vectors)
-        else:
-            backbone_betas = [(1, int(width))]
-        total_angles = int(TIME_DOMAIN_CONFIG.get("num_angles_total", TIME_DOMAIN_CONFIG.get("num_angles", len(backbone_betas))))
         t0 = float(TIME_DOMAIN_CONFIG.get("sampling_t0", 0.5))
         solver_mode = str(TIME_DOMAIN_CONFIG.get("multi_angle_solver_mode", "stacked_tikhonov")).strip().lower()
         formula_mode_source = (
@@ -1740,6 +2512,26 @@ def build_time_domain_operator(
             else formula_mode_override
         )
         formula_mode = _resolve_theoretical_formula_mode(formula_mode_source, solver_mode)
+        angle_parameterization = str(TIME_DOMAIN_CONFIG.get("angle_parameterization", "beta")).strip().lower()
+        if angle_parameterization == "alpha" or formula_mode == "alpha_continuous":
+            alpha_values = TIME_DOMAIN_CONFIG.get("alpha_values", None)
+            if not alpha_values:
+                raise ValueError(
+                    "alpha_continuous mode requires TIME_DOMAIN_CONFIG['alpha_values'] "
+                    "or ALPHA_VALUES_OVERRIDE."
+                )
+            return TheoreticalAlphaB1B1Operator2D(
+                alpha_values=[float(v) for v in list(alpha_values)],
+                height=int(height),
+                width=int(width),
+                tau_offsets=TIME_DOMAIN_CONFIG.get("alpha_tau_offsets", None),
+                t0=t0,
+            ).to(device)
+        if use_multi:
+            backbone_betas = _normalize_backbone_beta_vectors(beta_vectors)
+        else:
+            backbone_betas = [(1, int(width))]
+        total_angles = int(TIME_DOMAIN_CONFIG.get("num_angles_total", TIME_DOMAIN_CONFIG.get("num_angles", len(backbone_betas))))
         t0_per_angle = _condition_tau_offsets_for_formula(formula_mode)
         auto_shift_t0 = (
             bool(TIME_DOMAIN_CONFIG.get("auto_angle_t0", True))
@@ -1804,6 +2596,7 @@ def build_time_domain_operator(
 
 _COMPLETE_SPARSE_DATA_FORMULA_MODES = {
     "condition_constrained_offset",
+    "alpha_continuous",
 }
 
 _COMPLETE_BANDED_DATA_FORMULA_MODES = {
@@ -1817,6 +2610,8 @@ def _complete_data_formula_for_reconstruction(reconstruction_formula_mode: str) 
         return "legacy_injective_extension"
     if recon == "condition_constrained_offset":
         return "condition_constrained_offset"
+    if recon == "alpha_continuous":
+        return "alpha_continuous"
     raise ValueError(
         f"Cannot infer a complete data formula for reconstruction formula {recon!r}. "
         "Set data_formula_mode to one of "

@@ -2,12 +2,21 @@
 import os
 import re
 import argparse
+import sys
 from contextlib import contextmanager
+from pathlib import Path
 from typing import List, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+THIS_DIR = Path(__file__).resolve().parent
+MODELS_DIR = Path(__file__).resolve().parents[1]
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
+if str(MODELS_DIR) not in sys.path:
+    sys.path.insert(0, str(MODELS_DIR))
 
 from model import initialize_model, load_trainable_state_dict
 from radon_transform import TheoreticalDataGenerator
