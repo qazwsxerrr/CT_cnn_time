@@ -273,6 +273,17 @@ def _apply_alpha_condition_profile(json_path: str | None = None) -> None:
     TIME_DOMAIN_CONFIG["triangular_residual_channel_enabled"] = False
     TIME_DOMAIN_CONFIG["triangular_explicit_update_enabled"] = False
     TIME_DOMAIN_CONFIG["triangular_angle_attention_enabled"] = False
+    # α full-sparse blocks use a generic stacked physical inverse-residual
+    # correction instead of the β lower-triangular residual correction.
+    TIME_DOMAIN_CONFIG["physics_residual_channel_enabled"] = True
+    TIME_DOMAIN_CONFIG["physics_residual_mode"] = "stacked_cg"
+    TIME_DOMAIN_CONFIG["physics_residual_damping"] = 1.0e-2
+    TIME_DOMAIN_CONFIG["physics_residual_cg_iters"] = 8
+    TIME_DOMAIN_CONFIG["physics_residual_detach"] = True
+    TIME_DOMAIN_CONFIG["physics_residual_normalize"] = True
+    TIME_DOMAIN_CONFIG["physics_explicit_update_enabled"] = False
+    TIME_DOMAIN_CONFIG["physics_explicit_update_alpha_init"] = 0.02
+    TIME_DOMAIN_CONFIG["physics_explicit_update_max"] = 0.10
     TIME_DOMAIN_CONFIG["init_method"] = "tikhonov_direct"
     TIME_DOMAIN_CONFIG["auto_angle_t0"] = False
 
@@ -653,6 +664,21 @@ TIME_DOMAIN_CONFIG = {
     # The current first four angles are better conditioned than the last four.
     "triangular_angle_attention_enabled": False,
     "triangular_angle_attention_init": [0.70, 0.70, 0.70, 0.70, 0.35, 0.35, 0.35, 0.35],
+
+    # Generic inverse-residual channel for non-triangular α-continuous operators:
+    #   e_phys ~= (A^T A + mu I)^(-1) A^T (b - A c_t)
+    "physics_residual_channel_enabled": False,
+    "physics_residual_mode": "stacked_cg",
+    "physics_residual_damping": 1.0e-2,
+    "physics_residual_cg_iters": 8,
+    "physics_residual_detach": True,
+    "physics_residual_normalize": True,
+    # Optional explicit physical inverse-residual update:
+    #   c_{t+1} = c_t + eta * e_phys - learned_update
+    "physics_explicit_update_enabled": False,
+    "physics_explicit_update_alpha_init": 0.02,
+    "physics_explicit_update_max": 0.10,
+
     # Initialization strategy used by train.py / test.py before the learned updates.
     # Supported values:
     # - "cg": iterative Tikhonov solve
@@ -848,6 +874,52 @@ _apply_bool_override(
     TIME_DOMAIN_CONFIG,
     "triangular_angle_attention_enabled",
     "TRIANGULAR_ANGLE_ATTENTION_ENABLED_OVERRIDE",
+)
+_apply_bool_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_residual_channel_enabled",
+    "PHYSICS_RESIDUAL_CHANNEL_ENABLED_OVERRIDE",
+)
+_apply_string_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_residual_mode",
+    "PHYSICS_RESIDUAL_MODE_OVERRIDE",
+    allowed_values={"stacked_cg"},
+)
+_apply_float_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_residual_damping",
+    "PHYSICS_RESIDUAL_DAMPING_OVERRIDE",
+)
+_apply_int_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_residual_cg_iters",
+    "PHYSICS_RESIDUAL_CG_ITERS_OVERRIDE",
+)
+_apply_bool_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_residual_detach",
+    "PHYSICS_RESIDUAL_DETACH_OVERRIDE",
+)
+_apply_bool_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_residual_normalize",
+    "PHYSICS_RESIDUAL_NORMALIZE_OVERRIDE",
+)
+_apply_bool_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_explicit_update_enabled",
+    "PHYSICS_EXPLICIT_UPDATE_ENABLED_OVERRIDE",
+)
+_apply_float_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_explicit_update_alpha_init",
+    "PHYSICS_EXPLICIT_UPDATE_ALPHA_INIT_OVERRIDE",
+)
+_apply_float_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_explicit_update_max",
+    "PHYSICS_EXPLICIT_UPDATE_MAX_OVERRIDE",
 )
 _apply_bool_override(TIME_DOMAIN_CONFIG, "auto_angle_t0", "AUTO_ANGLE_T0_OVERRIDE")
 if str(TIME_DOMAIN_CONFIG.get("angle_parameterization", "beta")).strip().lower() == "alpha":

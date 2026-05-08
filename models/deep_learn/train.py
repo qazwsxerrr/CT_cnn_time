@@ -137,6 +137,7 @@ class TheoreticalTrainer:
             "reg_lambda_raw",
             "triangular_alpha_raw",
             "triangular_angle_logits",
+            "physics_alpha_raw",
         )
         for name, param in self.model.named_parameters():
             if any(key in name for key in scalar_names):

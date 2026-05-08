@@ -386,10 +386,50 @@ class LearnedGradientDescent(nn.Module):
             torch.tensor(math.log(math.exp(tri_alpha_init) - 1.0), dtype=torch.float32)
         )
 
+        self.physics_residual_enabled = bool(
+            TIME_DOMAIN_CONFIG.get("physics_residual_channel_enabled", False)
+        )
+        self.physics_residual_mode = str(
+            TIME_DOMAIN_CONFIG.get("physics_residual_mode", "stacked_cg")
+        ).strip().lower()
+        if self.physics_residual_mode != "stacked_cg":
+            raise ValueError(
+                "physics_residual_mode currently supports only 'stacked_cg', "
+                f"got {self.physics_residual_mode!r}."
+            )
+        self.physics_residual_damping = float(
+            TIME_DOMAIN_CONFIG.get("physics_residual_damping", 1.0e-2)
+        )
+        self.physics_residual_cg_iters = int(
+            TIME_DOMAIN_CONFIG.get("physics_residual_cg_iters", 8)
+        )
+        self.physics_residual_detach = bool(
+            TIME_DOMAIN_CONFIG.get("physics_residual_detach", True)
+        )
+        self.physics_residual_normalize = bool(
+            TIME_DOMAIN_CONFIG.get("physics_residual_normalize", True)
+        )
+        self.physics_residual_channels = 1 if self.physics_residual_enabled else 0
+
+        self.physics_explicit_update_enabled = bool(
+            TIME_DOMAIN_CONFIG.get("physics_explicit_update_enabled", False)
+        )
+        self.physics_explicit_update_max = float(
+            TIME_DOMAIN_CONFIG.get("physics_explicit_update_max", 0.10)
+        )
+        phys_alpha_init = max(
+            float(TIME_DOMAIN_CONFIG.get("physics_explicit_update_alpha_init", 0.02)),
+            1.0e-8,
+        )
+        self.physics_alpha_raw = nn.Parameter(
+            torch.tensor(math.log(math.exp(phys_alpha_init) - 1.0), dtype=torch.float32)
+        )
+
         self.input_channels = (
             2
             + self.cnn_num_angles
             + self.triangular_residual_channels
+            + self.physics_residual_channels
             + self.n_memory
         )
         self.detach_physical_grads = bool(DATA_CONFIG.get("detach_physical_grads", True))
@@ -500,6 +540,7 @@ class LearnedGradientDescent(nn.Module):
         memory,
         data_grad_pa=None,
         triangular_corr_pa=None,
+        physics_corr=None,
     ):
         if data_grad_pa is None:
             _, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(
@@ -528,6 +569,13 @@ class LearnedGradientDescent(nn.Module):
                 index=index_tensor,
             ).squeeze(2)
             parts.append(tri_channels)
+
+        if self.physics_residual_enabled:
+            if physics_corr is None:
+                raise ValueError(
+                    "physics_residual_channel_enabled=True, but physics_corr is None."
+                )
+            parts.append(physics_corr)
 
         parts.extend([reg_grad, memory])
         return torch.cat(parts, dim=1)
@@ -606,6 +654,12 @@ class LearnedGradientDescent(nn.Module):
             alpha = torch.clamp(alpha, max=self.triangular_explicit_update_max)
         return alpha
 
+    def current_physics_alpha(self):
+        alpha = F.softplus(self.physics_alpha_raw)
+        if self.physics_explicit_update_max > 0:
+            alpha = torch.clamp(alpha, max=self.physics_explicit_update_max)
+        return alpha
+
     def _apply_triangular_angle_attention(self, triangular_corr_pa):
         if triangular_corr_pa is None:
             return None
@@ -672,6 +726,24 @@ class LearnedGradientDescent(nn.Module):
                 )
                 triangular_corr_pa = self._apply_triangular_angle_attention(triangular_corr_pa)
 
+            physics_corr = None
+            if self.physics_residual_enabled or self.physics_explicit_update_enabled:
+                op = self.theoretical_gd.operator
+                if not hasattr(op, "residual_inverse_correction"):
+                    raise ValueError(
+                        "physics_residual_channel_enabled=True or "
+                        "physics_explicit_update_enabled=True, but the active operator "
+                        "does not implement residual_inverse_correction()."
+                    )
+                physics_corr = op.residual_inverse_correction(
+                    coeff_current,
+                    g_observed_learned,
+                    damping=self.physics_residual_damping,
+                    cg_iters=self.physics_residual_cg_iters,
+                    detach=self.physics_residual_detach,
+                    normalize=self.physics_residual_normalize,
+                )
+
             if self.detach_physical_grads:
                 data_grad = data_grad.detach()
                 reg_grad_base = reg_grad_base.detach()
@@ -680,6 +752,8 @@ class LearnedGradientDescent(nn.Module):
 
             if self.triangular_residual_detach and triangular_corr_pa is not None:
                 triangular_corr_pa = triangular_corr_pa.detach()
+            if self.physics_residual_detach and physics_corr is not None:
+                physics_corr = physics_corr.detach()
 
             reg_grad = reg_grad_base * lambda_i
 
@@ -690,6 +764,7 @@ class LearnedGradientDescent(nn.Module):
                 memory,
                 data_grad_pa=data_grad_pa,
                 triangular_corr_pa=triangular_corr_pa,
+                physics_corr=physics_corr,
             )
 
             cnn_output = self.update_network(cnn_input)
@@ -702,12 +777,16 @@ class LearnedGradientDescent(nn.Module):
                 triangular_corr_pa,
                 reference=learned_update,
             )
+            phys_update = torch.zeros_like(learned_update)
+            if self.physics_explicit_update_enabled and physics_corr is not None:
+                phys_update = self.current_physics_alpha() * physics_corr
 
             # Sign convention:
             #   learned_update is subtracted: c <- c - learned_update
             #   triangular residual is an error estimate: e_tri ~= c_true - c
-            # Therefore c <- c + tri_update - learned_update.
-            total_update = learned_update - tri_update
+            #   physics residual is an error estimate: e_phys ~= c_true - c
+            # Therefore c <- c + tri_update + phys_update - learned_update.
+            total_update = learned_update - tri_update - phys_update
             total_update = self._clip_update_norm(total_update)
 
             coeff_current = coeff_current - total_update
@@ -866,6 +945,19 @@ def initialize_model():
             float(model.optimizer.current_triangular_alpha().detach().cpu().item())
             if hasattr(model.optimizer, "current_triangular_alpha") else 0.0,
             bool(getattr(model.optimizer, "triangular_angle_attention_enabled", False)),
+        )
+    )
+    print(
+        "Physics residual: enabled=%s mode=%s damping=%.3g cg_iters=%d channels=%d explicit_update=%s alpha=%.4f"
+        % (
+            bool(getattr(model.optimizer, "physics_residual_enabled", False)),
+            str(getattr(model.optimizer, "physics_residual_mode", "disabled")),
+            float(getattr(model.optimizer, "physics_residual_damping", 0.0)),
+            int(getattr(model.optimizer, "physics_residual_cg_iters", 0) or 0),
+            int(getattr(model.optimizer, "physics_residual_channels", 0) or 0),
+            bool(getattr(model.optimizer, "physics_explicit_update_enabled", False)),
+            float(model.optimizer.current_physics_alpha().detach().cpu().item())
+            if hasattr(model.optimizer, "current_physics_alpha") else 0.0,
         )
     )
     if model.optimizer.angle_feature_adapter is not None:

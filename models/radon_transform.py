@@ -1713,6 +1713,91 @@ class TheoreticalAlphaB1B1Operator2D(torch.nn.Module):
     def apply_normal(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.adjoint(self.forward(coeff_matrix))
 
+    def solve_shifted_normal_cg(
+        self,
+        rhs: torch.Tensor,
+        damping: float = 1.0e-2,
+        cg_iters: int = 8,
+    ) -> torch.Tensor:
+        """
+        Approximately solve (A^T A + damping I) x = rhs by batched CG.
+
+        This is the generic inverse step behind the α-continuous physics
+        residual channel.
+        """
+        if rhs.dim() == 3:
+            rhs = rhs.unsqueeze(1)
+        if rhs.dim() != 4:
+            raise ValueError(f"rhs must have shape (B,1,H,W), got {tuple(rhs.shape)}")
+        rhs = rhs.to(dtype=torch.float32, device=self.sampling_points.device)
+        x = torch.zeros_like(rhs)
+        mu = float(damping)
+
+        def normal_plus_mu(z: torch.Tensor) -> torch.Tensor:
+            return self.apply_normal(z) + mu * z
+
+        r = rhs - normal_plus_mu(x)
+        p = r.clone()
+        rs_old = torch.sum(r.reshape(r.shape[0], -1).square(), dim=1, keepdim=True)
+        eps = rhs.new_tensor(1.0e-12)
+
+        for _ in range(max(int(cg_iters), 0)):
+            Ap = normal_plus_mu(p)
+            denom = torch.sum(
+                p.reshape(p.shape[0], -1) * Ap.reshape(Ap.shape[0], -1),
+                dim=1,
+                keepdim=True,
+            ).clamp_min(eps)
+            alpha = rs_old / denom
+            alpha_view = alpha.view(-1, 1, 1, 1)
+            x = x + alpha_view * p
+            r = r - alpha_view * Ap
+
+            rs_new = torch.sum(r.reshape(r.shape[0], -1).square(), dim=1, keepdim=True)
+            beta = rs_new / rs_old.clamp_min(eps)
+            p = r + beta.view(-1, 1, 1, 1) * p
+            rs_old = rs_new
+
+        return x
+
+    def residual_inverse_correction(
+        self,
+        coeff: torch.Tensor,
+        g_observed: torch.Tensor,
+        damping: float = 1.0e-2,
+        cg_iters: int = 8,
+        detach: bool = True,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """
+        Return e ≈ c_true - coeff by solving
+
+            (A^T A + damping I) e = A^T (g_observed - A coeff)
+
+        for the current α-continuous stacked sparse operator.
+        """
+        if g_observed.dim() == 3 and g_observed.shape[1] == 1:
+            g_observed = g_observed.squeeze(1)
+        if detach:
+            coeff = coeff.detach()
+            g_observed = g_observed.detach()
+
+        pred = self(coeff)
+        residual = g_observed.to(dtype=pred.dtype, device=pred.device) - pred
+        rhs = self.adjoint(residual)
+        correction = self.solve_shifted_normal_cg(
+            rhs,
+            damping=damping,
+            cg_iters=cg_iters,
+        )
+
+        if normalize:
+            flat = correction.reshape(correction.shape[0], -1)
+            norm = torch.norm(flat, dim=1, keepdim=True).clamp_min(1.0e-6)
+            correction = correction / norm.view(-1, 1, 1, 1)
+
+        return correction
+
     @torch.no_grad()
     def solve_tikhonov_direct(
         self,
