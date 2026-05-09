@@ -1,5 +1,6 @@
 import inspect
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -135,6 +136,46 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
 
         self.assertEqual(generator.calls, [("direct", (1, 4), 0.25)])
         self.assertTrue(torch.equal(baseline, torch.full((2, 2), 3.0)))
+
+    def test_morozov_selects_lambda_against_full_measurement_residual(self):
+        from config import DATA_CONFIG, device
+        from radon_transform import AlphaContinuousB1B1Operator2D
+
+        data_backup = dict(DATA_CONFIG)
+        try:
+            with tempfile.TemporaryDirectory() as cache_dir:
+                DATA_CONFIG["alpha_gram_cache_dir"] = cache_dir
+                torch.manual_seed(7)
+                op = AlphaContinuousB1B1Operator2D(
+                    alpha_values=[0.23, 1.11],
+                    height=4,
+                    width=4,
+                    tau_offsets=[0.15, 0.35],
+                ).to(device)
+                coeff_true = torch.randn(1, 1, 4, 4, device=device)
+                g_clean = op(coeff_true)
+                noise = 0.05 * torch.randn_like(g_clean)
+                g_observed = g_clean + noise
+                noise_norm = torch.norm(noise, dim=-1)
+
+                lam = op.choose_lambda_morozov(
+                    g_observed,
+                    noise_norm=noise_norm,
+                    tau=1.0,
+                    max_iter=40,
+                    lambda_min=1.0e-12,
+                    lambda_max=1.0e12,
+                )
+                coeff_est = op.solve_tikhonov_direct(g_observed, lambda_reg=lam)
+                measurement_residual = torch.norm(op(coeff_est) - g_observed, dim=-1)
+
+                self.assertLess(
+                    torch.abs(measurement_residual - noise_norm).item() / noise_norm.item(),
+                    1.0e-3,
+                )
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
 
 
 if __name__ == "__main__":

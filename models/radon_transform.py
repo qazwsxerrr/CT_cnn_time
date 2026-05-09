@@ -237,12 +237,23 @@ def _choose_lambda_morozov_from_gram_spectrum(
 
         def residual2_fn(lam: float) -> float:
             denom = eigvals_cpu + lam
-            filt = lam / denom
-            return float(np.sum((filt * filt) * (rhs_proj2 / np.maximum(eigvals_cpu, 1.0e-30))))
+            # Morozov's discrepancy principle is posed in measurement space:
+            #     ||A x_lambda - b|| ~= tau * ||noise||.
+            #
+            # The stacked alpha operator is generally tall (M = K*N > N), so
+            # b can contain a nonzero component orthogonal to Range(A).  A
+            # coefficient-space/range-only expression such as
+            # ``sum((lambda / (sigma^2 + lambda))^2 * rhs_proj^2 / sigma^2)``
+            # drops that orthogonal residual and overestimates the lambda
+            # needed to reach the target discrepancy.  Use the equivalent full
+            # measurement-space identity instead:
+            #     ||b||^2 - <rhs, x_lambda> - lambda ||x_lambda||^2.
+            x_rhs = float(np.sum(rhs_proj2 / denom))
+            x_norm2 = float(np.sum(rhs_proj2 / (denom * denom)))
+            return max(0.0, sample_b_norm2 - x_rhs - (lam * x_norm2))
 
         def derivative_fn(lam: float) -> float:
-            denom = eigvals_cpu + lam
-            return float(np.sum((2.0 * lam * eigvals_cpu / (denom ** 3)) * (rhs_proj2 / np.maximum(eigvals_cpu, 1.0e-30))))
+            return float(2.0 * lam * np.sum(rhs_proj2 / ((eigvals_cpu + lam) ** 3)))
 
         lam_list.append(
             _morozov_newton_scalar(
