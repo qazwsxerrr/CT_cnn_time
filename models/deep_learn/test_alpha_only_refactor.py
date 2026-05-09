@@ -80,6 +80,39 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
         self.assertFalse(hasattr(lgd, "feature_beta_vectors"))
         self.assertTrue(lgd.physics_residual_enabled)
 
+    def test_checkpoint_config_restore_preserves_explicit_cnn_angle_indices(self):
+        from config import TIME_DOMAIN_CONFIG
+        from test import _temporary_experiment_config
+
+        backup = dict(TIME_DOMAIN_CONFIG)
+        try:
+            TIME_DOMAIN_CONFIG.update(
+                {
+                    "cnn_angle_indices_override": [0, 2],
+                    "cnn_num_angles_override": 2,
+                    "physics_residual_mode": "per_angle_cg",
+                }
+            )
+            metadata = {
+                "experiment_profile": "runtime_alpha",
+                "operator_mode": "theoretical_b1b1",
+                "alpha_values": [0.23, 0.57, 1.11, 1.43],
+                "alpha_tau_offsets": [0.15, 0.25, 0.35, 0.45],
+                "learned_num_angles": 4,
+                "raw_cnn_angle_channels": 2,
+                "cnn_num_angles": 2,
+                "theoretical_formula_mode": "alpha_continuous",
+                "data_formula_mode": "auto_complete",
+                "physics_residual_mode": "per_angle_cg",
+            }
+            with _temporary_experiment_config(metadata):
+                self.assertEqual(TIME_DOMAIN_CONFIG["cnn_angle_indices_override"], [0, 2])
+                self.assertEqual(TIME_DOMAIN_CONFIG["cnn_num_angles_override"], 2)
+                self.assertEqual(TIME_DOMAIN_CONFIG["physics_residual_mode"], "per_angle_cg")
+        finally:
+            TIME_DOMAIN_CONFIG.clear()
+            TIME_DOMAIN_CONFIG.update(backup)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

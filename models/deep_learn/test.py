@@ -135,6 +135,7 @@ def _temporary_experiment_config(experiment_metadata: dict):
         return
 
     backup = copy.deepcopy(TIME_DOMAIN_CONFIG)
+    backup_cnn_angle_indices = backup.get("cnn_angle_indices_override", None)
     try:
         profile_name = str(experiment_metadata.get("experiment_profile", "") or "").strip()
         if profile_name:
@@ -168,21 +169,32 @@ def _temporary_experiment_config(experiment_metadata: dict):
             )
         if "cnn_backbone_only" in experiment_metadata:
             TIME_DOMAIN_CONFIG["cnn_backbone_only"] = bool(experiment_metadata["cnn_backbone_only"])
-        if "learned_num_angles" in experiment_metadata:
-            learned_num_angles = int(experiment_metadata["learned_num_angles"])
-            TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
-                learned_num_angles if learned_num_angles > 0 else None
-            )
-        elif "raw_cnn_angle_channels" in experiment_metadata:
-            raw_cnn_angle_channels = int(experiment_metadata["raw_cnn_angle_channels"])
-            TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
-                raw_cnn_angle_channels if raw_cnn_angle_channels > 0 else None
-            )
-        elif "cnn_num_angles" in experiment_metadata:
-            cnn_num_angles = int(experiment_metadata["cnn_num_angles"])
-            TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
-                cnn_num_angles if cnn_num_angles > 0 else None
-            )
+        selected_angle_indices = None
+        if experiment_metadata.get("cnn_angle_indices") is not None:
+            selected_angle_indices = [int(idx) for idx in experiment_metadata.get("cnn_angle_indices") or []]
+        elif backup_cnn_angle_indices is not None:
+            selected_angle_indices = [int(idx) for idx in list(backup_cnn_angle_indices)]
+
+        if selected_angle_indices:
+            TIME_DOMAIN_CONFIG["cnn_angle_indices_override"] = selected_angle_indices
+            TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = int(len(selected_angle_indices))
+        else:
+            TIME_DOMAIN_CONFIG["cnn_angle_indices_override"] = None
+            if "raw_cnn_angle_channels" in experiment_metadata:
+                raw_cnn_angle_channels = int(experiment_metadata["raw_cnn_angle_channels"])
+                TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
+                    raw_cnn_angle_channels if raw_cnn_angle_channels > 0 else None
+                )
+            elif "cnn_num_angles" in experiment_metadata:
+                cnn_num_angles = int(experiment_metadata["cnn_num_angles"])
+                TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
+                    cnn_num_angles if cnn_num_angles > 0 else None
+                )
+            elif "learned_num_angles" in experiment_metadata:
+                learned_num_angles = int(experiment_metadata["learned_num_angles"])
+                TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
+                    learned_num_angles if learned_num_angles > 0 else None
+                )
         if "cnn_angle_adapter_enabled" in experiment_metadata:
             TIME_DOMAIN_CONFIG["cnn_angle_adapter_enabled"] = bool(
                 experiment_metadata["cnn_angle_adapter_enabled"]
@@ -199,6 +211,20 @@ def _temporary_experiment_config(experiment_metadata: dict):
             adapter_output_channels = int(experiment_metadata["cnn_num_angles"])
             if adapter_output_channels > 0:
                 TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = adapter_output_channels
+        if "physics_residual_channel_enabled" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["physics_residual_channel_enabled"] = bool(experiment_metadata["physics_residual_channel_enabled"])
+        if experiment_metadata.get("physics_residual_mode"):
+            TIME_DOMAIN_CONFIG["physics_residual_mode"] = str(experiment_metadata["physics_residual_mode"])
+        if "physics_residual_cg_iters" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["physics_residual_cg_iters"] = int(experiment_metadata["physics_residual_cg_iters"])
+        if "physics_residual_damping" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["physics_residual_damping"] = float(experiment_metadata["physics_residual_damping"])
+        if "physics_residual_detach" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["physics_residual_detach"] = bool(experiment_metadata["physics_residual_detach"])
+        if "physics_residual_normalize" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["physics_residual_normalize"] = bool(experiment_metadata["physics_residual_normalize"])
+        if "physics_explicit_update_enabled" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["physics_explicit_update_enabled"] = bool(experiment_metadata["physics_explicit_update_enabled"])
         yield
     finally:
         TIME_DOMAIN_CONFIG.clear()
