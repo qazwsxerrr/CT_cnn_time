@@ -3,6 +3,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import torch
+
 THIS_DIR = Path(__file__).resolve().parent
 MODELS_DIR = THIS_DIR.parents[0]
 for path in (THIS_DIR, MODELS_DIR):
@@ -112,6 +114,27 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
         finally:
             TIME_DOMAIN_CONFIG.clear()
             TIME_DOMAIN_CONFIG.update(backup)
+
+    def test_eval_tikhonov_baseline_uses_solver_not_network_input(self):
+        from test import compute_tikhonov_baseline
+
+        class FakeGenerator:
+            def __init__(self):
+                self.calls = []
+
+            def solve_tikhonov_direct_init(self, g_obs, lambda_reg):
+                self.calls.append(("direct", tuple(g_obs.shape), float(lambda_reg)))
+                return torch.full((1, 1, 2, 2), 3.0)
+
+        generator = FakeGenerator()
+        baseline = compute_tikhonov_baseline(
+            generator,
+            g_obs=torch.arange(4, dtype=torch.float32),
+            lambda_reg=0.25,
+        )
+
+        self.assertEqual(generator.calls, [("direct", (1, 4), 0.25)])
+        self.assertTrue(torch.equal(baseline, torch.full((2, 2), 3.0)))
 
 
 if __name__ == "__main__":

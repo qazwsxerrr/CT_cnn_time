@@ -81,19 +81,19 @@ def coeff_to_display_image(coeff: np.ndarray) -> np.ndarray:
     return coeff
 
 
-def plot_result(idx, f_true, f_init, f_pred, res_init, res_pred, save_path, noise_desc, lambda_reg):
+def plot_result(idx, f_true, f_tikhonov, f_pred, res_tikhonov, res_pred, save_path, noise_desc, lambda_reg):
     """Plot synthesized f images; RES shown is still coefficient-domain RES."""
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    vmin = min(float(np.min(f_true)), float(np.min(f_init)), float(np.min(f_pred)))
-    vmax = max(float(np.max(f_true)), float(np.max(f_init)), float(np.max(f_pred)))
+    vmin = min(float(np.min(f_true)), float(np.min(f_tikhonov)), float(np.min(f_pred)))
+    vmax = max(float(np.max(f_true)), float(np.max(f_tikhonov)), float(np.max(f_pred)))
     extent = (0.0, float(IMAGE_SIZE - 1), 0.0, float(IMAGE_SIZE - 1))
 
     im0 = axes[0].imshow(f_true, cmap="gray", origin="lower", vmin=vmin, vmax=vmax, extent=extent)
     axes[0].set_title("True f(x,y)")
     plt.colorbar(im0, ax=axes[0])
 
-    im1 = axes[1].imshow(f_init, cmap="gray", origin="lower", vmin=vmin, vmax=vmax, extent=extent)
-    axes[1].set_title(f"Init f(x,y)\nCoeff RES={res_init:.4f}")
+    im1 = axes[1].imshow(f_tikhonov, cmap="gray", origin="lower", vmin=vmin, vmax=vmax, extent=extent)
+    axes[1].set_title(f"Tikhonov f(x,y)\nCoeff RES={res_tikhonov:.4f}")
     plt.colorbar(im1, ax=axes[1])
 
     im2 = axes[2].imshow(f_pred, cmap="gray", origin="lower", vmin=vmin, vmax=vmax, extent=extent)
@@ -114,6 +114,31 @@ def build_sample(generator: TheoreticalDataGenerator, seed: Optional[int] = None
         np.random.seed(seed)
     coeff_true, _, g_obs, coeff_init = generator.generate_training_sample(random_seed=seed)
     return coeff_true, g_obs, coeff_init
+
+
+@torch.no_grad()
+def compute_tikhonov_baseline(generator: TheoreticalDataGenerator, g_obs: torch.Tensor, lambda_reg) -> torch.Tensor:
+    """Compute an explicit Tikhonov baseline for reporting/evaluation.
+
+    This intentionally does not reuse the neural network input tensor named
+    ``coeff_init``.  The network may use a different initialization path during
+    experiments, while the reported baseline should stay the pure Tikhonov
+    reconstruction for the same observation and lambda.
+    """
+    method = str(os.environ.get("EVAL_TIKHONOV_BASELINE_METHOD_OVERRIDE", "tikhonov_direct")).strip().lower()
+    g_batch = g_obs.unsqueeze(0) if g_obs.dim() == 1 else g_obs
+    if method in {"", "direct", "tikhonov_direct"}:
+        coeff = generator.solve_tikhonov_direct_init(g_batch, lambda_reg=lambda_reg)
+    elif method in {"cg", "tikhonov_cg"}:
+        max_iter = int(os.environ.get("EVAL_TIKHONOV_BASELINE_CG_ITERS_OVERRIDE", TIME_DOMAIN_CONFIG.get("init_cg_iters", 40)))
+        tol = float(os.environ.get("EVAL_TIKHONOV_BASELINE_CG_TOL_OVERRIDE", TIME_DOMAIN_CONFIG.get("init_cg_tol", 1.0e-4)))
+        coeff = generator._tikhonov_cg_init(g_batch, lambda_reg=lambda_reg, max_iter=max_iter, tol=tol)
+    else:
+        raise ValueError(
+            f"Unsupported EVAL_TIKHONOV_BASELINE_METHOD_OVERRIDE={method!r}; "
+            "expected 'tikhonov_direct' or 'tikhonov_cg'."
+        )
+    return coeff.squeeze(0).squeeze(0)
 
 
 def _resolve_checkpoint_from_tag(tag: str) -> str:
@@ -273,15 +298,16 @@ def evaluate(
         generator.target_snr_db = float(snr_db)
         generator.image_gen = generator.image_gen.to(device)
 
-        res_init_list = []
+        res_tikhonov_list = []
         res_pred_list = []
         last_plot_data = None
 
         for _ in range(num_samples):
             coeff_true, g_obs, coeff_init = build_sample(generator, seed=None)
             lam_used = float(generator.last_lambda) if generator.last_lambda is not None else float(lambda_reg_fixed)
+            coeff_tikhonov = compute_tikhonov_baseline(generator, g_obs, lambda_reg=lam_used)
             coeff_true_cpu = coeff_true.squeeze().cpu()
-            coeff_init_cpu = coeff_init.squeeze().cpu()
+            coeff_tikhonov_cpu = coeff_tikhonov.squeeze().cpu()
 
             g_obs_batch = g_obs.unsqueeze(0).to(device)
             coeff_init_batch = coeff_init.unsqueeze(0).unsqueeze(0).to(device)
@@ -291,29 +317,29 @@ def evaluate(
 
             coeff_pred = coeff_pred_batch.squeeze().detach().cpu()
             diff_sq_sum_pred = torch.sum(torch.abs(coeff_pred - coeff_true_cpu) ** 2)
-            diff_sq_sum_init = torch.sum(torch.abs(coeff_init_cpu - coeff_true_cpu) ** 2)
+            diff_sq_sum_tikhonov = torch.sum(torch.abs(coeff_tikhonov_cpu - coeff_true_cpu) ** 2)
             true_sq_sum = torch.sum(torch.abs(coeff_true_cpu) ** 2).clamp_min(1e-12)
             res_pred = torch.sqrt(diff_sq_sum_pred / true_sq_sum).item()
-            res_init = torch.sqrt(diff_sq_sum_init / true_sq_sum).item()
+            res_tikhonov = torch.sqrt(diff_sq_sum_tikhonov / true_sq_sum).item()
 
-            res_init_list.append(res_init)
+            res_tikhonov_list.append(res_tikhonov)
             res_pred_list.append(res_pred)
             last_plot_data = (
                 coeff_true_cpu.numpy(),
-                coeff_init_cpu.numpy(),
+                coeff_tikhonov_cpu.numpy(),
                 coeff_pred.numpy(),
-                res_init,
+                res_tikhonov,
                 res_pred,
                 lam_used,
             )
 
-        mean_res_init = sum(res_init_list) / len(res_init_list)
+        mean_res_tikhonov = sum(res_tikhonov_list) / len(res_tikhonov_list)
         mean_res_pred = sum(res_pred_list) / len(res_pred_list)
 
         if last_plot_data is not None:
-            coeff_true_np, coeff_init_np, coeff_pred_np, res_init_last, res_pred_last, lam_used_last = last_plot_data
+            coeff_true_np, coeff_tikhonov_np, coeff_pred_np, res_tikhonov_last, res_pred_last, lam_used_last = last_plot_data
             f_true_np = coeff_to_display_image(coeff_true_np)
-            f_init_np = coeff_to_display_image(coeff_init_np)
+            f_tikhonov_np = coeff_to_display_image(coeff_tikhonov_np)
             f_pred_np = coeff_to_display_image(coeff_pred_np)
             save_name = "shepp_logan_last.png" if test_data_source == "shepp_logan" else "random_ellipses_last.png"
             prefix = str(
@@ -328,9 +354,9 @@ def evaluate(
             plot_result(
                 idx="MainExperiment_last",
                 f_true=f_true_np,
-                f_init=f_init_np,
+                f_tikhonov=f_tikhonov_np,
                 f_pred=f_pred_np,
-                res_init=res_init_last,
+                res_tikhonov=res_tikhonov_last,
                 res_pred=res_pred_last,
                 save_path=save_path,
                 noise_desc=noise_desc,
@@ -339,11 +365,12 @@ def evaluate(
 
         print("==== Main Experiment Evaluation (Mean over samples) ====")
         print(f"Noise: {noise_desc}")
-        print(f"Mean RES (init): {mean_res_init:.6f}")
+        print(f"Mean RES (tikhonov): {mean_res_tikhonov:.6f}")
         print(f"Mean RES (pred): {mean_res_pred:.6f}")
         return {
             "noise_desc": noise_desc,
-            "mean_res_init": float(mean_res_init),
+            "mean_res_init": float(mean_res_tikhonov),
+            "mean_res_tikhonov": float(mean_res_tikhonov),
             "mean_res_pred": float(mean_res_pred),
             "model_path": resolved_load_path,
             "output_tag": str(result_prefix or experiment_metadata.get("output_tag") or EXPERIMENT_OUTPUT_TAG or "default"),
@@ -370,7 +397,7 @@ def compare_saved_models(tags: List[str], num_samples: int = 50, result_dir: Opt
     print("==== Comparison Summary ====")
     for item in results:
         print(
-            f"{item['output_tag']}: Mean RES(init)={item['mean_res_init']:.6f} | "
+            f"{item['output_tag']}: Mean RES(tikhonov)={item['mean_res_tikhonov']:.6f} | "
             f"Mean RES(pred)={item['mean_res_pred']:.6f} | "
             f"model={item['model_path']}"
         )
