@@ -1,4 +1,5 @@
 import inspect
+import os
 import sys
 import tempfile
 import unittest
@@ -30,11 +31,19 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             "triangular_residual_channel_enabled",
             "triangular_explicit_update_enabled",
             "triangular_angle_attention_enabled",
+            "cnn_angle_adapter_enabled",
+            "cnn_angle_adapter_mode",
+            "cnn_angle_adapter_output_channels",
+            "cnn_angle_adapter_hidden_channels",
         }
         self.assertTrue(forbidden_keys.isdisjoint(TIME_DOMAIN_CONFIG.keys()))
 
+        config_source = Path(MODELS_DIR / "config.py").read_text(encoding="utf-8")
+        self.assertNotIn("CNN_ANGLE_ADAPTER", config_source)
+
         _apply_experiment_profile("runtime_alpha")
         _apply_experiment_profile("alpha_condition")
+        self.assertTrue(forbidden_keys.isdisjoint(TIME_DOMAIN_CONFIG.keys()))
         with self.assertRaises(ValueError):
             _apply_experiment_profile("condition_constrained8_pi")
 
@@ -55,21 +64,27 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
 
     def test_learned_model_has_no_triangular_or_feature_beta_path(self):
         from config import TIME_DOMAIN_CONFIG
+        import model
         from model import LearnedGradientDescent
+
+        self.assertFalse(hasattr(model, "AdaptiveAngleFeatureAdapter"))
 
         backup = dict(TIME_DOMAIN_CONFIG)
         try:
             TIME_DOMAIN_CONFIG.update(
                 {
                     "experiment_profile": "runtime_alpha",
-                    "alpha_values": [0.23, 1.11],
-                    "alpha_tau_offsets": [0.15, 0.35],
-                    "num_angles_total": 2,
-                    "num_angles": 2,
-                    "cnn_num_angles_override": 2,
+                    "alpha_values": [0.23, 0.57, 1.11, 1.43],
+                    "alpha_tau_offsets": [0.15, 0.25, 0.35, 0.45],
+                    "num_angles_total": 4,
+                    "num_angles": 4,
+                    "cnn_num_angles_override": 4,
+                    # Legacy adapter knobs must be ignored if injected by an old caller.
+                    "cnn_angle_adapter_enabled": True,
+                    "cnn_angle_adapter_mode": "adaptive_attention_mix",
                     "cnn_angle_adapter_output_channels": 2,
                     "cnn_angle_adapter_hidden_channels": 2,
-                    "physics_residual_channel_enabled": True,
+                    "physics_residual_channel_enabled": False,
                     "physics_explicit_update_enabled": False,
                 }
             )
@@ -81,7 +96,13 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
         self.assertFalse(hasattr(lgd, "triangular_residual_enabled"))
         self.assertFalse(hasattr(lgd, "triangular_alpha_raw"))
         self.assertFalse(hasattr(lgd, "feature_beta_vectors"))
-        self.assertTrue(lgd.physics_residual_enabled)
+        self.assertFalse(hasattr(lgd, "angle_feature_adapter"))
+        self.assertFalse(hasattr(lgd, "angle_adapter_enabled"))
+        self.assertFalse(hasattr(lgd, "get_angle_adapter_diagnostics"))
+        self.assertEqual(lgd.raw_cnn_num_angles, 4)
+        self.assertEqual(lgd.cnn_num_angles, 4)
+        self.assertEqual(lgd.input_channels, 2 + 4 + 0 + 1)
+        self.assertFalse(lgd.physics_residual_enabled)
 
     def test_checkpoint_config_restore_preserves_explicit_cnn_angle_indices(self):
         from config import TIME_DOMAIN_CONFIG
@@ -115,6 +136,46 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
         finally:
             TIME_DOMAIN_CONFIG.clear()
             TIME_DOMAIN_CONFIG.update(backup)
+
+    def test_train_helpers_resume_after_loaded_checkpoint_iteration(self):
+        import train as train_module
+
+        self.assertEqual(train_module._next_training_start_iter(-1), 0)
+        self.assertEqual(train_module._next_training_start_iter(0), 1)
+        self.assertEqual(train_module._next_training_start_iter(137), 138)
+
+        backup = os.environ.get("RESUME_CHECKPOINT_OVERRIDE")
+        try:
+            os.environ["RESUME_CHECKPOINT_OVERRIDE"] = "/root/checkpoints/deep_learn/example_model.pth"
+            self.assertEqual(
+                train_module._resolve_resume_checkpoint_path(),
+                "/root/checkpoints/deep_learn/example_model.pth",
+            )
+            os.environ["RESUME_CHECKPOINT_OVERRIDE"] = "   "
+            self.assertIsNone(train_module._resolve_resume_checkpoint_path())
+        finally:
+            if backup is None:
+                os.environ.pop("RESUME_CHECKPOINT_OVERRIDE", None)
+            else:
+                os.environ["RESUME_CHECKPOINT_OVERRIDE"] = backup
+
+    def test_train_helper_summarizes_selected_cnn_angle_channels(self):
+        import train as train_module
+
+        summary = train_module._build_cnn_angle_selection_summary(
+            cnn_angle_indices=[0, 2],
+            alpha_values=[0.1, 0.2, 0.3],
+            tau_offsets=[1.0, 1.1, 1.2],
+            physics_residual_enabled=True,
+            physics_residual_mode="per_angle_cg",
+        )
+
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["indices"], [0, 2])
+        self.assertEqual(summary["alpha_values"], [0.1, 0.3])
+        self.assertEqual(summary["tau_offsets"], [1.0, 1.2])
+        self.assertEqual(summary["data_fidelity_gradient_channel_indices"], [0, 2])
+        self.assertEqual(summary["physics_residual_channel_indices"], [0, 2])
 
     def test_eval_tikhonov_baseline_uses_solver_not_network_input(self):
         from test import compute_tikhonov_baseline

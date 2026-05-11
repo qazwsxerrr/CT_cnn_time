@@ -220,22 +220,6 @@ def _temporary_experiment_config(experiment_metadata: dict):
                 TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = (
                     learned_num_angles if learned_num_angles > 0 else None
                 )
-        if "cnn_angle_adapter_enabled" in experiment_metadata:
-            TIME_DOMAIN_CONFIG["cnn_angle_adapter_enabled"] = bool(
-                experiment_metadata["cnn_angle_adapter_enabled"]
-            )
-        if "cnn_angle_adapter_mode" in experiment_metadata:
-            TIME_DOMAIN_CONFIG["cnn_angle_adapter_mode"] = str(
-                experiment_metadata["cnn_angle_adapter_mode"]
-            )
-        if "cnn_angle_adapter_hidden_channels" in experiment_metadata:
-            hidden_channels = int(experiment_metadata["cnn_angle_adapter_hidden_channels"])
-            if hidden_channels > 0:
-                TIME_DOMAIN_CONFIG["cnn_angle_adapter_hidden_channels"] = hidden_channels
-        if bool(TIME_DOMAIN_CONFIG.get("cnn_angle_adapter_enabled", False)) and "cnn_num_angles" in experiment_metadata:
-            adapter_output_channels = int(experiment_metadata["cnn_num_angles"])
-            if adapter_output_channels > 0:
-                TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = adapter_output_channels
         if "physics_residual_channel_enabled" in experiment_metadata:
             TIME_DOMAIN_CONFIG["physics_residual_channel_enabled"] = bool(experiment_metadata["physics_residual_channel_enabled"])
         if experiment_metadata.get("physics_residual_mode"):

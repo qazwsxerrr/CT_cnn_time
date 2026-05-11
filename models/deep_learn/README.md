@@ -48,7 +48,6 @@ $env:ALPHA_GRAM_CACHE_DIR_OVERRIDE = "D:\ai_code\ai_project\ct_time\data\alpha_g
 # - 8 个对应 per-angle_cg physics residual 通道
 $env:CNN_ANGLE_INDICES_OVERRIDE = "0,2,4,6,8,10,12,14"
 $env:CNN_NUM_ANGLES_OVERRIDE = "8"
-$env:CNN_ANGLE_ADAPTER_ENABLED_OVERRIDE = "0"
 
 # Tikhonov/Morozov 初始化
 $env:INIT_METHOD_OVERRIDE = "tikhonov_direct"
@@ -104,7 +103,6 @@ $env:ALPHA_CONDITION_JSON_OVERRIDE = "D:\ai_code\ai_project\ct_time\data\alpha_s
 $env:ALPHA_GRAM_CACHE_DIR_OVERRIDE = "D:\ai_code\ai_project\ct_time\data\alpha_gram_cache"
 $env:CNN_ANGLE_INDICES_OVERRIDE = "0,2,4,6,8,10,12,14"
 $env:CNN_NUM_ANGLES_OVERRIDE = "8"
-$env:CNN_ANGLE_ADAPTER_ENABLED_OVERRIDE = "0"
 $env:INIT_METHOD_OVERRIDE = "tikhonov_direct"
 $env:LAMBDA_SELECT_MODE_OVERRIDE = "morozov"
 $env:NOISE_MODE_OVERRIDE = "multiplicative"
@@ -148,7 +146,6 @@ $env:ALPHA_GRAM_CACHE_DIR_OVERRIDE = "D:\ai_code\ai_project\ct_time\data\alpha_g
 
 $env:CNN_ANGLE_INDICES_OVERRIDE = "0,2,4,6,8,10,12,14"
 $env:CNN_NUM_ANGLES_OVERRIDE = "8"
-$env:CNN_ANGLE_ADAPTER_ENABLED_OVERRIDE = "0"
 
 $env:INIT_METHOD_OVERRIDE = "tikhonov_direct"
 $env:LAMBDA_SELECT_MODE_OVERRIDE = "morozov"

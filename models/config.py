@@ -256,10 +256,6 @@ TIME_DOMAIN_CONFIG = {
     "cnn_backbone_only": False,
     "cnn_num_angles_override": None,
     "cnn_angle_indices_override": None,
-    "cnn_angle_adapter_enabled": False,
-    "cnn_angle_adapter_mode": "disabled",
-    "cnn_angle_adapter_output_channels": DEFAULT_ALPHA_CONDITION_TOP_K,
-    "cnn_angle_adapter_hidden_channels": min(DEFAULT_ALPHA_CONDITION_TOP_K, 8),
     "physics_residual_channel_enabled": True,
     "physics_residual_mode": "per_angle_cg",
     "physics_residual_damping": 1.0e-2,
@@ -297,10 +293,6 @@ def _apply_alpha_condition_profile(json_path: str | None = None) -> None:
     TIME_DOMAIN_CONFIG["cnn_backbone_only"] = False
     TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = num_angles
     TIME_DOMAIN_CONFIG["cnn_angle_indices_override"] = None
-    TIME_DOMAIN_CONFIG["cnn_angle_adapter_enabled"] = False
-    TIME_DOMAIN_CONFIG["cnn_angle_adapter_mode"] = "disabled"
-    TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = num_angles
-    TIME_DOMAIN_CONFIG["cnn_angle_adapter_hidden_channels"] = min(num_angles, 8)
     TIME_DOMAIN_CONFIG["physics_residual_channel_enabled"] = True
     TIME_DOMAIN_CONFIG["physics_residual_mode"] = "per_angle_cg"
     TIME_DOMAIN_CONFIG["physics_residual_damping"] = 1.0e-2
@@ -368,8 +360,6 @@ if TIME_DOMAIN_CONFIG.get("alpha_values"):
     TIME_DOMAIN_CONFIG["num_angles_total"] = _alpha_k
     TIME_DOMAIN_CONFIG["num_angles"] = _alpha_k
     TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = _alpha_k
-    TIME_DOMAIN_CONFIG["cnn_angle_adapter_output_channels"] = _alpha_k
-    TIME_DOMAIN_CONFIG["cnn_angle_adapter_hidden_channels"] = min(_alpha_k, 8)
 
 _m_override = os.environ.get("NUM_DETECTOR_SAMPLES_OVERRIDE", None)
 if _m_override is not None:
@@ -387,10 +377,6 @@ _apply_string_override(TIME_DOMAIN_CONFIG, "theoretical_formula_mode", "THEORETI
 _apply_bool_override(TIME_DOMAIN_CONFIG, "cnn_backbone_only", "CNN_BACKBONE_ONLY_OVERRIDE")
 _apply_int_override(TIME_DOMAIN_CONFIG, "cnn_num_angles_override", "CNN_NUM_ANGLES_OVERRIDE")
 _apply_int_list_override(TIME_DOMAIN_CONFIG, "cnn_angle_indices_override", "CNN_ANGLE_INDICES_OVERRIDE")
-_apply_bool_override(TIME_DOMAIN_CONFIG, "cnn_angle_adapter_enabled", "CNN_ANGLE_ADAPTER_ENABLED_OVERRIDE")
-_apply_string_override(TIME_DOMAIN_CONFIG, "cnn_angle_adapter_mode", "CNN_ANGLE_ADAPTER_MODE_OVERRIDE", allowed_values={"disabled", "adaptive_attention_mix"})
-_apply_int_override(TIME_DOMAIN_CONFIG, "cnn_angle_adapter_output_channels", "CNN_ANGLE_ADAPTER_OUTPUT_CHANNELS_OVERRIDE")
-_apply_int_override(TIME_DOMAIN_CONFIG, "cnn_angle_adapter_hidden_channels", "CNN_ANGLE_ADAPTER_HIDDEN_CHANNELS_OVERRIDE")
 _apply_bool_override(TIME_DOMAIN_CONFIG, "physics_residual_channel_enabled", "PHYSICS_RESIDUAL_CHANNEL_ENABLED_OVERRIDE")
 _apply_string_override(TIME_DOMAIN_CONFIG, "physics_residual_mode", "PHYSICS_RESIDUAL_MODE_OVERRIDE", allowed_values={"stacked_cg", "per_angle_cg"})
 _apply_float_override(TIME_DOMAIN_CONFIG, "physics_residual_damping", "PHYSICS_RESIDUAL_DAMPING_OVERRIDE")
@@ -472,10 +458,6 @@ def print_config():
     print(f"Alpha angles: {len(TIME_DOMAIN_CONFIG.get('alpha_values') or [])}")
     if TIME_DOMAIN_CONFIG.get("alpha_condition_constrained_json"):
         print(f"Alpha JSON: {TIME_DOMAIN_CONFIG['alpha_condition_constrained_json']}")
-    print(f"CNN angle adapter enabled: {TIME_DOMAIN_CONFIG['cnn_angle_adapter_enabled']}")
-    print(f"CNN angle adapter mode: {TIME_DOMAIN_CONFIG['cnn_angle_adapter_mode']}")
-    print(f"CNN angle adapter output channels: {TIME_DOMAIN_CONFIG['cnn_angle_adapter_output_channels']}")
-    print(f"CNN angle adapter hidden channels: {TIME_DOMAIN_CONFIG['cnn_angle_adapter_hidden_channels']}")
     print(f"Physics residual channel: {TIME_DOMAIN_CONFIG['physics_residual_channel_enabled']}")
     print(f"Output tag: {EXPERIMENT_OUTPUT_TAG or '(default)'}")
     print(f"Training iterations: {n_train}")

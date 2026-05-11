@@ -37,6 +37,45 @@ N_TRAIN = int(os.environ.get("N_TRAIN_OVERRIDE", n_train))
 N_DATA = int(os.environ.get("N_DATA_OVERRIDE", n_data))
 
 
+def _resolve_resume_checkpoint_path():
+    resume_path = str(os.environ.get("RESUME_CHECKPOINT_OVERRIDE", "") or "").strip()
+    return resume_path or None
+
+
+def _next_training_start_iter(current_iter):
+    return max(int(current_iter) + 1, 0)
+
+
+def _select_by_indices(values, indices):
+    values_list = list(values or [])
+    selected = []
+    for idx in indices:
+        idx = int(idx)
+        if 0 <= idx < len(values_list):
+            selected.append(float(values_list[idx]))
+    return selected
+
+
+def _build_cnn_angle_selection_summary(
+    cnn_angle_indices,
+    alpha_values,
+    tau_offsets,
+    physics_residual_enabled,
+    physics_residual_mode,
+):
+    indices = [int(idx) for idx in list(cnn_angle_indices or [])]
+    physics_mode = str(physics_residual_mode or "").strip().lower()
+    physics_indices = indices if bool(physics_residual_enabled) and physics_mode == "per_angle_cg" else []
+    return {
+        "count": int(len(indices)),
+        "indices": indices,
+        "alpha_values": _select_by_indices(alpha_values, indices),
+        "tau_offsets": _select_by_indices(tau_offsets, indices),
+        "data_fidelity_gradient_channel_indices": indices,
+        "physics_residual_channel_indices": physics_indices,
+    }
+
+
 def _set_global_seed_from_env():
     seed_raw = os.environ.get("GLOBAL_SEED_OVERRIDE", None)
     if seed_raw is None:
@@ -92,19 +131,33 @@ class TheoreticalTrainer:
             bool(getattr(self.val_data_generator, "time_operator", None) is shared_time_operator),
         )
         self.logger.info(
-            "Angle usage: total=%d, learned=%d, raw_cnn_channels=%d, mixed_cnn_channels=%d",
+            "Angle usage: total=%d, learned=%d, cnn_channels=%d",
             self.experiment_metadata["num_angles"],
             self.experiment_metadata["learned_num_angles"],
-            self.experiment_metadata["raw_cnn_angle_channels"],
             self.experiment_metadata["cnn_num_angles"],
         )
         self.logger.info(
-            "Angle adapter: enabled=%s mode=%s hidden=%d out=%d",
-            self.experiment_metadata["cnn_angle_adapter_enabled"],
-            self.experiment_metadata["cnn_angle_adapter_mode"],
-            self.experiment_metadata["cnn_angle_adapter_hidden_channels"],
-            self.experiment_metadata["cnn_num_angles"],
+            "CNN input angle selection: count=%d indices=%s",
+            self.experiment_metadata["cnn_angle_selection"]["count"],
+            self.experiment_metadata["cnn_angle_selection"]["indices"],
         )
+        self.logger.info(
+            "CNN input alpha values: %s",
+            self.experiment_metadata["cnn_angle_selection"]["alpha_values"],
+        )
+        self.logger.info(
+            "CNN input tau offsets: %s",
+            self.experiment_metadata["cnn_angle_selection"]["tau_offsets"],
+        )
+        self.logger.info(
+            "Data fidelity gradient channel angle indices: %s",
+            self.experiment_metadata["cnn_angle_selection"]["data_fidelity_gradient_channel_indices"],
+        )
+        if self.experiment_metadata["cnn_angle_selection"]["physics_residual_channel_indices"]:
+            self.logger.info(
+                "Physics residual channel angle indices: %s",
+                self.experiment_metadata["cnn_angle_selection"]["physics_residual_channel_indices"],
+            )
         self.logger.info(
             "Active alpha JSON: %s",
             self.experiment_metadata.get("alpha_condition_constrained_json"),
@@ -158,7 +211,7 @@ class TheoreticalTrainer:
             return 1.0 / (1.0 + step / 500.0)
 
         self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
-        self.current_iter = 0
+        self.current_iter = -1
         self.best_val_loss = float('inf')
         self.patience_counter = 0
         self.training_history = {
@@ -174,6 +227,26 @@ class TheoreticalTrainer:
 
     def _build_experiment_metadata(self):
         operator = self.model.optimizer.operator
+        cnn_angle_indices = [int(idx) for idx in getattr(self.model.optimizer, "cnn_channel_indices", [])]
+        alpha_values = list(TIME_DOMAIN_CONFIG.get("alpha_values") or getattr(operator, "alpha_values", []) or [])
+        tau_offsets = list(TIME_DOMAIN_CONFIG.get("alpha_tau_offsets") or [])
+        if not tau_offsets and hasattr(operator, "tau_offsets_tensor"):
+            tau_offsets = [float(v) for v in operator.tau_offsets_tensor.detach().cpu().view(-1).tolist()]
+        physics_residual_enabled = bool(getattr(self.model.optimizer, "physics_residual_enabled", False))
+        physics_residual_mode = str(
+            getattr(
+                self.model.optimizer,
+                "physics_residual_mode",
+                TIME_DOMAIN_CONFIG.get("physics_residual_mode", "per_angle_cg"),
+            )
+        )
+        angle_selection = _build_cnn_angle_selection_summary(
+            cnn_angle_indices=cnn_angle_indices,
+            alpha_values=alpha_values,
+            tau_offsets=tau_offsets,
+            physics_residual_enabled=physics_residual_enabled,
+            physics_residual_mode=physics_residual_mode,
+        )
         return {
             "output_tag": EXPERIMENT_OUTPUT_TAG or "default",
             "experiment_profile": str(TIME_DOMAIN_CONFIG.get("experiment_profile", "default")),
@@ -185,12 +258,12 @@ class TheoreticalTrainer:
             "learned_num_angles": int(getattr(self.model.optimizer, "learned_num_angles", 1) or 1),
             "raw_cnn_angle_channels": int(getattr(self.model.optimizer, "raw_cnn_num_angles", getattr(self.model.optimizer, "cnn_num_angles", 1)) or 1),
             "cnn_num_angles": int(getattr(self.model.optimizer, "cnn_num_angles", 1) or 1),
-            "cnn_angle_indices": [int(idx) for idx in getattr(self.model.optimizer, "cnn_channel_indices", [])],
-            "cnn_angle_adapter_enabled": bool(getattr(self.model.optimizer, "angle_feature_adapter", None) is not None),
-            "cnn_angle_adapter_mode": str(getattr(self.model.optimizer, "angle_adapter_mode", "disabled")),
-            "cnn_angle_adapter_hidden_channels": int(getattr(self.model.optimizer, "angle_adapter_hidden_channels", 0) or 0),
-            "physics_residual_channel_enabled": bool(getattr(self.model.optimizer, "physics_residual_enabled", False)),
-            "physics_residual_mode": str(getattr(self.model.optimizer, "physics_residual_mode", TIME_DOMAIN_CONFIG.get("physics_residual_mode", "per_angle_cg"))),
+            "cnn_angle_indices": cnn_angle_indices,
+            "cnn_angle_alpha_values": list(angle_selection["alpha_values"]),
+            "cnn_angle_tau_offsets": list(angle_selection["tau_offsets"]),
+            "cnn_angle_selection": angle_selection,
+            "physics_residual_channel_enabled": physics_residual_enabled,
+            "physics_residual_mode": physics_residual_mode,
             "physics_residual_cg_iters": int(getattr(self.model.optimizer, "physics_residual_cg_iters", TIME_DOMAIN_CONFIG.get("physics_residual_cg_iters", 8)) or 0),
             "physics_residual_damping": float(getattr(self.model.optimizer, "physics_residual_damping", TIME_DOMAIN_CONFIG.get("physics_residual_damping", 1.0e-2))),
             "physics_residual_detach": bool(getattr(self.model.optimizer, "physics_residual_detach", TIME_DOMAIN_CONFIG.get("physics_residual_detach", True))),
@@ -279,7 +352,15 @@ class TheoreticalTrainer:
         self.logger.info(f"Model parameters: {count_parameters(self.model):,}")
         self.logger.info("Objective mode: RES")
         total_start_time = time.time()
-        for self.current_iter in range(N_TRAIN):
+        start_iter = _next_training_start_iter(self.current_iter)
+        self.logger.info(f"Starting iteration: {start_iter}")
+        if start_iter >= N_TRAIN:
+            self.logger.info(
+                "No training iterations to run: checkpoint iter=%d, target N_TRAIN=%d",
+                int(self.current_iter),
+                int(N_TRAIN),
+            )
+        for self.current_iter in range(start_iter, N_TRAIN):
             iter_start_time = time.time()
             coeff_true, _, g_observed, coeff_initial = self._generate_training_batch()
             coeff_true = coeff_true.to(device)
@@ -340,7 +421,6 @@ class TheoreticalTrainer:
                 self.training_history['update_difference'].append(metrics.get('update_difference', 0.0))
             iter_time = time.time() - iter_start_time
             if self.current_iter % TRAINING_CONFIG['validation_interval'] == 0:
-                angle_adapter_diag = self.model.optimizer.get_angle_adapter_diagnostics()
                 val_loss, val_metrics = self._validate()
                 # 记录验证损失
                 self.training_history['val_loss'].append(val_loss)
@@ -368,17 +448,6 @@ class TheoreticalTrainer:
                     f"Data Fidelity Error: {data_err:.6f} | "
                     f"Coeff Change: {upd_diff:.3e}"
                 )
-                if angle_adapter_diag is not None:
-                    self.logger.info(
-                        "  Angle adapter stats | gate(mean/min/max)=%.4f/%.4f/%.4f | "
-                        "mix_row_norm(mean/min/max)=%.4f/%.4f/%.4f",
-                        angle_adapter_diag.get("gate_mean", float("nan")),
-                        angle_adapter_diag.get("gate_min", float("nan")),
-                        angle_adapter_diag.get("gate_max", float("nan")),
-                        angle_adapter_diag.get("mix_row_norm_mean", float("nan")),
-                        angle_adapter_diag.get("mix_row_norm_min", float("nan")),
-                        angle_adapter_diag.get("mix_row_norm_max", float("nan")),
-                    )
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self.patience_counter = 0
@@ -500,8 +569,10 @@ def main():
     if seed is not None:
         print(f"Using GLOBAL_SEED_OVERRIDE={seed}")
     trainer = TheoreticalTrainer()
-    resume_path = None
-    if resume_path and os.path.exists(resume_path):
+    resume_path = _resolve_resume_checkpoint_path()
+    if resume_path:
+        if not os.path.exists(resume_path):
+            raise FileNotFoundError(f"RESUME_CHECKPOINT_OVERRIDE not found: {resume_path}")
         trainer.load_checkpoint(resume_path)
     trainer.train()
     print("Theoretical training completed successfully!")

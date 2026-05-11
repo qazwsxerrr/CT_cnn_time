@@ -148,68 +148,7 @@ class TheoreticalGradientDescent(nn.Module):
 
 
 # ============================================================================
-# 3. Angle feature adapter
-# ============================================================================
-class AdaptiveAngleFeatureAdapter(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int):
-        super().__init__()
-        self.in_channels = int(in_channels)
-        self.hidden_channels = int(hidden_channels)
-        self.out_channels = int(out_channels)
-        if self.in_channels <= 0:
-            raise ValueError(f"in_channels must be positive, got {self.in_channels}.")
-        if self.hidden_channels <= 0:
-            raise ValueError(f"hidden_channels must be positive, got {self.hidden_channels}.")
-        if self.out_channels <= 0:
-            raise ValueError(f"out_channels must be positive, got {self.out_channels}.")
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.gate_reduce = nn.Conv2d(self.in_channels, self.hidden_channels, kernel_size=1, bias=True)
-        self.gate_expand = nn.Conv2d(self.hidden_channels, self.in_channels, kernel_size=1, bias=True)
-        self.mix_conv = nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, bias=True)
-        self.last_gate = None
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.gate_reduce.weight, a=math.sqrt(5))
-        if self.gate_reduce.bias is not None:
-            nn.init.zeros_(self.gate_reduce.bias)
-        nn.init.zeros_(self.gate_expand.weight)
-        if self.gate_expand.bias is not None:
-            nn.init.constant_(self.gate_expand.bias, 2.0)
-        nn.init.kaiming_uniform_(self.mix_conv.weight, a=math.sqrt(5))
-        if self.mix_conv.bias is not None:
-            nn.init.zeros_(self.mix_conv.bias)
-
-    def forward(self, grad_channels: torch.Tensor) -> torch.Tensor:
-        if grad_channels.dim() != 4:
-            raise ValueError(f"AdaptiveAngleFeatureAdapter expects shape (B,C,H,W), got {tuple(grad_channels.shape)}.")
-        if int(grad_channels.shape[1]) != self.in_channels:
-            raise ValueError(f"AdaptiveAngleFeatureAdapter expected {self.in_channels} input channels, got {int(grad_channels.shape[1])}.")
-        pooled = self.pool(torch.abs(grad_channels))
-        gate_logits = self.gate_expand(F.relu(self.gate_reduce(pooled), inplace=False))
-        gate = torch.sigmoid(gate_logits)
-        self.last_gate = gate.detach()
-        return self.mix_conv(grad_channels * gate)
-
-    @torch.no_grad()
-    def diagnostics(self):
-        mix_weight = self.mix_conv.weight.detach().view(self.out_channels, self.in_channels)
-        mix_row_norms = torch.norm(mix_weight, dim=1)
-        diag = {
-            "raw_channels": int(self.in_channels),
-            "mixed_channels": int(self.out_channels),
-            "mix_row_norm_mean": float(mix_row_norms.mean().item()),
-            "mix_row_norm_min": float(mix_row_norms.min().item()),
-            "mix_row_norm_max": float(mix_row_norms.max().item()),
-        }
-        if self.last_gate is not None:
-            gate = self.last_gate.detach().view(-1)
-            diag.update({"gate_mean": float(gate.mean().item()), "gate_min": float(gate.min().item()), "gate_max": float(gate.max().item())})
-        return diag
-
-
-# ============================================================================
-# 4. Learned gradient descent (CNN updates)
+# 3. Learned gradient descent (CNN updates)
 # ============================================================================
 class LearnedGradientDescent(nn.Module):
     def __init__(self, height=IMAGE_SIZE, width=IMAGE_SIZE, regularizer_type="tikhonov", n_iter=10, n_memory=5):
@@ -235,24 +174,7 @@ class LearnedGradientDescent(nn.Module):
         self.learned_num_angles = self.num_angles
         self.cnn_channel_indices = self._resolve_cnn_channel_indices()
         self.raw_cnn_num_angles = len(self.cnn_channel_indices)
-
-        self.angle_adapter_enabled = bool(TIME_DOMAIN_CONFIG.get("cnn_angle_adapter_enabled", False))
-        self.angle_adapter_mode = str(TIME_DOMAIN_CONFIG.get("cnn_angle_adapter_mode", "disabled")).strip().lower()
-        self.angle_adapter_output_channels = int(TIME_DOMAIN_CONFIG.get("cnn_angle_adapter_output_channels", self.raw_cnn_num_angles))
-        self.angle_adapter_hidden_channels = int(TIME_DOMAIN_CONFIG.get("cnn_angle_adapter_hidden_channels", min(self.raw_cnn_num_angles, 8)))
-        if self.angle_adapter_output_channels <= 0:
-            raise ValueError("cnn_angle_adapter_output_channels must be positive.")
-        if self.angle_adapter_hidden_channels <= 0:
-            raise ValueError("cnn_angle_adapter_hidden_channels must be positive.")
-        self.use_angle_adapter = self.angle_adapter_enabled and self.angle_adapter_mode == "adaptive_attention_mix" and self.raw_cnn_num_angles > self.angle_adapter_output_channels
-        self.angle_feature_adapter = None
-        if self.use_angle_adapter:
-            self.angle_feature_adapter = AdaptiveAngleFeatureAdapter(
-                in_channels=self.raw_cnn_num_angles,
-                hidden_channels=self.angle_adapter_hidden_channels,
-                out_channels=self.angle_adapter_output_channels,
-            ).to(device)
-        self.cnn_num_angles = self.angle_adapter_output_channels if self.angle_feature_adapter is not None else self.raw_cnn_num_angles
+        self.cnn_num_angles = self.raw_cnn_num_angles
         self.theoretical_gd = TheoreticalGradientDescent(height, width, regularizer_type, operator=self.learned_operator)
 
         self.physics_residual_enabled = bool(TIME_DOMAIN_CONFIG.get("physics_residual_channel_enabled", False))
@@ -348,8 +270,6 @@ class LearnedGradientDescent(nn.Module):
         if int(data_grad_pa.shape[1]) < int(self.raw_cnn_num_angles):
             raise ValueError(f"Per-angle gradient only has {int(data_grad_pa.shape[1])} channels, but CNN expects at least {int(self.raw_cnn_num_angles)} raw channels.")
         grad_channels = self._select_cnn_angle_channels(data_grad_pa).squeeze(2)
-        if self.angle_feature_adapter is not None:
-            grad_channels = self.angle_feature_adapter(grad_channels)
         parts = [coeff_current, grad_channels]
         if self.physics_residual_enabled:
             if physics_corr is None:
@@ -364,14 +284,6 @@ class LearnedGradientDescent(nn.Module):
             parts.append(physics_corr)
         parts.extend([reg_grad, memory])
         return torch.cat(parts, dim=1)
-
-    @torch.no_grad()
-    def get_angle_adapter_diagnostics(self):
-        if self.angle_feature_adapter is None:
-            return None
-        diag = self.angle_feature_adapter.diagnostics()
-        diag.update({"enabled": True, "mode": str(self.angle_adapter_mode), "hidden_channels": int(self.angle_adapter_hidden_channels)})
-        return diag
 
     def _select_learned_measurements(self, g_observed):
         if g_observed.dim() == 3 and g_observed.shape[1] == 1:
@@ -580,9 +492,9 @@ def initialize_model():
     print(f"Optimization iterations: {n_iter}")
     print(f"Memory units: {n_memory}")
     print(
-        "Physical angles / learned data angles / raw CNN angle channels / mixed CNN angle channels: "
+        "Physical angles / learned data angles / CNN angle channels: "
         f"{model.optimizer.num_angles} / {model.optimizer.learned_num_angles} / "
-        f"{model.optimizer.raw_cnn_num_angles} / {model.optimizer.cnn_num_angles}"
+        f"{model.optimizer.cnn_num_angles}"
     )
     print(
         "Physics residual: enabled=%s mode=%s damping=%.3g cg_iters=%d channels=%d explicit_update=%s alpha=%.4f"
@@ -596,8 +508,6 @@ def initialize_model():
             float(model.optimizer.current_physics_alpha().detach().cpu().item()) if hasattr(model.optimizer, "current_physics_alpha") else 0.0,
         )
     )
-    if model.optimizer.angle_feature_adapter is not None:
-        print(f"Angle adapter: {model.optimizer.angle_adapter_mode} (hidden={model.optimizer.angle_adapter_hidden_channels}, out={model.optimizer.cnn_num_angles})")
     return model
 
 
