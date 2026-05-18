@@ -34,6 +34,18 @@ from image_generator import (
     generate_random_ellipse_phantom,
     generate_shepp_logan_phantom,
 )
+try:
+    from initialization_methods import (
+        INIT_METHOD_CHOICES,
+        SPLIT_ADMM_INIT_METHODS,
+        normalize_init_method,
+    )
+except ImportError:  # pragma: no cover - supports package-style imports.
+    from models.initialization_methods import (
+        INIT_METHOD_CHOICES,
+        SPLIT_ADMM_INIT_METHODS,
+        normalize_init_method,
+    )
 from b_spline.b2b1_spline import (
     phi_support_bounds_b1b1,
     radon_phi_b1b1,
@@ -270,6 +282,44 @@ def _choose_lambda_morozov_from_gram_spectrum(
             )
         )
     return torch.tensor(lam_list, dtype=b.dtype, device=b.device)
+
+
+def _soft_threshold(x: torch.Tensor, threshold: torch.Tensor | float) -> torch.Tensor:
+    if not torch.is_tensor(threshold):
+        threshold = x.new_tensor(float(threshold))
+    return torch.sign(x) * torch.clamp(torch.abs(x) - threshold.to(dtype=x.dtype, device=x.device), min=0.0)
+
+
+def _project_l2_ball(x: torch.Tensor, radius: torch.Tensor | float) -> torch.Tensor:
+    if not torch.is_tensor(radius):
+        radius = x.new_tensor(float(radius))
+    radius = radius.to(dtype=x.dtype, device=x.device).view(-1).clamp_min(0.0)
+    flat = x.reshape(x.shape[0], -1)
+    norm = torch.norm(flat, dim=1).clamp_min(1.0e-12)
+    scale = torch.minimum(torch.ones_like(norm), radius / norm)
+    return (flat * scale.view(-1, 1)).view_as(x)
+
+
+def _project_l1_ball(x: torch.Tensor, radius: torch.Tensor | float) -> torch.Tensor:
+    if not torch.is_tensor(radius):
+        radius = x.new_tensor(float(radius))
+    radius = radius.to(dtype=x.dtype, device=x.device).view(-1).clamp_min(0.0)
+    flat = x.reshape(x.shape[0], -1)
+    abs_flat = torch.abs(flat)
+    l1_norm = torch.sum(abs_flat, dim=1)
+    inside = l1_norm <= radius
+    if bool(torch.all(inside)):
+        return x
+    sorted_abs, _ = torch.sort(abs_flat, dim=1, descending=True)
+    cssv = torch.cumsum(sorted_abs, dim=1)
+    arange = torch.arange(1, flat.shape[1] + 1, dtype=x.dtype, device=x.device).view(1, -1)
+    cond = sorted_abs * arange > (cssv - radius.view(-1, 1))
+    rho = torch.sum(cond.to(dtype=torch.int64), dim=1).clamp_min(1)
+    theta = (cssv.gather(1, (rho - 1).view(-1, 1)).squeeze(1) - radius) / rho.to(dtype=x.dtype)
+    projected = torch.sign(flat) * torch.clamp(abs_flat - theta.view(-1, 1), min=0.0)
+    projected = torch.where(inside.view(-1, 1), flat, projected)
+    projected = torch.where((radius <= 0.0).view(-1, 1), torch.zeros_like(projected), projected)
+    return projected.view_as(x)
 
 
 def _sparse_blocks_apply_batched(rows: torch.Tensor, cols: torch.Tensor, values: torch.Tensor, nnz: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -606,6 +656,50 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
     def apply_normal(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.adjoint(self.forward(coeff_matrix))
 
+    def tv_gradient(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        """Forward finite-difference gradient used by anisotropic TV.
+
+        The boundary condition is Neumann-like: the last column/row forward
+        differences are fixed to zero, so the returned tensor has shape
+        ``(B,2,H,W)`` without wrapping around the image.
+        """
+        if coeff_matrix.dim() == 3:
+            coeff_matrix = coeff_matrix.unsqueeze(1)
+        if coeff_matrix.dim() != 4:
+            raise ValueError(f"coeff_matrix must have shape (B,1,H,W), got {tuple(coeff_matrix.shape)}")
+        x = coeff_matrix.to(dtype=torch.float32, device=self.sampling_points.device)
+        if int(x.shape[1]) != 1 or int(x.shape[2]) != int(self.height) or int(x.shape[3]) != int(self.width):
+            raise ValueError(f"Expected coeff_matrix shape (B,1,{self.height},{self.width}), got {tuple(x.shape)}")
+        grad = torch.zeros((int(x.shape[0]), 2, self.height, self.width), dtype=x.dtype, device=x.device)
+        grad[:, 0, :, :-1] = x[:, 0, :, 1:] - x[:, 0, :, :-1]
+        grad[:, 1, :-1, :] = x[:, 0, 1:, :] - x[:, 0, :-1, :]
+        return grad
+
+    def tv_divergence_adjoint(self, gradient: torch.Tensor) -> torch.Tensor:
+        """Adjoint of :meth:`tv_gradient` under the Euclidean inner product."""
+        if gradient.dim() != 4:
+            raise ValueError(f"gradient must have shape (B,2,H,W), got {tuple(gradient.shape)}")
+        if int(gradient.shape[1]) != 2 or int(gradient.shape[2]) != int(self.height) or int(gradient.shape[3]) != int(self.width):
+            raise ValueError(f"Expected gradient shape (B,2,{self.height},{self.width}), got {tuple(gradient.shape)}")
+        p = gradient.to(dtype=torch.float32, device=self.sampling_points.device)
+        out = torch.zeros((int(p.shape[0]), 1, self.height, self.width), dtype=p.dtype, device=p.device)
+        px = p[:, 0]
+        py = p[:, 1]
+        out[:, 0, :, :-1] -= px[:, :, :-1]
+        out[:, 0, :, 1:] += px[:, :, :-1]
+        out[:, 0, :-1, :] -= py[:, :-1, :]
+        out[:, 0, 1:, :] += py[:, :-1, :]
+        return out
+
+    def apply_tv_normal(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        """Apply ``D^T D`` for the finite-difference TV split operator ``D``."""
+        return self.tv_divergence_adjoint(self.tv_gradient(coeff_matrix))
+
+    def anisotropic_tv_norm(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        """Return per-sample anisotropic TV, ``sum(|D_x x| + |D_y x|)``."""
+        grad = self.tv_gradient(coeff_matrix)
+        return torch.sum(torch.abs(grad).reshape(grad.shape[0], -1), dim=1)
+
     def apply_normal_per_angle(self, coeff_per_angle: torch.Tensor) -> torch.Tensor:
         """Apply each single-angle normal matrix independently.
 
@@ -772,6 +866,424 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             correction_pa = correction_pa / norm.view(correction_pa.shape[0], correction_pa.shape[1], 1, 1, 1)
         return correction_pa
 
+    def _normalize_lambda_reg(self, lambda_reg: float | torch.Tensor, batch_size: int, target_device: torch.device) -> torch.Tensor:
+        if torch.is_tensor(lambda_reg):
+            lam = lambda_reg.detach().to(dtype=torch.float32, device=target_device).view(-1)
+            if int(lam.numel()) == 1 and int(batch_size) > 1:
+                lam = lam.expand(int(batch_size))
+            elif int(lam.numel()) != int(batch_size):
+                raise ValueError(f"lambda_reg has {int(lam.numel())} entries, expected 1 or batch={int(batch_size)}.")
+        else:
+            lam = torch.full((int(batch_size),), float(lambda_reg), dtype=torch.float32, device=target_device)
+        return lam.clamp_min(0.0)
+
+    def _admm_options(
+        self,
+        *,
+        max_iter: Optional[int] = None,
+        cg_iters: Optional[int] = None,
+        cg_tol: Optional[float] = None,
+        rho_data: Optional[float] = None,
+        rho_reg: Optional[float] = None,
+    ) -> dict[str, float | int]:
+        return {
+            "max_iter": max(0, int(DATA_CONFIG.get("l1_init_admm_iters", 80) if max_iter is None else max_iter)),
+            "cg_iters": max(1, int(DATA_CONFIG.get("l1_init_admm_cg_iters", 30) if cg_iters is None else cg_iters)),
+            "cg_tol": float(DATA_CONFIG.get("l1_init_admm_cg_tol", 1.0e-4) if cg_tol is None else cg_tol),
+            "rho_data": max(float(DATA_CONFIG.get("l1_init_admm_rho_data", 1.0) if rho_data is None else rho_data), 1.0e-12),
+            "rho_reg": max(float(DATA_CONFIG.get("l1_init_admm_rho_reg", 1.0) if rho_reg is None else rho_reg), 1.0e-12),
+        }
+
+    @torch.no_grad()
+    def _solve_weighted_normal_cg(
+        self,
+        rhs: torch.Tensor,
+        *,
+        normal_weight: float,
+        ridge_weight: float,
+        tv_weight: float = 0.0,
+        max_iter: int,
+        tol: float,
+        x0: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if rhs.dim() == 3:
+            rhs = rhs.unsqueeze(1)
+        if rhs.dim() != 4:
+            raise ValueError(f"rhs must have shape (B,1,H,W), got {tuple(rhs.shape)}")
+        rhs = rhs.to(dtype=torch.float32, device=self.sampling_points.device)
+        x = torch.zeros_like(rhs) if x0 is None else x0.to(dtype=torch.float32, device=rhs.device).clone()
+        normal_weight = float(normal_weight)
+        ridge_weight = float(ridge_weight)
+        tv_weight = float(tv_weight)
+
+        def matvec(z: torch.Tensor) -> torch.Tensor:
+            out = normal_weight * self.apply_normal(z) + ridge_weight * z
+            if tv_weight != 0.0:
+                out = out + tv_weight * self.apply_tv_normal(z)
+            return out
+
+        r = rhs - matvec(x)
+        p = r.clone()
+        rr = torch.sum(r * r, dim=(1, 2, 3), keepdim=True)
+        eps = rhs.new_tensor(1.0e-12)
+        for _ in range(int(max_iter)):
+            Ap = matvec(p)
+            denom = torch.sum(p * Ap, dim=(1, 2, 3), keepdim=True).clamp_min(eps)
+            alpha = rr / denom
+            x = x + alpha * p
+            r = r - alpha * Ap
+            rr_new = torch.sum(r * r, dim=(1, 2, 3), keepdim=True)
+            if torch.sqrt(rr_new.max()).item() < float(tol):
+                break
+            p = r + (rr_new / rr.clamp_min(eps)) * p
+            rr = rr_new
+        return x
+
+    def _record_admm_stats(self, *, method: str, iterations: int, coeff: torch.Tensor, b: torch.Tensor, lambda_reg: torch.Tensor) -> None:
+        residual = self(coeff) - b
+        self.last_split_admm_stats = {
+            "method": str(method),
+            "iterations": int(iterations),
+            "lambda_reg": [float(v) for v in lambda_reg.detach().cpu().view(-1).tolist()],
+            "measurement_l2": [float(v) for v in torch.norm(residual.detach(), dim=-1).cpu().view(-1).tolist()],
+            "measurement_l1": [float(v) for v in torch.sum(torch.abs(residual.detach()), dim=-1).cpu().view(-1).tolist()],
+            "coeff_l1": [float(v) for v in torch.sum(torch.abs(coeff.detach()).reshape(coeff.shape[0], -1), dim=1).cpu().view(-1).tolist()],
+            "coeff_tv": [float(v) for v in self.anisotropic_tv_norm(coeff.detach()).detach().cpu().view(-1).tolist()],
+        }
+
+    @torch.no_grad()
+    def l2_l1_zero_threshold(self, b: torch.Tensor) -> torch.Tensor:
+        """Return smallest lambda for which x=0 solves 0.5||Ax-b||_2^2 + lambda||x||_1."""
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        adj = self.adjoint(b).reshape(b.shape[0], -1)
+        return torch.amax(torch.abs(adj), dim=1).clamp_min(0.0)
+
+    @torch.no_grad()
+    def l1_l1_zero_threshold(self, b: torch.Tensor) -> torch.Tensor:
+        """Return a zero-solution lambda threshold for ||Ax-b||_1 + lambda||x||_1."""
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        adj = self.adjoint(torch.sign(b)).reshape(b.shape[0], -1)
+        return torch.amax(torch.abs(adj), dim=1).clamp_min(0.0)
+
+    def _record_constrained_admm_stats(self, *, method: str, iterations: int, coeff: torch.Tensor, b: torch.Tensor, noise_radius: torch.Tensor, residual_norm: str) -> None:
+        residual = self(coeff) - b
+        self.last_split_admm_stats = {
+            "method": str(method),
+            "iterations": int(iterations),
+            "constraint_radius": [float(v) for v in noise_radius.detach().cpu().view(-1).tolist()],
+            "residual_norm": str(residual_norm),
+            "measurement_l2": [float(v) for v in torch.norm(residual.detach(), dim=-1).cpu().view(-1).tolist()],
+            "measurement_l1": [float(v) for v in torch.sum(torch.abs(residual.detach()), dim=-1).cpu().view(-1).tolist()],
+            "coeff_l1": [float(v) for v in torch.sum(torch.abs(coeff.detach()).reshape(coeff.shape[0], -1), dim=1).cpu().view(-1).tolist()],
+            "coeff_tv": [float(v) for v in self.anisotropic_tv_norm(coeff.detach()).detach().cpu().view(-1).tolist()],
+        }
+
+    @torch.no_grad()
+    def solve_l2_l1_admm(
+        self,
+        b: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        *,
+        max_iter: Optional[int] = None,
+        cg_iters: Optional[int] = None,
+        cg_tol: Optional[float] = None,
+        rho_reg: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Solve ``0.5 * ||A x - b||_2^2 + lambda * ||x||_1`` by ADMM."""
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        opts = self._admm_options(max_iter=max_iter, cg_iters=cg_iters, cg_tol=cg_tol, rho_reg=rho_reg)
+        batch = int(b.shape[0])
+        lam = self._normalize_lambda_reg(lambda_reg, batch_size=batch, target_device=b.device)
+        zero_threshold = self.l2_l1_zero_threshold(b)
+        zero_active = lam >= zero_threshold * (1.0 - 1.0e-6)
+        if bool(torch.all(zero_active)):
+            x_zero = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+            self._record_admm_stats(method="l2_l1_admm", iterations=0, coeff=x_zero, b=b, lambda_reg=lam)
+            return x_zero
+        rho = float(opts["rho_reg"])
+        rhs_data = self.adjoint(b)
+        x = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+        z = torch.zeros_like(x)
+        u = torch.zeros_like(x)
+        threshold = (lam / rho).view(batch, 1, 1, 1)
+        for _ in range(int(opts["max_iter"])):
+            rhs = rhs_data + rho * (z - u)
+            x = self._solve_weighted_normal_cg(
+                rhs,
+                normal_weight=1.0,
+                ridge_weight=rho,
+                max_iter=int(opts["cg_iters"]),
+                tol=float(opts["cg_tol"]),
+                x0=x,
+            )
+            z = _soft_threshold(x + u, threshold)
+            u = u + x - z
+        if bool(torch.any(zero_active)):
+            x = x.clone()
+            x[zero_active.view(-1, 1, 1, 1).expand_as(x)] = 0.0
+        self._record_admm_stats(method="l2_l1_admm", iterations=int(opts["max_iter"]), coeff=x, b=b, lambda_reg=lam)
+        return x
+
+    @torch.no_grad()
+    def solve_l2_tv_admm(
+        self,
+        b: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        *,
+        max_iter: Optional[int] = None,
+        cg_iters: Optional[int] = None,
+        cg_tol: Optional[float] = None,
+        rho_reg: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Solve ``0.5 * ||A x - b||_2^2 + lambda * TV(x)`` by split ADMM."""
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        opts = self._admm_options(max_iter=max_iter, cg_iters=cg_iters, cg_tol=cg_tol, rho_reg=rho_reg)
+        batch = int(b.shape[0])
+        lam = self._normalize_lambda_reg(lambda_reg, batch_size=batch, target_device=b.device)
+        rho = float(opts["rho_reg"])
+        rhs_data = self.adjoint(b)
+        x = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+        z = torch.zeros((batch, 2, self.height, self.width), dtype=torch.float32, device=b.device)
+        u = torch.zeros_like(z)
+        threshold = (lam / rho).view(batch, 1, 1, 1)
+        for _ in range(int(opts["max_iter"])):
+            rhs = rhs_data + rho * self.tv_divergence_adjoint(z - u)
+            x = self._solve_weighted_normal_cg(
+                rhs,
+                normal_weight=1.0,
+                ridge_weight=0.0,
+                tv_weight=rho,
+                max_iter=int(opts["cg_iters"]),
+                tol=float(opts["cg_tol"]),
+                x0=x,
+            )
+            grad = self.tv_gradient(x)
+            z = _soft_threshold(grad + u, threshold)
+            u = u + grad - z
+        self._record_admm_stats(method="l2_tv_admm", iterations=int(opts["max_iter"]), coeff=x, b=b, lambda_reg=lam)
+        return x
+
+    @torch.no_grad()
+    def solve_l1_l1_admm(
+        self,
+        b: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        *,
+        max_iter: Optional[int] = None,
+        cg_iters: Optional[int] = None,
+        cg_tol: Optional[float] = None,
+        rho_data: Optional[float] = None,
+        rho_reg: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Solve ``||A x - b||_1 + lambda * ||x||_1`` by split ADMM."""
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        opts = self._admm_options(max_iter=max_iter, cg_iters=cg_iters, cg_tol=cg_tol, rho_data=rho_data, rho_reg=rho_reg)
+        batch = int(b.shape[0])
+        lam = self._normalize_lambda_reg(lambda_reg, batch_size=batch, target_device=b.device)
+        zero_threshold = self.l1_l1_zero_threshold(b)
+        zero_active = lam >= zero_threshold * (1.0 - 1.0e-6)
+        if bool(torch.all(zero_active)):
+            x_zero = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+            self._record_admm_stats(method="l1_l1_admm", iterations=0, coeff=x_zero, b=b, lambda_reg=lam)
+            return x_zero
+        rho_d = float(opts["rho_data"])
+        rho_r = float(opts["rho_reg"])
+        x = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+        r = torch.zeros_like(b)
+        u_data = torch.zeros_like(b)
+        z = torch.zeros_like(x)
+        u_reg = torch.zeros_like(x)
+        threshold_data = 1.0 / rho_d
+        threshold_reg = (lam / rho_r).view(batch, 1, 1, 1)
+        for _ in range(int(opts["max_iter"])):
+            rhs = rho_d * self.adjoint(b + r - u_data) + rho_r * (z - u_reg)
+            x = self._solve_weighted_normal_cg(
+                rhs,
+                normal_weight=rho_d,
+                ridge_weight=rho_r,
+                max_iter=int(opts["cg_iters"]),
+                tol=float(opts["cg_tol"]),
+                x0=x,
+            )
+            residual = self(x) - b
+            r = _soft_threshold(residual + u_data, threshold_data)
+            z = _soft_threshold(x + u_reg, threshold_reg)
+            u_data = u_data + residual - r
+            u_reg = u_reg + x - z
+        if bool(torch.any(zero_active)):
+            x = x.clone()
+            x[zero_active.view(-1, 1, 1, 1).expand_as(x)] = 0.0
+        self._record_admm_stats(method="l1_l1_admm", iterations=int(opts["max_iter"]), coeff=x, b=b, lambda_reg=lam)
+        return x
+
+    @torch.no_grad()
+    def solve_l2_l1_morozov_admm(
+        self,
+        b: torch.Tensor,
+        noise_radius: float | torch.Tensor,
+        *,
+        max_iter: Optional[int] = None,
+        cg_iters: Optional[int] = None,
+        cg_tol: Optional[float] = None,
+        rho_data: Optional[float] = None,
+        rho_reg: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Solve ``min ||x||_1`` subject to ``||A x - b||_2 <= noise_radius``."""
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        opts = self._admm_options(max_iter=max_iter, cg_iters=cg_iters, cg_tol=cg_tol, rho_data=rho_data, rho_reg=rho_reg)
+        batch = int(b.shape[0])
+        radius = self._normalize_lambda_reg(noise_radius, batch_size=batch, target_device=b.device)
+        rho_d = float(opts["rho_data"])
+        rho_r = float(opts["rho_reg"])
+        x = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+        r = _project_l2_ball(-b, radius)
+        u_data = torch.zeros_like(b)
+        z = torch.zeros_like(x)
+        u_reg = torch.zeros_like(x)
+        threshold_reg = 1.0 / rho_r
+        for _ in range(int(opts["max_iter"])):
+            rhs = rho_d * self.adjoint(b + r - u_data) + rho_r * (z - u_reg)
+            x = self._solve_weighted_normal_cg(
+                rhs,
+                normal_weight=rho_d,
+                ridge_weight=rho_r,
+                max_iter=int(opts["cg_iters"]),
+                tol=float(opts["cg_tol"]),
+                x0=x,
+            )
+            residual = self(x) - b
+            r = _project_l2_ball(residual + u_data, radius)
+            z = _soft_threshold(x + u_reg, threshold_reg)
+            u_data = u_data + residual - r
+            u_reg = u_reg + x - z
+        self._record_constrained_admm_stats(
+            method="l2_l1_morozov_admm",
+            iterations=int(opts["max_iter"]),
+            coeff=x,
+            b=b,
+            noise_radius=radius,
+            residual_norm="l2",
+        )
+        return x
+
+    @torch.no_grad()
+    def solve_l1_l1_morozov_admm(
+        self,
+        b: torch.Tensor,
+        noise_radius: float | torch.Tensor,
+        *,
+        max_iter: Optional[int] = None,
+        cg_iters: Optional[int] = None,
+        cg_tol: Optional[float] = None,
+        rho_data: Optional[float] = None,
+        rho_reg: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Solve ``min ||x||_1`` subject to ``||A x - b||_1 <= noise_radius``."""
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        opts = self._admm_options(max_iter=max_iter, cg_iters=cg_iters, cg_tol=cg_tol, rho_data=rho_data, rho_reg=rho_reg)
+        batch = int(b.shape[0])
+        radius = self._normalize_lambda_reg(noise_radius, batch_size=batch, target_device=b.device)
+        rho_d = float(opts["rho_data"])
+        rho_r = float(opts["rho_reg"])
+        x = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+        r = _project_l1_ball(-b, radius)
+        u_data = torch.zeros_like(b)
+        z = torch.zeros_like(x)
+        u_reg = torch.zeros_like(x)
+        threshold_reg = 1.0 / rho_r
+        for _ in range(int(opts["max_iter"])):
+            rhs = rho_d * self.adjoint(b + r - u_data) + rho_r * (z - u_reg)
+            x = self._solve_weighted_normal_cg(
+                rhs,
+                normal_weight=rho_d,
+                ridge_weight=rho_r,
+                max_iter=int(opts["cg_iters"]),
+                tol=float(opts["cg_tol"]),
+                x0=x,
+            )
+            residual = self(x) - b
+            r = _project_l1_ball(residual + u_data, radius)
+            z = _soft_threshold(x + u_reg, threshold_reg)
+            u_data = u_data + residual - r
+            u_reg = u_reg + x - z
+        self._record_constrained_admm_stats(
+            method="l1_l1_morozov_admm",
+            iterations=int(opts["max_iter"]),
+            coeff=x,
+            b=b,
+            noise_radius=radius,
+            residual_norm="l1",
+        )
+        return x
+
+    @torch.no_grad()
+    def solve_l2_tv_morozov_admm(
+        self,
+        b: torch.Tensor,
+        noise_radius: float | torch.Tensor,
+        *,
+        max_iter: Optional[int] = None,
+        cg_iters: Optional[int] = None,
+        cg_tol: Optional[float] = None,
+        rho_data: Optional[float] = None,
+        rho_reg: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Solve ``min TV(x)`` subject to ``||A x - b||_2 <= noise_radius``."""
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        opts = self._admm_options(max_iter=max_iter, cg_iters=cg_iters, cg_tol=cg_tol, rho_data=rho_data, rho_reg=rho_reg)
+        batch = int(b.shape[0])
+        radius = self._normalize_lambda_reg(noise_radius, batch_size=batch, target_device=b.device)
+        rho_d = float(opts["rho_data"])
+        rho_r = float(opts["rho_reg"])
+        x = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+        r = _project_l2_ball(-b, radius)
+        u_data = torch.zeros_like(b)
+        z = torch.zeros((batch, 2, self.height, self.width), dtype=torch.float32, device=b.device)
+        u_reg = torch.zeros_like(z)
+        threshold_reg = 1.0 / rho_r
+        for _ in range(int(opts["max_iter"])):
+            rhs = rho_d * self.adjoint(b + r - u_data) + rho_r * self.tv_divergence_adjoint(z - u_reg)
+            x = self._solve_weighted_normal_cg(
+                rhs,
+                normal_weight=rho_d,
+                ridge_weight=0.0,
+                tv_weight=rho_r,
+                max_iter=int(opts["cg_iters"]),
+                tol=float(opts["cg_tol"]),
+                x0=x,
+            )
+            residual = self(x) - b
+            r = _project_l2_ball(residual + u_data, radius)
+            grad = self.tv_gradient(x)
+            z = _soft_threshold(grad + u_reg, threshold_reg)
+            u_data = u_data + residual - r
+            u_reg = u_reg + grad - z
+        self._record_constrained_admm_stats(
+            method="l2_tv_morozov_admm",
+            iterations=int(opts["max_iter"]),
+            coeff=x,
+            b=b,
+            noise_radius=radius,
+            residual_norm="l2",
+        )
+        return x
+
     @torch.no_grad()
     def solve_tikhonov_direct(self, b: torch.Tensor, lambda_reg: float | torch.Tensor) -> torch.Tensor:
         self.last_split_admm_stats = None
@@ -876,6 +1388,7 @@ class TheoreticalDataGenerator:
         self.feature_time_operator = None
         self.M = int(getattr(self.time_operator, "M", int(TIME_DOMAIN_CONFIG.get("num_detector_samples", self.N))))
         self.last_lambda: Optional[float | torch.Tensor] = None
+        self.last_lambda_info: Optional[dict[str, object]] = None
         self._chol_lambda: Optional[float] = None
         self._chol_factor: Optional[torch.Tensor] = None
         self._ata_factor: Optional[torch.Tensor] = None
@@ -894,6 +1407,10 @@ class TheoreticalDataGenerator:
             lam = torch.full((batch_size,), float(lambda_reg), dtype=dtype, device=target_device)
         return lam
 
+    def _l1_init_lambda_to_solver_scale(self, lambda_reg: float | torch.Tensor, batch_size: int, *, measurement_count: int, target_device: torch.device) -> torch.Tensor:
+        lam = self._normalize_lambda_reg(lambda_reg, batch_size=batch_size, dtype=torch.float32, target_device=target_device)
+        return lam * float(max(int(measurement_count), 1))
+
     def forward_operator(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.time_operator.forward(coeff_matrix)
 
@@ -906,6 +1423,130 @@ class TheoreticalDataGenerator:
     @torch.no_grad()
     def solve_tikhonov_direct_init(self, g_obs: torch.Tensor, lambda_reg: float | torch.Tensor) -> torch.Tensor:
         return self._tikhonov_direct_init(g_obs, lambda_reg=lambda_reg)
+
+    @torch.no_grad()
+    def solve_regularized_init(
+        self,
+        g_obs: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        *,
+        init_method: Optional[str] = None,
+    ) -> torch.Tensor:
+        method = normalize_init_method(str(init_method or TIME_DOMAIN_CONFIG.get("init_method", "cg")))
+        if method == "tikhonov_direct":
+            return self._tikhonov_direct_init(g_obs, lambda_reg=lambda_reg)
+        if method == "cg":
+            init_cg_iters = int(TIME_DOMAIN_CONFIG.get("init_cg_iters", 0))
+            if init_cg_iters <= 0:
+                raise ValueError("init_method='cg' requires TIME_DOMAIN_CONFIG['init_cg_iters'] > 0.")
+            return self._tikhonov_cg_init(g_obs, lambda_reg=lambda_reg, max_iter=init_cg_iters)
+        if method == "l2_l1_admm":
+            if not hasattr(self.time_operator, "solve_l2_l1_admm"):
+                raise ValueError("Active operator does not expose solve_l2_l1_admm().")
+            if g_obs.dim() == 1:
+                g_obs = g_obs.unsqueeze(0)
+            g_obs = g_obs.to(device=device, dtype=torch.float32)
+            lam_solver = self._l1_init_lambda_to_solver_scale(
+                lambda_reg,
+                batch_size=int(g_obs.shape[0]),
+                measurement_count=int(g_obs.shape[-1]),
+                target_device=g_obs.device,
+            )
+            return self.time_operator.solve_l2_l1_admm(g_obs, lambda_reg=lam_solver)
+        if method == "l1_l1_admm":
+            if not hasattr(self.time_operator, "solve_l1_l1_admm"):
+                raise ValueError("Active operator does not expose solve_l1_l1_admm().")
+            if g_obs.dim() == 1:
+                g_obs = g_obs.unsqueeze(0)
+            g_obs = g_obs.to(device=device, dtype=torch.float32)
+            lam_solver = self._l1_init_lambda_to_solver_scale(
+                lambda_reg,
+                batch_size=int(g_obs.shape[0]),
+                measurement_count=int(g_obs.shape[-1]),
+                target_device=g_obs.device,
+            )
+            return self.time_operator.solve_l1_l1_admm(g_obs, lambda_reg=lam_solver)
+        if method == "l2_tv_admm":
+            if not hasattr(self.time_operator, "solve_l2_tv_admm"):
+                raise ValueError("Active operator does not expose solve_l2_tv_admm().")
+            if g_obs.dim() == 1:
+                g_obs = g_obs.unsqueeze(0)
+            g_obs = g_obs.to(device=device, dtype=torch.float32)
+            lam_solver = self._l1_init_lambda_to_solver_scale(
+                lambda_reg,
+                batch_size=int(g_obs.shape[0]),
+                measurement_count=int(g_obs.shape[-1]),
+                target_device=g_obs.device,
+            )
+            return self.time_operator.solve_l2_tv_admm(g_obs, lambda_reg=lam_solver)
+        raise ValueError(
+            f"Unsupported init_method={method!r}; expected one of {list(INIT_METHOD_CHOICES)!r}."
+        )
+
+    @torch.no_grad()
+    def solve_constrained_init(
+        self,
+        g_obs: torch.Tensor,
+        noise_radius: float | torch.Tensor,
+        *,
+        init_method: Optional[str] = None,
+    ) -> torch.Tensor:
+        method = normalize_init_method(str(init_method or TIME_DOMAIN_CONFIG.get("init_method", "cg")))
+        if g_obs.dim() == 1:
+            g_obs = g_obs.unsqueeze(0)
+        g_obs = g_obs.to(device=device, dtype=torch.float32)
+        radius = self._normalize_lambda_reg(noise_radius, batch_size=int(g_obs.shape[0]), dtype=torch.float32, target_device=g_obs.device)
+        if method == "l2_l1_admm":
+            if not hasattr(self.time_operator, "solve_l2_l1_morozov_admm"):
+                raise ValueError("Active operator does not expose solve_l2_l1_morozov_admm().")
+            return self.time_operator.solve_l2_l1_morozov_admm(g_obs, noise_radius=radius)
+        if method == "l1_l1_admm":
+            if not hasattr(self.time_operator, "solve_l1_l1_morozov_admm"):
+                raise ValueError("Active operator does not expose solve_l1_l1_morozov_admm().")
+            return self.time_operator.solve_l1_l1_morozov_admm(g_obs, noise_radius=radius)
+        if method == "l2_tv_admm":
+            if not hasattr(self.time_operator, "solve_l2_tv_morozov_admm"):
+                raise ValueError("Active operator does not expose solve_l2_tv_morozov_admm().")
+            return self.time_operator.solve_l2_tv_morozov_admm(g_obs, noise_radius=radius)
+        raise ValueError(f"Constrained Morozov initialization is only supported for 'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}.")
+
+    @torch.no_grad()
+    def solve_morozov_constrained_init(
+        self,
+        g_obs: torch.Tensor,
+        g_clean: torch.Tensor,
+        *,
+        init_method: Optional[str] = None,
+    ) -> torch.Tensor:
+        method = normalize_init_method(str(init_method or TIME_DOMAIN_CONFIG.get("init_method", "cg")))
+        if method == "l2_l1_admm":
+            norm_type = "l2"
+        elif method == "l1_l1_admm":
+            norm_type = "l1"
+        elif method == "l2_tv_admm":
+            norm_type = "l2"
+        else:
+            raise ValueError(f"Constrained Morozov initialization is only supported for 'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}.")
+        radius = self._morozov_noise_radius(g_obs, g_clean, norm_type=norm_type)
+        info = {
+            "mode": "morozov_constrained_radius",
+            "method": method,
+            "residual_norm": norm_type,
+            "target_norm": [float(v) for v in radius.detach().cpu().view(-1).tolist()],
+            "constraint_radius": [float(v) for v in radius.detach().cpu().view(-1).tolist()],
+        }
+        coeff = self.solve_constrained_init(g_obs, noise_radius=radius, init_method=method)
+        stats = dict(getattr(self.time_operator, "last_split_admm_stats", None) or {})
+        info.update(
+            {
+                "mode": "morozov_constrained",
+                "constraint_radius": [float(v) for v in radius.detach().cpu().view(-1).tolist()] if torch.is_tensor(radius) else [float(radius)],
+                "solver_stats": stats,
+            }
+        )
+        self.last_lambda = radius
+        self.last_lambda_info = info
+        return coeff
 
     @torch.no_grad()
     def _tikhonov_direct_init(self, g_obs: torch.Tensor, lambda_reg: float | torch.Tensor) -> torch.Tensor:
@@ -958,15 +1599,204 @@ class TheoreticalDataGenerator:
             return g_clean + (torch.randn_like(g_clean) * sigma)
         raise ValueError(f"Unsupported noise_mode={self.noise_mode!r}; expected 'additive', 'multiplicative', or 'snr'.")
 
-    def _select_lambda(self, g_observed: torch.Tensor, g_clean: torch.Tensor, lambda_reg: float | torch.Tensor = None) -> float | torch.Tensor:
+    @torch.no_grad()
+    def _measurement_residual_norm(self, coeff: torch.Tensor, observed: torch.Tensor, *, norm_type: str) -> torch.Tensor:
+        residual = self.forward_operator(coeff) - observed.to(dtype=torch.float32, device=coeff.device)
+        norm_type = str(norm_type).strip().lower()
+        if norm_type == "l1":
+            return torch.sum(torch.abs(residual), dim=-1)
+        if norm_type == "l2":
+            return torch.norm(residual, dim=-1)
+        raise ValueError(f"Unsupported residual norm_type={norm_type!r}; expected 'l1' or 'l2'.")
+
+    @torch.no_grad()
+    def _morozov_noise_radius(self, g_observed: torch.Tensor, g_clean: torch.Tensor, *, norm_type: str) -> torch.Tensor:
+        if g_observed.dim() == 1:
+            g_observed = g_observed.unsqueeze(0)
+        if g_clean.dim() == 1:
+            g_clean = g_clean.unsqueeze(0)
+        g_observed = g_observed.to(device=device, dtype=torch.float32)
+        g_clean = g_clean.to(device=g_observed.device, dtype=torch.float32)
+        noise = g_observed - g_clean
+        norm_type = str(norm_type).strip().lower()
+        if norm_type == "l1":
+            radius = torch.sum(torch.abs(noise), dim=-1)
+        elif norm_type == "l2":
+            radius = torch.norm(noise, dim=-1)
+        else:
+            raise ValueError(f"Unsupported norm_type={norm_type!r}; expected 'l1' or 'l2'.")
+        return radius * float(DATA_CONFIG.get("morozov_tau", 1.0))
+
+    @torch.no_grad()
+    def _choose_lambda_morozov_iterative(
+        self,
+        g_observed: torch.Tensor,
+        g_clean: torch.Tensor,
+        *,
+        init_method: str,
+        residual_norm: str,
+    ) -> torch.Tensor:
+        if g_observed.dim() == 1:
+            g_observed = g_observed.unsqueeze(0)
+        if g_clean.dim() == 1:
+            g_clean = g_clean.unsqueeze(0)
+        g_observed = g_observed.to(device=device, dtype=torch.float32)
+        g_clean = g_clean.to(device=g_observed.device, dtype=torch.float32)
+        batch = int(g_observed.shape[0])
+        residual_norm = str(residual_norm).strip().lower()
+        noise = g_observed - g_clean
+        if residual_norm == "l1":
+            target = torch.sum(torch.abs(noise), dim=-1) * float(DATA_CONFIG.get("morozov_tau", 1.0))
+        elif residual_norm == "l2":
+            target = torch.norm(noise, dim=-1) * float(DATA_CONFIG.get("morozov_tau", 1.0))
+        else:
+            raise ValueError(f"Unsupported residual_norm={residual_norm!r}; expected 'l1' or 'l2'.")
+
+        lam_min = max(float(DATA_CONFIG.get("morozov_lambda_min", 1.0e-12)), 1.0e-30)
+        configured_lam_max = max(float(DATA_CONFIG.get("morozov_lambda_max", 1.0e12)), lam_min * 10.0)
+        max_iter = max(0, int(DATA_CONFIG.get("morozov_max_iter", 8)))
+        lambda_max_source = "configured"
+        lambda_scale = "raw"
+        measurement_count = int(g_observed.shape[-1])
+        natural_lam_max: Optional[torch.Tensor] = None
+        natural_lam_max_is_exact_zero_threshold = False
+        if init_method == "l2_l1_admm" and hasattr(self.time_operator, "l2_l1_zero_threshold"):
+            natural_lam_max = self.time_operator.l2_l1_zero_threshold(g_observed).to(dtype=torch.float32, device=g_observed.device) / float(max(measurement_count, 1))
+            lambda_max_source = "zero_solution_threshold"
+            lambda_scale = "normalized_by_measurements"
+            natural_lam_max_is_exact_zero_threshold = True
+        elif init_method == "l1_l1_admm" and hasattr(self.time_operator, "l1_l1_zero_threshold"):
+            natural_lam_max = self.time_operator.l1_l1_zero_threshold(g_observed).to(dtype=torch.float32, device=g_observed.device) / float(max(measurement_count, 1))
+            lambda_max_source = "zero_solution_threshold"
+            lambda_scale = "normalized_by_measurements"
+            natural_lam_max_is_exact_zero_threshold = True
+        elif init_method == "l2_tv_admm" and hasattr(self.time_operator, "l2_l1_zero_threshold"):
+            # TV has a constant-image nullspace, so the exact zero-solution
+            # threshold used by pixel L1 does not apply.  Use the L2/L1
+            # threshold only as a finite, data-scaled upper-bound proxy so
+            # Morozov does not start from the global 1e12 configuration.
+            natural_lam_max = self.time_operator.l2_l1_zero_threshold(g_observed).to(dtype=torch.float32, device=g_observed.device) / float(max(measurement_count, 1))
+            lambda_max_source = "l2_l1_zero_threshold_proxy"
+            lambda_scale = "normalized_by_measurements"
+        lam_values: list[float] = []
+        final_residuals: list[float] = []
+        statuses: list[str] = []
+        lambda_max_values: list[float] = []
+
+        for idx in range(batch):
+            observed_i = g_observed[idx : idx + 1]
+            target_i = float(target[idx].item())
+            natural_hi_i = None
+            if natural_lam_max is not None:
+                natural_hi_i = max(float(natural_lam_max[idx].item()), lam_min * 10.0)
+
+            def evaluate(lam_value: float) -> float:
+                if natural_lam_max_is_exact_zero_threshold and natural_hi_i is not None and lam_value >= natural_hi_i * (1.0 - 1.0e-7):
+                    if residual_norm == "l1":
+                        return float(torch.sum(torch.abs(observed_i), dim=-1).view(-1)[0].item())
+                    return float(torch.norm(observed_i, dim=-1).view(-1)[0].item())
+                lam_tensor = torch.tensor([float(lam_value)], dtype=torch.float32, device=observed_i.device)
+                coeff = self.solve_regularized_init(observed_i, lambda_reg=lam_tensor, init_method=init_method)
+                return float(self._measurement_residual_norm(coeff, observed_i, norm_type=residual_norm).view(-1)[0].item())
+
+            lo = float(lam_min)
+            hi = float(configured_lam_max if natural_hi_i is None else min(configured_lam_max, natural_hi_i))
+            hi = max(hi, lo * 10.0)
+            res_lo = evaluate(lo)
+            res_hi = evaluate(hi)
+            candidates = [(abs(res_lo - target_i), lo, res_lo), (abs(res_hi - target_i), hi, res_hi)]
+
+            if target_i <= res_lo:
+                _, best_lam, best_res = min(candidates, key=lambda item: item[0])
+                status = "target_below_or_equal_lambda_min"
+            elif target_i >= res_hi:
+                _, best_lam, best_res = min(candidates, key=lambda item: item[0])
+                status = "target_above_or_equal_lambda_max"
+                if natural_lam_max_is_exact_zero_threshold and natural_hi_i is not None and hi <= natural_hi_i * (1.0 + 1.0e-7):
+                    status = "target_above_or_equal_zero_solution"
+            else:
+                status = "bracketed"
+                best_lam = lo
+                best_res = res_lo
+                for _ in range(max_iter):
+                    mid = math.sqrt(lo * hi)
+                    res_mid = evaluate(mid)
+                    candidates.append((abs(res_mid - target_i), mid, res_mid))
+                    if res_mid < target_i:
+                        lo = mid
+                    else:
+                        hi = mid
+                _, best_lam, best_res = min(candidates, key=lambda item: item[0])
+
+            lam_values.append(float(best_lam))
+            final_residuals.append(float(best_res))
+            statuses.append(status)
+            lambda_max_values.append(float(hi))
+
+        lam = torch.tensor(lam_values, dtype=torch.float32, device=g_observed.device)
+        self.last_lambda_info = {
+            "mode": "morozov_iterative",
+            "method": str(init_method),
+            "residual_norm": residual_norm,
+            "lambda_min": float(lam_min),
+            "lambda_max": lambda_max_values,
+            "lambda_max_source": lambda_max_source,
+            "lambda_scale": lambda_scale,
+            "measurement_count": int(measurement_count),
+            "lambda_raw_value": [float(v) * float(max(measurement_count, 1)) if lambda_scale == "normalized_by_measurements" else float(v) for v in lam_values],
+            "lambda_raw_max": [float(v) * float(max(measurement_count, 1)) if lambda_scale == "normalized_by_measurements" else float(v) for v in lambda_max_values],
+            "max_iter": int(max_iter),
+            "target_norm": [float(v) for v in target.detach().cpu().view(-1).tolist()],
+            "residual_norm_value": final_residuals,
+            "status": statuses,
+        }
+        return lam
+
+    def select_lambda_for_init_method(
+        self,
+        g_observed: torch.Tensor,
+        g_clean: torch.Tensor,
+        *,
+        init_method: Optional[str] = None,
+        lambda_reg: float | torch.Tensor = None,
+    ) -> float | torch.Tensor:
         if lambda_reg is not None:
             if torch.is_tensor(lambda_reg):
+                provided_method = normalize_init_method(str(init_method or TIME_DOMAIN_CONFIG.get("init_method", "cg")))
+                self.last_lambda_info = {
+                    "mode": "provided",
+                    "method": provided_method,
+                    "lambda_scale": "normalized_by_measurements" if provided_method in SPLIT_ADMM_INIT_METHODS else "raw",
+                }
                 return lambda_reg.to(dtype=torch.float32, device=g_observed.device)
+            provided_method = normalize_init_method(str(init_method or TIME_DOMAIN_CONFIG.get("init_method", "cg")))
+            self.last_lambda_info = {
+                "mode": "provided",
+                "method": provided_method,
+                "lambda_scale": "normalized_by_measurements" if provided_method in SPLIT_ADMM_INIT_METHODS else "raw",
+            }
             return float(lambda_reg)
         mode = str(DATA_CONFIG.get("lambda_select_mode", "fixed")).strip().lower()
+        method = normalize_init_method(str(init_method or TIME_DOMAIN_CONFIG.get("init_method", "cg")))
+        if mode == "fixed":
+            self.last_lambda_info = {
+                "mode": "fixed",
+                "method": method,
+                "residual_norm": "none",
+                "lambda_scale": "normalized_by_measurements" if method in SPLIT_ADMM_INIT_METHODS else "raw",
+            }
+            return float(DATA_CONFIG.get("lambda_reg", 1e-2))
         if mode == "morozov":
+            if method in SPLIT_ADMM_INIT_METHODS:
+                norm_type = "l1" if method == "l1_l1_admm" else "l2"
+                return self._choose_lambda_morozov_iterative(
+                    g_observed,
+                    g_clean,
+                    init_method=method,
+                    residual_norm=norm_type,
+                )
             noise_norm = torch.norm(g_observed - g_clean, dim=-1)
-            return self.time_operator.choose_lambda_morozov(
+            lam = self.time_operator.choose_lambda_morozov(
                 g_observed,
                 noise_norm=noise_norm,
                 tau=float(DATA_CONFIG.get("morozov_tau", 1.0)),
@@ -974,7 +1804,17 @@ class TheoreticalDataGenerator:
                 lambda_min=float(DATA_CONFIG.get("morozov_lambda_min", 1.0e-12)),
                 lambda_max=float(DATA_CONFIG.get("morozov_lambda_max", 1.0e12)),
             ).to(dtype=torch.float32, device=g_observed.device)
+            self.last_lambda_info = {
+                "mode": "morozov_spectral",
+                "method": method,
+                "residual_norm": "l2",
+                "target_norm": [float(v) for v in noise_norm.detach().cpu().view(-1).tolist()],
+            }
+            return lam
         return float(DATA_CONFIG.get("lambda_reg", 1e-2))
+
+    def _select_lambda(self, g_observed: torch.Tensor, g_clean: torch.Tensor, lambda_reg: float | torch.Tensor = None) -> float | torch.Tensor:
+        return self.select_lambda_for_init_method(g_observed, g_clean, init_method=None, lambda_reg=lambda_reg)
 
     def generate_training_sample(self, random_seed=None, lambda_reg: float | torch.Tensor = None):
         if random_seed is not None:
@@ -985,16 +1825,17 @@ class TheoreticalDataGenerator:
         with torch.no_grad():
             g_clean = self.data_forward_operator(coeff_true).to(torch.float32)
             g_observed = self._apply_noise(g_clean)
-        lambda_eff = self._select_lambda(g_observed, g_clean, lambda_reg=lambda_reg)
-        self.last_lambda = lambda_eff
-        init_method = str(TIME_DOMAIN_CONFIG.get("init_method", "cg")).strip().lower()
-        init_cg_iters = int(TIME_DOMAIN_CONFIG.get("init_cg_iters", 0))
-        if init_method == "tikhonov_direct":
-            coeff_initial = self._tikhonov_direct_init(g_observed, lambda_reg=lambda_eff)
-        elif init_method == "cg" and init_cg_iters > 0:
-            coeff_initial = self._tikhonov_cg_init(g_observed, lambda_reg=lambda_eff, max_iter=init_cg_iters)
-        else:
-            raise ValueError(f"Unsupported init_method={init_method!r}; expected 'cg' or 'tikhonov_direct'.")
+            lambda_eff = self._select_lambda(g_observed, g_clean, lambda_reg=lambda_reg)
+            self.last_lambda = lambda_eff
+            init_method = normalize_init_method(str(TIME_DOMAIN_CONFIG.get("init_method", "cg")))
+            if dict(self.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
+                coeff_initial = self.solve_constrained_init(g_observed, noise_radius=lambda_eff, init_method=init_method)
+                info = dict(self.last_lambda_info or {})
+                info["mode"] = "morozov_constrained"
+                info["solver_stats"] = dict(getattr(self.time_operator, "last_split_admm_stats", None) or {})
+                self.last_lambda_info = info
+            else:
+                coeff_initial = self.solve_regularized_init(g_observed, lambda_reg=lambda_eff, init_method=init_method)
         return coeff_true.squeeze(0).squeeze(0), f_true.squeeze(0), g_observed.squeeze(0), coeff_initial.squeeze(0).squeeze(0)
 
     def generate_batch(self, batch_size, random_seed=None, lambda_reg: float | torch.Tensor = None):
@@ -1002,14 +1843,14 @@ class TheoreticalDataGenerator:
             torch.manual_seed(random_seed)
             np.random.seed(random_seed)
         batch_started = time.perf_counter()
-        init_method = str(TIME_DOMAIN_CONFIG.get("init_method", "cg")).strip().lower()
+        init_method = normalize_init_method(str(TIME_DOMAIN_CONFIG.get("init_method", "cg")))
         lambda_mode = "provided" if lambda_reg is not None else str(DATA_CONFIG.get("lambda_select_mode", "fixed")).strip().lower()
-        progress_enabled = (not self._first_batch_progress_logged) and init_method == "tikhonov_direct"
+        progress_enabled = (not self._first_batch_progress_logged) and init_method != "cg"
         if progress_enabled:
             print(
                 "[init] first batch start "
                 f"batch_size={int(batch_size)} angles={int(getattr(self.time_operator, 'num_angles', 1) or 1)} "
-                f"lambda_mode={lambda_mode} init_method={init_method} solver=stacked_tikhonov"
+                f"lambda_mode={lambda_mode} init_method={init_method} solver=regularized_init"
             )
         coeff_true = self._sample_coefficients(batch_size)
         f_true = self.image_gen(coeff_true)
@@ -1018,14 +1859,15 @@ class TheoreticalDataGenerator:
             g_observed = self._apply_noise(g_clean)
         lambda_eff = self._select_lambda(g_observed, g_clean, lambda_reg=lambda_reg)
         self.last_lambda = lambda_eff
-        init_cg_iters = int(TIME_DOMAIN_CONFIG.get("init_cg_iters", 0))
         coeff_init_started = time.perf_counter()
-        if init_method == "tikhonov_direct":
-            coeff_initial = self._tikhonov_direct_init(g_observed, lambda_reg=lambda_eff)
-        elif init_method == "cg" and init_cg_iters > 0:
-            coeff_initial = self._tikhonov_cg_init(g_observed, lambda_reg=lambda_eff, max_iter=init_cg_iters)
+        if dict(self.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
+            coeff_initial = self.solve_constrained_init(g_observed, noise_radius=lambda_eff, init_method=init_method)
+            info = dict(self.last_lambda_info or {})
+            info["mode"] = "morozov_constrained"
+            info["solver_stats"] = dict(getattr(self.time_operator, "last_split_admm_stats", None) or {})
+            self.last_lambda_info = info
         else:
-            raise ValueError(f"Unsupported init_method={init_method!r}; expected 'cg' or 'tikhonov_direct'.")
+            coeff_initial = self.solve_regularized_init(g_observed, lambda_reg=lambda_eff, init_method=init_method)
         if progress_enabled:
             print(f"[init] coefficient init finished in {time.perf_counter() - coeff_init_started:.2f}s")
             print(f"[init] first batch ready in {time.perf_counter() - batch_started:.2f}s")

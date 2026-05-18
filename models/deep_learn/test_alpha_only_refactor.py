@@ -238,6 +238,383 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             DATA_CONFIG.clear()
             DATA_CONFIG.update(data_backup)
 
+    def test_l1_and_tv_admm_initializers_reduce_their_objectives_and_dispatch(self):
+        from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
+        from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
+
+        data_backup = dict(DATA_CONFIG)
+        time_backup = dict(TIME_DOMAIN_CONFIG)
+        try:
+            DATA_CONFIG.update(
+                {
+                    "lambda_select_mode": "fixed",
+                    "l1_init_admm_iters": 16,
+                    "l1_init_admm_cg_iters": 12,
+                    "l1_init_admm_cg_tol": 1.0e-5,
+                    "l1_init_admm_rho_data": 4.0,
+                    "l1_init_admm_rho_reg": 1.0,
+                }
+            )
+            TIME_DOMAIN_CONFIG.update(
+                {
+                    "experiment_profile": "runtime_alpha",
+                    "operator_mode": "theoretical_b1b1",
+                    "use_multi_angle": True,
+                    "alpha_values": [0.23, 1.11],
+                    "alpha_tau_offsets": [0.15, 0.35],
+                    "num_angles_total": 2,
+                    "num_angles": 2,
+                    "theoretical_formula_mode": "alpha_continuous",
+                    "data_formula_mode": "auto_complete",
+                }
+            )
+            torch.manual_seed(11)
+            op = AlphaContinuousB1B1Operator2D(
+                alpha_values=[0.23, 1.11],
+                height=4,
+                width=4,
+                tau_offsets=[0.15, 0.35],
+            ).to(device)
+            generator = TheoreticalDataGenerator(img_size=4, data_source="shepp_logan", time_operator=op)
+            coeff_true = torch.randn(1, 1, 4, 4, device=device)
+            g_observed = op(coeff_true) + 0.03 * torch.randn(1, op.M, device=device)
+            lam = torch.tensor([0.08], dtype=torch.float32, device=device)
+
+            zero = torch.zeros_like(coeff_true)
+
+            def objective_l2_l1(x):
+                residual = op(x) - g_observed
+                return 0.5 * torch.sum(residual.square()) + lam[0] * torch.sum(torch.abs(x))
+
+            def objective_l1_l1(x):
+                residual = op(x) - g_observed
+                return torch.sum(torch.abs(residual)) + lam[0] * torch.sum(torch.abs(x))
+
+            def objective_l2_tv(x):
+                residual = op(x) - g_observed
+                return 0.5 * torch.sum(residual.square()) + lam[0] * op.anisotropic_tv_norm(x).sum()
+
+            coeff_l2_l1 = op.solve_l2_l1_admm(g_observed, lambda_reg=lam)
+            coeff_l1_l1 = op.solve_l1_l1_admm(g_observed, lambda_reg=lam)
+            coeff_l2_tv = op.solve_l2_tv_admm(g_observed, lambda_reg=lam)
+
+            self.assertEqual(tuple(coeff_l2_l1.shape), (1, 1, 4, 4))
+            self.assertEqual(tuple(coeff_l1_l1.shape), (1, 1, 4, 4))
+            self.assertEqual(tuple(coeff_l2_tv.shape), (1, 1, 4, 4))
+            self.assertTrue(torch.isfinite(coeff_l2_l1).all())
+            self.assertTrue(torch.isfinite(coeff_l1_l1).all())
+            self.assertTrue(torch.isfinite(coeff_l2_tv).all())
+            self.assertLess(float(objective_l2_l1(coeff_l2_l1)), float(objective_l2_l1(zero)))
+            self.assertLess(float(objective_l1_l1(coeff_l1_l1)), float(objective_l1_l1(zero)))
+            self.assertLess(float(objective_l2_tv(coeff_l2_tv)), float(objective_l2_tv(zero)))
+
+            lam_normalized = lam / float(op.M)
+            dispatched_l2_l1 = generator.solve_regularized_init(
+                g_observed,
+                lambda_reg=lam_normalized,
+                init_method="l2_l1_admm",
+            )
+            dispatched_l1_l1 = generator.solve_regularized_init(
+                g_observed,
+                lambda_reg=lam_normalized,
+                init_method="l1_l1_admm",
+            )
+            dispatched_l2_tv = generator.solve_regularized_init(
+                g_observed,
+                lambda_reg=lam_normalized,
+                init_method="l2_tv_admm",
+            )
+            self.assertEqual(tuple(dispatched_l2_l1.shape), (1, 1, 4, 4))
+            self.assertEqual(tuple(dispatched_l1_l1.shape), (1, 1, 4, 4))
+            self.assertEqual(tuple(dispatched_l2_tv.shape), (1, 1, 4, 4))
+            self.assertTrue(torch.allclose(dispatched_l2_l1, coeff_l2_l1, atol=1.0e-4, rtol=1.0e-3))
+            self.assertTrue(torch.allclose(dispatched_l1_l1, coeff_l1_l1, atol=1.0e-4, rtol=1.0e-3))
+            self.assertTrue(torch.allclose(dispatched_l2_tv, coeff_l2_tv, atol=1.0e-4, rtol=1.0e-3))
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
+            TIME_DOMAIN_CONFIG.clear()
+            TIME_DOMAIN_CONFIG.update(time_backup)
+
+    def test_tv_gradient_adjoint_identity(self):
+        from config import device
+        from radon_transform import AlphaContinuousB1B1Operator2D
+
+        torch.manual_seed(12)
+        op = AlphaContinuousB1B1Operator2D(
+            alpha_values=[0.23, 1.11],
+            height=5,
+            width=4,
+            tau_offsets=[0.15, 0.35],
+        ).to(device)
+        x = torch.randn(2, 1, 5, 4, device=device)
+        p = torch.randn(2, 2, 5, 4, device=device)
+
+        lhs = torch.sum(op.tv_gradient(x) * p)
+        rhs = torch.sum(x * op.tv_divergence_adjoint(p))
+
+        self.assertLess(float(torch.abs(lhs - rhs).item()), 1.0e-5)
+
+    def test_l1_morozov_uses_method_specific_residual_norms(self):
+        from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
+        from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
+
+        data_backup = dict(DATA_CONFIG)
+        time_backup = dict(TIME_DOMAIN_CONFIG)
+        try:
+            DATA_CONFIG.update(
+                {
+                    "lambda_select_mode": "morozov",
+                    "morozov_max_iter": 2,
+                    "morozov_lambda_min": 1.0e-4,
+                    "morozov_lambda_max": 1.0,
+                    "l1_init_admm_iters": 4,
+                    "l1_init_admm_cg_iters": 4,
+                    "l1_init_admm_cg_tol": 1.0e-4,
+                }
+            )
+            TIME_DOMAIN_CONFIG.update(
+                {
+                    "experiment_profile": "runtime_alpha",
+                    "operator_mode": "theoretical_b1b1",
+                    "use_multi_angle": True,
+                    "alpha_values": [0.23, 1.11],
+                    "alpha_tau_offsets": [0.15, 0.35],
+                    "num_angles_total": 2,
+                    "num_angles": 2,
+                    "theoretical_formula_mode": "alpha_continuous",
+                    "data_formula_mode": "auto_complete",
+                }
+            )
+            torch.manual_seed(13)
+            op = AlphaContinuousB1B1Operator2D(
+                alpha_values=[0.23, 1.11],
+                height=4,
+                width=4,
+                tau_offsets=[0.15, 0.35],
+            ).to(device)
+            generator = TheoreticalDataGenerator(img_size=4, data_source="shepp_logan", time_operator=op)
+            coeff_true = torch.randn(1, 1, 4, 4, device=device)
+            g_clean = op(coeff_true)
+            g_observed = g_clean + 0.04 * torch.randn_like(g_clean)
+
+            TIME_DOMAIN_CONFIG["init_method"] = "l2_l1_admm"
+            lam_l2 = generator._select_lambda(g_observed, g_clean)
+            info_l2 = dict(generator.last_lambda_info)
+            self.assertTrue(torch.isfinite(lam_l2).all())
+            self.assertEqual(info_l2["method"], "l2_l1_admm")
+            self.assertEqual(info_l2["residual_norm"], "l2")
+            self.assertEqual(info_l2["mode"], "morozov_iterative")
+            self.assertEqual(info_l2["lambda_max_source"], "zero_solution_threshold")
+            self.assertEqual(info_l2["lambda_scale"], "normalized_by_measurements")
+            self.assertLess(float(lam_l2.view(-1)[0].item()), 1.0e6)
+
+            TIME_DOMAIN_CONFIG["init_method"] = "l1_l1_admm"
+            lam_l1 = generator._select_lambda(g_observed, g_clean)
+            info_l1 = dict(generator.last_lambda_info)
+            self.assertTrue(torch.isfinite(lam_l1).all())
+            self.assertEqual(info_l1["method"], "l1_l1_admm")
+            self.assertEqual(info_l1["residual_norm"], "l1")
+            self.assertEqual(info_l1["mode"], "morozov_iterative")
+            self.assertEqual(info_l1["lambda_max_source"], "zero_solution_threshold")
+            self.assertEqual(info_l1["lambda_scale"], "normalized_by_measurements")
+            self.assertLess(float(lam_l1.view(-1)[0].item()), 1.0e6)
+
+            TIME_DOMAIN_CONFIG["init_method"] = "l2_tv_admm"
+            lam_tv = generator._select_lambda(g_observed, g_clean)
+            info_tv = dict(generator.last_lambda_info)
+            self.assertTrue(torch.isfinite(lam_tv).all())
+            self.assertEqual(info_tv["method"], "l2_tv_admm")
+            self.assertEqual(info_tv["residual_norm"], "l2")
+            self.assertEqual(info_tv["mode"], "morozov_iterative")
+            self.assertEqual(info_tv["lambda_max_source"], "l2_l1_zero_threshold_proxy")
+            self.assertEqual(info_tv["lambda_scale"], "normalized_by_measurements")
+            self.assertLess(float(lam_tv.view(-1)[0].item()), 1.0e6)
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
+            TIME_DOMAIN_CONFIG.clear()
+            TIME_DOMAIN_CONFIG.update(time_backup)
+
+    def test_morozov_constrained_l1_initializers_enforce_residual_balls(self):
+        from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
+        from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
+
+        data_backup = dict(DATA_CONFIG)
+        time_backup = dict(TIME_DOMAIN_CONFIG)
+        try:
+            DATA_CONFIG.update(
+                {
+                    "lambda_select_mode": "morozov",
+                    "morozov_tau": 1.0,
+                    "l1_init_admm_iters": 96,
+                    "l1_init_admm_cg_iters": 16,
+                    "l1_init_admm_cg_tol": 1.0e-5,
+                    "l1_init_admm_rho_data": 4.0,
+                    "l1_init_admm_rho_reg": 4.0,
+                }
+            )
+            TIME_DOMAIN_CONFIG.update(
+                {
+                    "experiment_profile": "runtime_alpha",
+                    "operator_mode": "theoretical_b1b1",
+                    "use_multi_angle": True,
+                    "alpha_values": [0.23, 1.11],
+                    "alpha_tau_offsets": [0.15, 0.35],
+                    "num_angles_total": 2,
+                    "num_angles": 2,
+                    "theoretical_formula_mode": "alpha_continuous",
+                    "data_formula_mode": "auto_complete",
+                }
+            )
+            torch.manual_seed(17)
+            op = AlphaContinuousB1B1Operator2D(
+                alpha_values=[0.23, 1.11],
+                height=4,
+                width=4,
+                tau_offsets=[0.15, 0.35],
+            ).to(device)
+            generator = TheoreticalDataGenerator(img_size=4, data_source="shepp_logan", time_operator=op)
+            coeff_true = torch.randn(1, 1, 4, 4, device=device)
+            g_clean = op(coeff_true)
+            g_observed = g_clean + 0.05 * torch.randn_like(g_clean)
+
+            coeff_l2 = generator.solve_morozov_constrained_init(
+                g_observed,
+                g_clean,
+                init_method="l2_l1_admm",
+            )
+            info_l2 = dict(generator.last_lambda_info)
+            target_l2 = float(info_l2["target_norm"][0])
+            residual_l2 = float(torch.norm(op(coeff_l2) - g_observed, dim=-1).view(-1)[0].item())
+            self.assertEqual(info_l2["mode"], "morozov_constrained")
+            self.assertEqual(info_l2["residual_norm"], "l2")
+            self.assertLessEqual(residual_l2, target_l2 * 1.08 + 1.0e-5)
+
+            coeff_l1 = generator.solve_morozov_constrained_init(
+                g_observed,
+                g_clean,
+                init_method="l1_l1_admm",
+            )
+            info_l1 = dict(generator.last_lambda_info)
+            target_l1 = float(info_l1["target_norm"][0])
+            residual_l1 = float(torch.sum(torch.abs(op(coeff_l1) - g_observed), dim=-1).view(-1)[0].item())
+            self.assertEqual(info_l1["mode"], "morozov_constrained")
+            self.assertEqual(info_l1["residual_norm"], "l1")
+            self.assertLessEqual(residual_l1, target_l1 * 1.08 + 1.0e-5)
+
+            coeff_tv = generator.solve_morozov_constrained_init(
+                g_observed,
+                g_clean,
+                init_method="l2_tv_admm",
+            )
+            info_tv = dict(generator.last_lambda_info)
+            target_tv = float(info_tv["target_norm"][0])
+            residual_tv = float(torch.norm(op(coeff_tv) - g_observed, dim=-1).view(-1)[0].item())
+            self.assertEqual(info_tv["mode"], "morozov_constrained")
+            self.assertEqual(info_tv["residual_norm"], "l2")
+            self.assertLessEqual(residual_tv, target_tv * 1.08 + 1.0e-5)
+            self.assertTrue(torch.isfinite(coeff_tv).all())
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
+            TIME_DOMAIN_CONFIG.clear()
+            TIME_DOMAIN_CONFIG.update(time_backup)
+
+    def test_alpha_eval_defines_regularized_baseline_methods(self):
+        alpha_dir = MODELS_DIR / "α_condition"
+        if str(alpha_dir) not in sys.path:
+            sys.path.insert(0, str(alpha_dir))
+        import alpha_tikhonov_eval
+
+        methods = alpha_tikhonov_eval.reconstruction_method_defs()
+        by_name = {item["name"]: item for item in methods}
+
+        self.assertEqual(
+            list(by_name.keys()),
+            ["tikhonov_l2_l2", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm"],
+        )
+        self.assertEqual(by_name["tikhonov_l2_l2"]["init_method"], "tikhonov_direct")
+        self.assertEqual(by_name["tikhonov_l2_l2"]["morozov_residual_norm"], "l2")
+        self.assertEqual(by_name["l2_l1_admm"]["init_method"], "l2_l1_admm")
+        self.assertEqual(by_name["l2_l1_admm"]["morozov_residual_norm"], "l2")
+        self.assertEqual(by_name["l1_l1_admm"]["init_method"], "l1_l1_admm")
+        self.assertEqual(by_name["l1_l1_admm"]["morozov_residual_norm"], "l1")
+        self.assertEqual(by_name["l2_tv_admm"]["init_method"], "l2_tv_admm")
+        self.assertEqual(by_name["l2_tv_admm"]["objective"], "l2_tv")
+        self.assertEqual(by_name["l2_tv_admm"]["morozov_residual_norm"], "l2")
+
+    def test_initialization_methods_are_available_as_shared_model_choices(self):
+        import initialization_methods as init_methods
+        from config import INIT_METHOD_CHOICES
+
+        self.assertEqual(
+            list(init_methods.REGULARIZED_INIT_METHOD_CHOICES),
+            ["tikhonov_direct", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm"],
+        )
+        self.assertTrue(set(init_methods.REGULARIZED_INIT_METHOD_CHOICES).issubset(set(INIT_METHOD_CHOICES)))
+        self.assertEqual(init_methods.normalize_init_method("tikhonov"), "tikhonov_direct")
+        self.assertEqual(init_methods.normalize_init_method("L2/L1"), "l2_l1_admm")
+        self.assertEqual(init_methods.normalize_init_method("l1-l1"), "l1_l1_admm")
+        self.assertEqual(init_methods.normalize_init_method("tv"), "l2_tv_admm")
+
+        methods = init_methods.reconstruction_method_defs()
+        self.assertEqual([item["name"] for item in methods], ["tikhonov_l2_l2", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm"])
+        self.assertEqual(init_methods.method_spec_from_init_method("tv")["objective"], "l2_tv")
+
+    def test_shepp_logan_comparison_exposes_adjustable_angle_count_helpers(self):
+        comparison_dir = MODELS_DIR / "shepp_logan_comparison"
+        if str(comparison_dir) not in sys.path:
+            sys.path.insert(0, str(comparison_dir))
+        import compare_angle_selection
+
+        self.assertEqual(compare_angle_selection.parse_angle_counts("8,4"), [8, 4])
+        self.assertEqual(compare_angle_selection.parse_angle_counts(" 16 "), [16])
+        with self.assertRaises(ValueError):
+            compare_angle_selection.parse_angle_counts("8,0")
+
+        selected_path = compare_angle_selection.resolve_selected_alpha_json("", 8)
+        self.assertEqual(selected_path.name, "alpha_selected8.json")
+        self.assertIn("alpha_search_cache", str(selected_path))
+        self.assertEqual(compare_angle_selection.resolve_method_spec("tv")["init_method"], "l2_tv_admm")
+
+    def test_random_uniform_angles_are_independent_of_angle_count_order(self):
+        comparison_dir = MODELS_DIR / "shepp_logan_comparison"
+        if str(comparison_dir) not in sys.path:
+            sys.path.insert(0, str(comparison_dir))
+        import compare_angle_selection
+
+        seed = 20260517
+        forward = {
+            count: compare_angle_selection.random_uniform_alphas(count, seed, trial_index=0)
+            for count in [10, 12, 16]
+        }
+        reverse = {
+            count: compare_angle_selection.random_uniform_alphas(count, seed, trial_index=0)
+            for count in [16, 12, 10]
+        }
+
+        self.assertEqual(forward, reverse)
+        self.assertEqual(forward[16], sorted(forward[16]))
+        self.assertEqual(len(forward[16]), 16)
+        self.assertNotEqual(
+            compare_angle_selection.random_uniform_alphas(16, seed, trial_index=0),
+            compare_angle_selection.random_uniform_alphas(16, seed, trial_index=1),
+        )
+
+    def test_selected_angle_count_plot_titles_include_res_values(self):
+        comparison_dir = MODELS_DIR / "shepp_logan_comparison"
+        if str(comparison_dir) not in sys.path:
+            sys.path.insert(0, str(comparison_dir))
+        import plot_selected_angle_counts
+
+        self.assertEqual(plot_selected_angle_counts.format_panel_title(4, 0.123456789), "k=4\nRES=0.123457")
+        self.assertEqual(plot_selected_angle_counts.selected_case_name(16), "selected16_uniform_condition")
+        self.assertEqual(
+            plot_selected_angle_counts.safe_method_filename("l2_tv_admm"),
+            "l2_tv_admm",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

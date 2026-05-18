@@ -148,8 +148,20 @@ def _resolve_checkpoint_from_tag(tag: str) -> str:
         model_path = MODEL_PATH
     else:
         stem = f"theoretical_ct_{tag}"
-        best_path = os.path.join(MODEL_DIR, f"{stem}_best_model.pth")
-        model_path = os.path.join(MODEL_DIR, f"{stem}_model.pth")
+        candidate_dirs = [
+            os.path.join(Path(MODEL_DIR).parents[0], tag),
+            MODEL_DIR,
+            os.path.join(Path(MODEL_DIR).parents[0], "deep_learn"),
+        ]
+        for directory in candidate_dirs:
+            best_path = os.path.join(str(directory), f"{stem}_best_model.pth")
+            model_path = os.path.join(str(directory), f"{stem}_model.pth")
+            if os.path.exists(best_path):
+                return best_path
+            if os.path.exists(model_path):
+                return model_path
+        best_path = os.path.join(str(candidate_dirs[0]), f"{stem}_best_model.pth")
+        model_path = os.path.join(str(candidate_dirs[0]), f"{stem}_model.pth")
     return best_path if os.path.exists(best_path) else model_path
 
 

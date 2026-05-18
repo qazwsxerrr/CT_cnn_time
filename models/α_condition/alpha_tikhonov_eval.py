@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Pure Tikhonov evaluation for alpha condition-constrained sampling.
+"""Regularized initialization evaluation for alpha condition-constrained sampling.
 
 This entrypoint intentionally does not load or run the learned neural network.
 It only:
@@ -7,8 +7,8 @@ It only:
 1. loads alpha/tau records produced by ``alpha_condition_constrained_sampling.py``;
 2. configures the runtime alpha-continuous stacked operator;
 3. generates observations; and
-4. solves the direct Tikhonov normal equations, with either fixed lambda or
-   Morozov-selected lambda.
+4. compares direct Tikhonov, L2/L1 ADMM, L1/L1 ADMM, and L2/TV ADMM
+   initialization solves, with either fixed lambda or Morozov-selected lambda.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from alpha_condition_constrained_sampling import (
     select_uniform_condition_best,
 )
 from config import DATA_CONFIG, DATA_DIR, IMAGE_SIZE, RESULTS_DIR, TIME_DOMAIN_CONFIG, device
+from initialization_methods import reconstruction_method_defs
 from radon_transform import TheoreticalDataGenerator
 
 DEFAULT_ALPHA_JSON = ""
@@ -264,25 +265,91 @@ def build_observation(
 def choose_lambda(
     generator: TheoreticalDataGenerator,
     observed: torch.Tensor,
-    noise_norm: torch.Tensor,
+    g_clean: torch.Tensor,
     *,
     lambda_mode: str,
     lambda_reg: float,
+    method: dict[str, str],
 ) -> torch.Tensor:
     mode = str(lambda_mode).strip().lower()
     if mode == "fixed":
+        generator.last_lambda_info = {
+            "mode": "fixed",
+            "method": str(method["init_method"]),
+            "residual_norm": str(method["morozov_residual_norm"]),
+        }
         return torch.full((int(observed.shape[0]),), float(lambda_reg), device=observed.device, dtype=torch.float32)
     if mode != "morozov":
         raise ValueError(f"Unsupported lambda_mode={lambda_mode!r}; expected 'morozov' or 'fixed'.")
-    lam = generator.time_operator.choose_lambda_morozov(
+    lam = generator.select_lambda_for_init_method(
         observed,
-        noise_norm=noise_norm,
-        tau=float(DATA_CONFIG.get("morozov_tau", 1.0)),
-        max_iter=int(DATA_CONFIG.get("morozov_max_iter", 8)),
-        lambda_min=float(DATA_CONFIG.get("morozov_lambda_min", 1.0e-12)),
-        lambda_max=float(DATA_CONFIG.get("morozov_lambda_max", 1.0e12)),
+        g_clean,
+        init_method=str(method["init_method"]),
+        lambda_reg=None,
     )
     return lam.to(device=observed.device, dtype=torch.float32).view(-1)
+
+
+def solve_method(
+    generator: TheoreticalDataGenerator,
+    observed: torch.Tensor,
+    *,
+    lambda_reg: torch.Tensor,
+    method: dict[str, str],
+) -> torch.Tensor:
+    if dict(generator.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
+        return generator.solve_constrained_init(
+            observed,
+            noise_radius=lambda_reg,
+            init_method=str(method["init_method"]),
+        )
+    return generator.solve_regularized_init(
+        observed,
+        lambda_reg=lambda_reg,
+        init_method=str(method["init_method"]),
+    )
+
+
+def measurement_norms(generator: TheoreticalDataGenerator, coeff_est: torch.Tensor, observed: torch.Tensor) -> dict[str, float]:
+    residual = generator.forward_operator(coeff_est) - observed.to(dtype=torch.float32, device=coeff_est.device)
+    return {
+        "measurement_l2": float(torch.norm(residual, dim=-1).view(-1)[0].item()),
+        "measurement_l1": float(torch.sum(torch.abs(residual), dim=-1).view(-1)[0].item()),
+    }
+
+
+def objective_value(
+    generator: TheoreticalDataGenerator,
+    coeff_est: torch.Tensor,
+    observed: torch.Tensor,
+    *,
+    lambda_reg: torch.Tensor,
+    method: dict[str, str],
+    lambda_info: dict[str, Any] | None = None,
+) -> float:
+    residual = generator.forward_operator(coeff_est) - observed.to(dtype=torch.float32, device=coeff_est.device)
+    if str((lambda_info or {}).get("mode", "")).startswith("morozov_constrained"):
+        return float(torch.sum(torch.abs(coeff_est)).item())
+    lam = float(lambda_reg.view(-1)[0].item())
+    objective = str(method["objective"])
+    if objective == "l2_l2":
+        return float((0.5 * torch.sum(residual.square()) + 0.5 * lam * torch.sum(coeff_est.square())).item())
+    if objective == "l2_l1":
+        measurement_count = max(int(residual.shape[-1]), 1)
+        return float((0.5 * torch.sum(residual.square()) / float(measurement_count) + lam * torch.sum(torch.abs(coeff_est))).item())
+    if objective == "l1_l1":
+        measurement_count = max(int(residual.shape[-1]), 1)
+        return float((torch.sum(torch.abs(residual)) / float(measurement_count) + lam * torch.sum(torch.abs(coeff_est))).item())
+    if objective == "l2_tv":
+        measurement_count = max(int(residual.shape[-1]), 1)
+        if hasattr(generator.time_operator, "anisotropic_tv_norm"):
+            tv = torch.sum(generator.time_operator.anisotropic_tv_norm(coeff_est))
+        else:
+            dx = coeff_est[:, :, :, 1:] - coeff_est[:, :, :, :-1]
+            dy = coeff_est[:, :, 1:, :] - coeff_est[:, :, :-1, :]
+            tv = torch.sum(torch.abs(dx)) + torch.sum(torch.abs(dy))
+        return float((0.5 * torch.sum(residual.square()) / float(measurement_count) + lam * tv).item())
+    raise ValueError(f"Unsupported objective={objective!r}.")
 
 
 def plot_triptych(
@@ -319,19 +386,53 @@ def plot_triptych(
     plt.close(fig)
 
 
+def plot_method_comparison(
+    *,
+    coeff_true: np.ndarray,
+    estimates: dict[str, np.ndarray],
+    title: str,
+    save_path: str | Path,
+) -> None:
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    method_names = list(estimates.keys())
+    panels = [("true", coeff_true)] + [(name, estimates[name]) for name in method_names]
+    vmin = min(float(np.min(arr)) for _, arr in panels)
+    vmax = max(float(np.max(arr)) for _, arr in panels)
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 4))
+    if len(panels) == 1:
+        axes = [axes]
+    for col, (panel_title, arr) in enumerate(panels):
+        im = axes[col].imshow(arr, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
+        axes[col].set_title(panel_title)
+        axes[col].axis("off")
+        plt.colorbar(im, ax=axes[col], fraction=0.046, pad=0.04)
+    fig.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _format_summary(results: list[dict[str, Any]], *, alpha_json: str, output_prefix: str) -> str:
     lines = [
         f"output_prefix: {output_prefix}",
         f"alpha_json: {alpha_json}",
         f"device: {device}",
         "",
-        "scenario | trial | lambda | noise_norm | meas_res | coeff_res | solve_seconds",
+        "scenario | trial | method | lambda | constraint_radius | noise_l2 | noise_l1 | meas_l2 | meas_l1 | coeff_res | objective | solve_seconds",
     ]
     for item in results:
+        lambda_value = item.get("lambda", None)
+        lambda_text = "None" if lambda_value is None else f"{float(lambda_value):.6e}"
+        radius_value = item.get("constraint_radius", None)
+        radius_text = "None" if radius_value is None else f"{float(radius_value):.6e}"
         lines.append(
-            f"{item['scenario']} | {item['trial']} | {float(item['lambda']):.6e} | "
-            f"{float(item['noise_norm']):.6e} | {float(item['measurement_residual']):.6e} | "
-            f"{float(item['coeff_res']):.6e} | {float(item['solve_seconds']):.3f}"
+            f"{item['scenario']} | {item['trial']} | {item['method']} | {lambda_text} | {radius_text} | "
+            f"{float(item['noise_l2']):.6e} | {float(item['noise_l1']):.6e} | "
+            f"{float(item['measurement_l2']):.6e} | {float(item['measurement_l1']):.6e} | "
+            f"{float(item['coeff_res']):.6e} | {float(item['objective_value']):.6e} | "
+            f"{float(item['solve_seconds']):.3f}"
         )
     return "\n".join(lines) + "\n"
 
@@ -372,9 +473,11 @@ def evaluate(
     output_dir.mkdir(parents=True, exist_ok=True)
     generator = TheoreticalDataGenerator(data_source=data_source)
 
-    print(f"Running alpha pure Tikhonov on device: {device}")
+    methods = reconstruction_method_defs()
+    print(f"Running alpha regularized initialization comparison on device: {device}")
     print(f"alpha_json={alpha_json}")
     print(f"num_angles={len(records)} lambda_mode={lambda_mode} data_source={data_source}")
+    print("methods=" + ", ".join(item["name"] for item in methods))
     for idx, item in enumerate(records, start=1):
         print(
             f"[alpha {idx:02d}] alpha={float(item['alpha']):.12f} "
@@ -391,45 +494,62 @@ def evaluate(
             coeff_true = generator._sample_coefficients(batch_size=1)
             g_clean = generator.data_forward_operator(coeff_true).to(torch.float32)
             observed, noise_norm = build_observation(generator, g_clean, scenario_item, seed=seed)
+            noise_l1 = torch.sum(torch.abs(observed - g_clean), dim=-1)
+            estimates_for_plot: dict[str, np.ndarray] = {}
 
-            t0 = time.perf_counter()
-            lam = choose_lambda(
-                generator,
-                observed,
-                noise_norm,
-                lambda_mode=lambda_mode,
-                lambda_reg=float(lambda_reg),
-            )
-            t1 = time.perf_counter()
-            coeff_est = generator.solve_tikhonov_direct_init(observed, lambda_reg=lam)
-            t2 = time.perf_counter()
-            residual = generator.forward_operator(coeff_est) - observed
-            result = {
-                "scenario": str(scenario_item["name"]),
-                "trial": int(trial),
-                "seed": int(seed),
-                "lambda": float(lam.view(-1)[0].item()),
-                "noise_norm": float(noise_norm.view(-1)[0].item()),
-                "measurement_residual": float(torch.norm(residual, dim=-1).view(-1)[0].item()),
-                "coeff_res": coeff_res(coeff_est.squeeze(0).squeeze(0), coeff_true.squeeze(0).squeeze(0)),
-                "lambda_seconds": float(t1 - t0),
-                "solve_seconds": float(t2 - t1),
-                "num_angles": int(len(records)),
-                "alpha_values": [float(item["alpha"]) for item in records],
-                "tau_offsets": [float(item["tau_star"]) for item in records],
-            }
-            results.append(result)
-            print(json.dumps(result, ensure_ascii=False))
+            for method in methods:
+                t0 = time.perf_counter()
+                lam = choose_lambda(
+                    generator,
+                    observed,
+                    g_clean,
+                    lambda_mode=lambda_mode,
+                    lambda_reg=float(lambda_reg),
+                    method=method,
+                )
+                lambda_info = dict(generator.last_lambda_info or {})
+                constrained = str(lambda_info.get("mode", "")).startswith("morozov_constrained")
+                t1 = time.perf_counter()
+                coeff_est = solve_method(generator, observed, lambda_reg=lam, method=method)
+                solve_info = dict(generator.last_lambda_info or lambda_info)
+                if constrained:
+                    solve_info.update({"mode": "morozov_constrained", "solver_stats": dict(getattr(generator.time_operator, "last_split_admm_stats", None) or {})})
+                    generator.last_lambda_info = solve_info
+                t2 = time.perf_counter()
+                norms = measurement_norms(generator, coeff_est, observed)
+                result = {
+                    "scenario": str(scenario_item["name"]),
+                    "trial": int(trial),
+                    "seed": int(seed),
+                    "method": str(method["name"]),
+                    "init_method": str(method["init_method"]),
+                    "objective": str(method["objective"]),
+                    "morozov_residual_norm": str(method["morozov_residual_norm"]),
+                    "lambda": None if constrained else float(lam.view(-1)[0].item()),
+                    "constraint_radius": float(lam.view(-1)[0].item()) if constrained else None,
+                    "lambda_info": dict(generator.last_lambda_info or lambda_info),
+                    "noise_l2": float(noise_norm.view(-1)[0].item()),
+                    "noise_l1": float(noise_l1.view(-1)[0].item()),
+                    **norms,
+                    "coeff_res": coeff_res(coeff_est.squeeze(0).squeeze(0), coeff_true.squeeze(0).squeeze(0)),
+                    "objective_value": objective_value(generator, coeff_est, observed, lambda_reg=lam, method=method, lambda_info=dict(generator.last_lambda_info or lambda_info)),
+                    "lambda_seconds": float(t1 - t0),
+                    "solve_seconds": float(t2 - t1),
+                    "num_angles": int(len(records)),
+                    "alpha_values": [float(item["alpha"]) for item in records],
+                    "tau_offsets": [float(item["tau_star"]) for item in records],
+                }
+                results.append(result)
+                print(json.dumps(result, ensure_ascii=False))
+                if trial == int(num_trials) - 1:
+                    estimates_for_plot[str(method["name"])] = coeff_est.squeeze(0).squeeze(0).detach().cpu().numpy()
 
             if trial == int(num_trials) - 1:
-                plot_triptych(
+                plot_method_comparison(
                     coeff_true=coeff_true.squeeze(0).squeeze(0).detach().cpu().numpy(),
-                    coeff_est=coeff_est.squeeze(0).squeeze(0).detach().cpu().numpy(),
-                    title=(
-                        f"{scenario_item['name']} | lambda={result['lambda']:.3e} | "
-                        f"coeff_RES={result['coeff_res']:.6f}"
-                    ),
-                    save_path=output_dir / f"{output_prefix}_{scenario_item['name']}.png",
+                    estimates=estimates_for_plot,
+                    title=f"{scenario_item['name']} | alpha{len(records)} regularized init comparison",
+                    save_path=output_dir / f"{output_prefix}_{scenario_item['name']}_comparison.png",
                 )
 
     json_path = output_dir / f"{output_prefix}_results.json"
@@ -443,6 +563,7 @@ def evaluate(
             "data_source": str(data_source),
             "num_trials": int(num_trials),
             "image_size": int(IMAGE_SIZE),
+            "methods": methods,
         },
         "alpha_records": records,
         "results": results,
@@ -455,9 +576,9 @@ def evaluate(
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run pure stacked Tikhonov for alpha condition-constrained sampling.")
+    parser = argparse.ArgumentParser(description="Compare Tikhonov, L2/L1 ADMM, L1/L1 ADMM, and L2/TV ADMM alpha initializations.")
     parser.add_argument("--alpha-json", type=str, default=DEFAULT_ALPHA_JSON)
-    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--top-k", type=int, default=16)
     parser.add_argument("--per-bucket-keep", type=int, default=10)
     parser.add_argument("--beam-size", type=int, default=80)
     parser.add_argument("--lambda-uniform", type=float, default=0.25)

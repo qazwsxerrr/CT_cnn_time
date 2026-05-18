@@ -9,10 +9,16 @@ import sys
 
 import torch
 
+try:
+    from initialization_methods import INIT_METHOD_CHOICES, normalize_init_method
+except ImportError:  # pragma: no cover - supports package-style imports.
+    from models.initialization_methods import INIT_METHOD_CHOICES, normalize_init_method
+
 # Paths
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_CODE_DIR = os.path.join(PROJECT_ROOT, "models")
-MODEL_DIR = os.path.join(PROJECT_ROOT, "checkpoints", "deep_learn")
+CHECKPOINT_ROOT = os.path.join(PROJECT_ROOT, "checkpoints")
+LEGACY_MODEL_DIR = os.path.join(CHECKPOINT_ROOT, "deep_learn")
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 
@@ -203,6 +209,11 @@ DATA_CONFIG = {
     "data_fidelity_mode": "standard",
     "irls_eps_factor": 3.0e-03,
     "irls_detach_weights": True,
+    "l1_init_admm_iters": 80,
+    "l1_init_admm_cg_iters": 30,
+    "l1_init_admm_cg_tol": 1.0e-4,
+    "l1_init_admm_rho_data": 1.0,
+    "l1_init_admm_rho_reg": 1.0,
     "detach_physical_grads": False,
     "learned_reg_lambda_init": 1.0e-02,
     "learned_step_init": 2.0e-03,
@@ -236,6 +247,11 @@ _apply_string_override(DATA_CONFIG, "morozov_cache_dir", "MOROZOV_CACHE_DIR_OVER
 _apply_string_override(DATA_CONFIG, "alpha_gram_cache_dir", "ALPHA_GRAM_CACHE_DIR_OVERRIDE")
 _apply_string_override(DATA_CONFIG, "data_fidelity_mode", "DATA_FIDELITY_MODE_OVERRIDE", allowed_values={"standard", "irls"})
 _apply_bool_override(DATA_CONFIG, "detach_physical_grads", "DETACH_PHYSICAL_GRADS_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "l1_init_admm_iters", "L1_INIT_ADMM_ITERS_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "l1_init_admm_cg_iters", "L1_INIT_ADMM_CG_ITERS_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "l1_init_admm_cg_tol", "L1_INIT_ADMM_CG_TOL_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "l1_init_admm_rho_data", "L1_INIT_ADMM_RHO_DATA_OVERRIDE")
+_apply_float_override(DATA_CONFIG, "l1_init_admm_rho_reg", "L1_INIT_ADMM_RHO_REG_OVERRIDE")
 _apply_bool_override(DATA_CONFIG, "intermediate_supervision_enabled", "INTERMEDIATE_SUPERVISION_ENABLED_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "intermediate_supervision_weight_start", "INTERMEDIATE_SUPERVISION_WEIGHT_START_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "intermediate_supervision_weight_end", "INTERMEDIATE_SUPERVISION_WEIGHT_END_OVERRIDE")
@@ -371,7 +387,11 @@ if _m_override is not None:
             raise ValueError(f"Invalid NUM_DETECTOR_SAMPLES_OVERRIDE={_m_override!r}; expected an integer.") from e
 
 _apply_string_override(TIME_DOMAIN_CONFIG, "operator_mode", "OPERATOR_MODE_OVERRIDE", allowed_values={"theoretical_b1b1"})
-_apply_string_override(TIME_DOMAIN_CONFIG, "init_method", "INIT_METHOD_OVERRIDE", allowed_values={"cg", "tikhonov_direct"})
+_init_method_override = _get_env_override("INIT_METHOD_OVERRIDE")
+if _init_method_override is not None:
+    TIME_DOMAIN_CONFIG["init_method"] = normalize_init_method(_init_method_override)
+elif TIME_DOMAIN_CONFIG.get("init_method"):
+    TIME_DOMAIN_CONFIG["init_method"] = normalize_init_method(str(TIME_DOMAIN_CONFIG["init_method"]))
 _apply_string_override(TIME_DOMAIN_CONFIG, "multi_angle_solver_mode", "MULTI_ANGLE_SOLVER_MODE_OVERRIDE", allowed_values={"stacked_tikhonov"})
 _apply_string_override(TIME_DOMAIN_CONFIG, "theoretical_formula_mode", "THEORETICAL_FORMULA_MODE_OVERRIDE", allowed_values={"alpha_continuous"})
 _apply_bool_override(TIME_DOMAIN_CONFIG, "cnn_backbone_only", "CNN_BACKBONE_ONLY_OVERRIDE")
@@ -408,6 +428,8 @@ _default_profile_tag = {
     "runtime_alpha": "runtime_alpha",
 }.get(str(TIME_DOMAIN_CONFIG.get("experiment_profile", "default")).strip().lower(), "")
 EXPERIMENT_OUTPUT_TAG = str(os.environ.get("OUTPUT_TAG_OVERRIDE", "") or _default_profile_tag).strip()
+_model_dir_name = str(os.environ.get("MODEL_DIR_NAME_OVERRIDE", "") or EXPERIMENT_OUTPUT_TAG or "deep_learn").strip()
+MODEL_DIR = os.path.join(CHECKPOINT_ROOT, _model_dir_name)
 _model_stem = "theoretical_ct"
 if EXPERIMENT_OUTPUT_TAG:
     _model_stem = f"{_model_stem}_{EXPERIMENT_OUTPUT_TAG}"
