@@ -1527,13 +1527,18 @@ class TheoreticalDataGenerator:
             norm_type = "l2"
         else:
             raise ValueError(f"Constrained Morozov initialization is only supported for 'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}.")
-        radius = self._morozov_noise_radius(g_obs, g_clean, norm_type=norm_type)
+        del g_clean  # Clean/noiseless data must not enter Morozov radius selection.
+        radius_base, radius_source = self._estimate_morozov_noise_norm_from_observed(g_obs, norm_type=norm_type)
+        radius = radius_base * float(DATA_CONFIG.get("morozov_tau", 1.0))
         info = {
             "mode": "morozov_constrained_radius",
             "method": method,
             "residual_norm": norm_type,
             "target_norm": [float(v) for v in radius.detach().cpu().view(-1).tolist()],
             "constraint_radius": [float(v) for v in radius.detach().cpu().view(-1).tolist()],
+            "noise_radius_source": radius_source,
+            "noise_mode": str(self.noise_mode),
+            "noise_level": float(self.noise_level),
         }
         coeff = self.solve_constrained_init(g_obs, noise_radius=radius, init_method=method)
         stats = dict(getattr(self.time_operator, "last_split_admm_stats", None) or {})
@@ -1610,21 +1615,95 @@ class TheoreticalDataGenerator:
         raise ValueError(f"Unsupported residual norm_type={norm_type!r}; expected 'l1' or 'l2'.")
 
     @torch.no_grad()
-    def _morozov_noise_radius(self, g_observed: torch.Tensor, g_clean: torch.Tensor, *, norm_type: str) -> torch.Tensor:
+    def _observed_data_norm(self, g_observed: torch.Tensor, *, norm_type: str) -> torch.Tensor:
         if g_observed.dim() == 1:
             g_observed = g_observed.unsqueeze(0)
-        if g_clean.dim() == 1:
-            g_clean = g_clean.unsqueeze(0)
         g_observed = g_observed.to(device=device, dtype=torch.float32)
-        g_clean = g_clean.to(device=g_observed.device, dtype=torch.float32)
-        noise = g_observed - g_clean
         norm_type = str(norm_type).strip().lower()
         if norm_type == "l1":
-            radius = torch.sum(torch.abs(noise), dim=-1)
-        elif norm_type == "l2":
-            radius = torch.norm(noise, dim=-1)
-        else:
-            raise ValueError(f"Unsupported norm_type={norm_type!r}; expected 'l1' or 'l2'.")
+            return torch.sum(torch.abs(g_observed), dim=-1)
+        if norm_type == "l2":
+            return torch.norm(g_observed, dim=-1)
+        raise ValueError(f"Unsupported norm_type={norm_type!r}; expected 'l1' or 'l2'.")
+
+    @torch.no_grad()
+    def _estimate_morozov_noise_norm_from_observed(self, g_observed: torch.Tensor, *, norm_type: str) -> tuple[torch.Tensor, str]:
+        """Estimate Morozov noise size from observed data only.
+
+        For multiplicative noise
+
+            g_delta_i = g_i * (1 + alpha * xi_i),  xi_i in [-1, 1],
+
+        the clean datum ``g`` is unknown at reconstruction time.  Two observed
+        data-only modes are supported:
+
+        * ``rms`` (default): use the second moment of xi ~ U(-1, 1),
+
+              ||noise|| ~= alpha / sqrt(3 + alpha^2) * ||g_delta||.
+
+        * ``conservative``: use the deterministic upper bound
+
+              ||noise|| <= alpha / (1 - alpha) * ||g_delta||.
+
+        Neither mode uses ``g_clean`` as reconstruction-time input.
+        """
+        if g_observed.dim() == 1:
+            g_observed = g_observed.unsqueeze(0)
+        g_observed = g_observed.to(device=device, dtype=torch.float32)
+        mode = str(self.noise_mode).strip().lower()
+        norm_type = str(norm_type).strip().lower()
+        if mode == "multiplicative":
+            alpha = float(self.noise_level)
+            if alpha < 0.0:
+                raise ValueError(f"multiplicative noise_level must be non-negative, got {alpha!r}.")
+            radius_mode = str(DATA_CONFIG.get("morozov_noise_radius_mode", "rms")).strip().lower()
+            if radius_mode == "rms":
+                scale = alpha / math.sqrt(3.0 + alpha * alpha)
+                return scale * self._observed_data_norm(g_observed, norm_type=norm_type), "observed_multiplicative_rms"
+            if radius_mode == "conservative":
+                if alpha >= 1.0:
+                    raise ValueError(
+                        "Conservative observed-data Morozov bound for multiplicative noise requires noise_level < 1. "
+                        f"Got noise_level={alpha!r}."
+                    )
+                scale = alpha / max(1.0 - alpha, 1.0e-12)
+                return scale * self._observed_data_norm(g_observed, norm_type=norm_type), "observed_multiplicative_conservative"
+            raise ValueError(
+                f"Unsupported morozov_noise_radius_mode={radius_mode!r}; expected 'rms' or 'conservative'."
+            )
+        if mode == "snr":
+            radius_mode = str(DATA_CONFIG.get("morozov_noise_radius_mode", "rms")).strip().lower()
+            epsilon = 10.0 ** (-float(self.target_snr_db) / 20.0)
+            if radius_mode == "rms":
+                return epsilon * self._observed_data_norm(g_observed, norm_type=norm_type), "observed_snr_rms"
+            if radius_mode == "conservative":
+                if epsilon >= 1.0:
+                    raise ValueError(
+                        "Conservative observed-data Morozov bound for SNR noise requires target_snr_db > 0. "
+                        f"Got target_snr_db={float(self.target_snr_db)!r}."
+                    )
+                scale = epsilon / max(1.0 - epsilon, 1.0e-12)
+                return scale * self._observed_data_norm(g_observed, norm_type=norm_type), "observed_snr_conservative"
+            raise ValueError(
+                f"Unsupported morozov_noise_radius_mode={radius_mode!r}; expected 'rms' or 'conservative'."
+            )
+        if mode == "additive":
+            sigma = max(float(self.noise_level), 0.0)
+            batch = int(g_observed.shape[0])
+            m = max(int(g_observed.shape[-1]), 1)
+            if norm_type == "l2":
+                value = sigma * math.sqrt(float(m))
+            elif norm_type == "l1":
+                value = sigma * float(m) * math.sqrt(2.0 / math.pi)
+            else:
+                raise ValueError(f"Unsupported norm_type={norm_type!r}; expected 'l1' or 'l2'.")
+            return torch.full((batch,), float(value), dtype=torch.float32, device=g_observed.device), "known_additive_expected"
+        raise ValueError(f"Unsupported noise_mode={mode!r}; expected 'additive', 'multiplicative', or 'snr'.")
+
+    @torch.no_grad()
+    def _morozov_noise_radius(self, g_observed: torch.Tensor, g_clean: torch.Tensor, *, norm_type: str) -> torch.Tensor:
+        del g_clean  # Clean/noiseless data must not enter Morozov parameter selection.
+        radius, _ = self._estimate_morozov_noise_norm_from_observed(g_observed, norm_type=norm_type)
         return radius * float(DATA_CONFIG.get("morozov_tau", 1.0))
 
     @torch.no_grad()
@@ -1636,21 +1715,17 @@ class TheoreticalDataGenerator:
         init_method: str,
         residual_norm: str,
     ) -> torch.Tensor:
+        del g_clean  # Clean/noiseless data must not enter Morozov parameter selection.
         if g_observed.dim() == 1:
             g_observed = g_observed.unsqueeze(0)
-        if g_clean.dim() == 1:
-            g_clean = g_clean.unsqueeze(0)
         g_observed = g_observed.to(device=device, dtype=torch.float32)
-        g_clean = g_clean.to(device=g_observed.device, dtype=torch.float32)
         batch = int(g_observed.shape[0])
         residual_norm = str(residual_norm).strip().lower()
-        noise = g_observed - g_clean
-        if residual_norm == "l1":
-            target = torch.sum(torch.abs(noise), dim=-1) * float(DATA_CONFIG.get("morozov_tau", 1.0))
-        elif residual_norm == "l2":
-            target = torch.norm(noise, dim=-1) * float(DATA_CONFIG.get("morozov_tau", 1.0))
-        else:
-            raise ValueError(f"Unsupported residual_norm={residual_norm!r}; expected 'l1' or 'l2'.")
+        noise_norm, noise_radius_source = self._estimate_morozov_noise_norm_from_observed(
+            g_observed,
+            norm_type=residual_norm,
+        )
+        target = noise_norm * float(DATA_CONFIG.get("morozov_tau", 1.0))
 
         lam_min = max(float(DATA_CONFIG.get("morozov_lambda_min", 1.0e-12)), 1.0e-30)
         configured_lam_max = max(float(DATA_CONFIG.get("morozov_lambda_max", 1.0e12)), lam_min * 10.0)
@@ -1747,6 +1822,9 @@ class TheoreticalDataGenerator:
             "lambda_raw_max": [float(v) * float(max(measurement_count, 1)) if lambda_scale == "normalized_by_measurements" else float(v) for v in lambda_max_values],
             "max_iter": int(max_iter),
             "target_norm": [float(v) for v in target.detach().cpu().view(-1).tolist()],
+            "noise_radius_source": noise_radius_source,
+            "noise_mode": str(self.noise_mode),
+            "noise_level": float(self.noise_level),
             "residual_norm_value": final_residuals,
             "status": statuses,
         }
@@ -1795,7 +1873,8 @@ class TheoreticalDataGenerator:
                     init_method=method,
                     residual_norm=norm_type,
                 )
-            noise_norm = torch.norm(g_observed - g_clean, dim=-1)
+            del g_clean  # Clean/noiseless data must not enter Morozov parameter selection.
+            noise_norm, noise_radius_source = self._estimate_morozov_noise_norm_from_observed(g_observed, norm_type="l2")
             lam = self.time_operator.choose_lambda_morozov(
                 g_observed,
                 noise_norm=noise_norm,
@@ -1808,7 +1887,10 @@ class TheoreticalDataGenerator:
                 "mode": "morozov_spectral",
                 "method": method,
                 "residual_norm": "l2",
-                "target_norm": [float(v) for v in noise_norm.detach().cpu().view(-1).tolist()],
+                "target_norm": [float(v) for v in (noise_norm * float(DATA_CONFIG.get("morozov_tau", 1.0))).detach().cpu().view(-1).tolist()],
+                "noise_radius_source": noise_radius_source,
+                "noise_mode": str(self.noise_mode),
+                "noise_level": float(self.noise_level),
             }
             return lam
         return float(DATA_CONFIG.get("lambda_reg", 1e-2))

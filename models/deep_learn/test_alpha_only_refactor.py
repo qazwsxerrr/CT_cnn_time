@@ -436,6 +436,128 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             TIME_DOMAIN_CONFIG.clear()
             TIME_DOMAIN_CONFIG.update(time_backup)
 
+    def test_morozov_lambda_uses_observed_multiplicative_noise_bound_not_clean_data(self):
+        from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
+        from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
+
+        data_backup = dict(DATA_CONFIG)
+        time_backup = dict(TIME_DOMAIN_CONFIG)
+        try:
+            DATA_CONFIG.update(
+                {
+                    "lambda_select_mode": "morozov",
+                    "noise_mode": "multiplicative",
+                    "noise_level": 0.1,
+                    "morozov_noise_radius_mode": "rms",
+                    "morozov_tau": 1.0,
+                    "morozov_max_iter": 1,
+                    "l1_init_admm_iters": 2,
+                    "l1_init_admm_cg_iters": 2,
+                    "l1_init_admm_cg_tol": 1.0e-4,
+                }
+            )
+            TIME_DOMAIN_CONFIG.update(
+                {
+                    "experiment_profile": "runtime_alpha",
+                    "operator_mode": "theoretical_b1b1",
+                    "use_multi_angle": True,
+                    "alpha_values": [0.23, 1.11],
+                    "alpha_tau_offsets": [0.15, 0.35],
+                    "num_angles_total": 2,
+                    "num_angles": 2,
+                    "theoretical_formula_mode": "alpha_continuous",
+                    "data_formula_mode": "auto_complete",
+                }
+            )
+            op = AlphaContinuousB1B1Operator2D(
+                alpha_values=[0.23, 1.11],
+                height=4,
+                width=4,
+                tau_offsets=[0.15, 0.35],
+            ).to(device)
+            generator = TheoreticalDataGenerator(img_size=4, data_source="shepp_logan", time_operator=op)
+            g_observed = torch.linspace(0.2, 1.1, steps=op.M, dtype=torch.float32, device=device).view(1, -1)
+            g_clean_a = torch.zeros_like(g_observed)
+            g_clean_b = 10.0 * g_observed
+
+            expected_l2 = (0.1 / (3.0 + 0.1 * 0.1) ** 0.5) * torch.norm(g_observed, dim=-1)
+            lam_a = generator.select_lambda_for_init_method(g_observed, g_clean_a, init_method="tikhonov_direct")
+            info_a = dict(generator.last_lambda_info)
+            lam_b = generator.select_lambda_for_init_method(g_observed, g_clean_b, init_method="tikhonov_direct")
+            info_b = dict(generator.last_lambda_info)
+
+            self.assertTrue(torch.allclose(lam_a, lam_b, atol=1.0e-7, rtol=1.0e-6))
+            self.assertAlmostEqual(float(info_a["target_norm"][0]), float(expected_l2[0].item()), places=6)
+            self.assertEqual(info_a["target_norm"], info_b["target_norm"])
+            self.assertEqual(info_a["noise_radius_source"], "observed_multiplicative_rms")
+
+            expected_l1 = (0.1 / (3.0 + 0.1 * 0.1) ** 0.5) * torch.sum(torch.abs(g_observed), dim=-1)
+            lam_l1_a = generator.select_lambda_for_init_method(g_observed, g_clean_a, init_method="l1_l1_admm")
+            info_l1_a = dict(generator.last_lambda_info)
+            lam_l1_b = generator.select_lambda_for_init_method(g_observed, g_clean_b, init_method="l1_l1_admm")
+            info_l1_b = dict(generator.last_lambda_info)
+
+            self.assertTrue(torch.allclose(lam_l1_a, lam_l1_b, atol=1.0e-7, rtol=1.0e-6))
+            self.assertAlmostEqual(float(info_l1_a["target_norm"][0]), float(expected_l1[0].item()), places=6)
+            self.assertEqual(info_l1_a["target_norm"], info_l1_b["target_norm"])
+            self.assertEqual(info_l1_a["noise_radius_source"], "observed_multiplicative_rms")
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
+            TIME_DOMAIN_CONFIG.clear()
+            TIME_DOMAIN_CONFIG.update(time_backup)
+
+    def test_morozov_noise_radius_mode_can_use_conservative_bound(self):
+        from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
+        from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
+
+        data_backup = dict(DATA_CONFIG)
+        time_backup = dict(TIME_DOMAIN_CONFIG)
+        try:
+            DATA_CONFIG.update(
+                {
+                    "lambda_select_mode": "morozov",
+                    "noise_mode": "multiplicative",
+                    "noise_level": 0.1,
+                    "morozov_noise_radius_mode": "conservative",
+                    "morozov_tau": 1.0,
+                    "morozov_max_iter": 1,
+                }
+            )
+            TIME_DOMAIN_CONFIG.update(
+                {
+                    "experiment_profile": "runtime_alpha",
+                    "operator_mode": "theoretical_b1b1",
+                    "use_multi_angle": True,
+                    "alpha_values": [0.23, 1.11],
+                    "alpha_tau_offsets": [0.15, 0.35],
+                    "num_angles_total": 2,
+                    "num_angles": 2,
+                    "theoretical_formula_mode": "alpha_continuous",
+                    "data_formula_mode": "auto_complete",
+                }
+            )
+            op = AlphaContinuousB1B1Operator2D(
+                alpha_values=[0.23, 1.11],
+                height=4,
+                width=4,
+                tau_offsets=[0.15, 0.35],
+            ).to(device)
+            generator = TheoreticalDataGenerator(img_size=4, data_source="shepp_logan", time_operator=op)
+            g_observed = torch.linspace(0.2, 1.1, steps=op.M, dtype=torch.float32, device=device).view(1, -1)
+            expected_l2 = (0.1 / 0.9) * torch.norm(g_observed, dim=-1)
+
+            _ = generator.select_lambda_for_init_method(g_observed, torch.zeros_like(g_observed), init_method="tikhonov_direct")
+            info = dict(generator.last_lambda_info)
+
+            self.assertAlmostEqual(float(info["target_norm"][0]), float(expected_l2[0].item()), places=6)
+            self.assertEqual(info["noise_radius_source"], "observed_multiplicative_conservative")
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
+            TIME_DOMAIN_CONFIG.clear()
+            TIME_DOMAIN_CONFIG.update(time_backup)
+
     def test_morozov_constrained_l1_initializers_enforce_residual_balls(self):
         from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
         from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator

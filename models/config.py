@@ -197,6 +197,7 @@ DATA_CONFIG = {
     "morozov_lambda_max": 1.0e12,
     "morozov_newton_tol": 1.0e-10,
     "morozov_initial_lambda": 1.0,
+    "morozov_noise_radius_mode": "rms",
     "morozov_cache_dir": os.path.join(DATA_DIR, "morozov_cache"),
     "alpha_gram_cache_dir": os.path.join(DATA_DIR, "alpha_gram_cache"),
     "morozov_cg_iters": 12,
@@ -243,6 +244,7 @@ _apply_float_override(DATA_CONFIG, "morozov_lambda_min", "MOROZOV_LAMBDA_MIN_OVE
 _apply_float_override(DATA_CONFIG, "morozov_lambda_max", "MOROZOV_LAMBDA_MAX_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "morozov_newton_tol", "MOROZOV_NEWTON_TOL_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "morozov_initial_lambda", "MOROZOV_INITIAL_LAMBDA_OVERRIDE")
+_apply_string_override(DATA_CONFIG, "morozov_noise_radius_mode", "MOROZOV_NOISE_RADIUS_MODE_OVERRIDE", allowed_values={"rms", "conservative"})
 _apply_string_override(DATA_CONFIG, "morozov_cache_dir", "MOROZOV_CACHE_DIR_OVERRIDE")
 _apply_string_override(DATA_CONFIG, "alpha_gram_cache_dir", "ALPHA_GRAM_CACHE_DIR_OVERRIDE")
 _apply_string_override(DATA_CONFIG, "data_fidelity_mode", "DATA_FIDELITY_MODE_OVERRIDE", allowed_values={"standard", "irls"})
