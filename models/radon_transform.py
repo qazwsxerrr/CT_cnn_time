@@ -1514,7 +1514,6 @@ class TheoreticalDataGenerator:
     def solve_morozov_constrained_init(
         self,
         g_obs: torch.Tensor,
-        g_clean: torch.Tensor,
         *,
         init_method: Optional[str] = None,
     ) -> torch.Tensor:
@@ -1527,7 +1526,6 @@ class TheoreticalDataGenerator:
             norm_type = "l2"
         else:
             raise ValueError(f"Constrained Morozov initialization is only supported for 'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}.")
-        del g_clean  # Clean/noiseless data must not enter Morozov radius selection.
         radius_base, radius_source = self._estimate_morozov_noise_norm_from_observed(g_obs, norm_type=norm_type)
         radius = radius_base * float(DATA_CONFIG.get("morozov_tau", 1.0))
         info = {
@@ -1701,8 +1699,7 @@ class TheoreticalDataGenerator:
         raise ValueError(f"Unsupported noise_mode={mode!r}; expected 'additive', 'multiplicative', or 'snr'.")
 
     @torch.no_grad()
-    def _morozov_noise_radius(self, g_observed: torch.Tensor, g_clean: torch.Tensor, *, norm_type: str) -> torch.Tensor:
-        del g_clean  # Clean/noiseless data must not enter Morozov parameter selection.
+    def _morozov_noise_radius(self, g_observed: torch.Tensor, *, norm_type: str) -> torch.Tensor:
         radius, _ = self._estimate_morozov_noise_norm_from_observed(g_observed, norm_type=norm_type)
         return radius * float(DATA_CONFIG.get("morozov_tau", 1.0))
 
@@ -1710,12 +1707,10 @@ class TheoreticalDataGenerator:
     def _choose_lambda_morozov_iterative(
         self,
         g_observed: torch.Tensor,
-        g_clean: torch.Tensor,
         *,
         init_method: str,
         residual_norm: str,
     ) -> torch.Tensor:
-        del g_clean  # Clean/noiseless data must not enter Morozov parameter selection.
         if g_observed.dim() == 1:
             g_observed = g_observed.unsqueeze(0)
         g_observed = g_observed.to(device=device, dtype=torch.float32)
@@ -1833,7 +1828,6 @@ class TheoreticalDataGenerator:
     def select_lambda_for_init_method(
         self,
         g_observed: torch.Tensor,
-        g_clean: torch.Tensor,
         *,
         init_method: Optional[str] = None,
         lambda_reg: float | torch.Tensor = None,
@@ -1869,11 +1863,9 @@ class TheoreticalDataGenerator:
                 norm_type = "l1" if method == "l1_l1_admm" else "l2"
                 return self._choose_lambda_morozov_iterative(
                     g_observed,
-                    g_clean,
                     init_method=method,
                     residual_norm=norm_type,
                 )
-            del g_clean  # Clean/noiseless data must not enter Morozov parameter selection.
             noise_norm, noise_radius_source = self._estimate_morozov_noise_norm_from_observed(g_observed, norm_type="l2")
             lam = self.time_operator.choose_lambda_morozov(
                 g_observed,
@@ -1895,8 +1887,8 @@ class TheoreticalDataGenerator:
             return lam
         return float(DATA_CONFIG.get("lambda_reg", 1e-2))
 
-    def _select_lambda(self, g_observed: torch.Tensor, g_clean: torch.Tensor, lambda_reg: float | torch.Tensor = None) -> float | torch.Tensor:
-        return self.select_lambda_for_init_method(g_observed, g_clean, init_method=None, lambda_reg=lambda_reg)
+    def _select_lambda(self, g_observed: torch.Tensor, lambda_reg: float | torch.Tensor = None) -> float | torch.Tensor:
+        return self.select_lambda_for_init_method(g_observed, init_method=None, lambda_reg=lambda_reg)
 
     def generate_training_sample(self, random_seed=None, lambda_reg: float | torch.Tensor = None):
         if random_seed is not None:
@@ -1907,7 +1899,7 @@ class TheoreticalDataGenerator:
         with torch.no_grad():
             g_clean = self.data_forward_operator(coeff_true).to(torch.float32)
             g_observed = self._apply_noise(g_clean)
-            lambda_eff = self._select_lambda(g_observed, g_clean, lambda_reg=lambda_reg)
+            lambda_eff = self._select_lambda(g_observed, lambda_reg=lambda_reg)
             self.last_lambda = lambda_eff
             init_method = normalize_init_method(str(TIME_DOMAIN_CONFIG.get("init_method", "cg")))
             if dict(self.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
@@ -1939,7 +1931,7 @@ class TheoreticalDataGenerator:
         with torch.no_grad():
             g_clean = self.data_forward_operator(coeff_true).to(torch.float32)
             g_observed = self._apply_noise(g_clean)
-        lambda_eff = self._select_lambda(g_observed, g_clean, lambda_reg=lambda_reg)
+        lambda_eff = self._select_lambda(g_observed, lambda_reg=lambda_reg)
         self.last_lambda = lambda_eff
         coeff_init_started = time.perf_counter()
         if dict(self.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":

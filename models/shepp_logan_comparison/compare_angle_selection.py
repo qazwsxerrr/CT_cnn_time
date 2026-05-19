@@ -276,7 +276,6 @@ def _solve_case(
     if constrained:
         coeff_est = generator.solve_morozov_constrained_init(
             observed,
-            g_clean,
             init_method=str(method["init_method"]),
         )
         lam = None
@@ -284,7 +283,6 @@ def _solve_case(
         lam_tensor = evalmod.choose_lambda(
             generator,
             observed,
-            g_clean,
             lambda_mode=lambda_mode,
             lambda_reg=float(lambda_reg),
             method=method,

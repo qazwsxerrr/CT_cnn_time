@@ -201,8 +201,8 @@ class CascadeBatchGenerator:
             g_observed = generator._apply_noise(g_clean)
         return g_clean, g_observed
 
-    def _stage1_initial(self, g_observed: torch.Tensor, g_clean: torch.Tensor):
-        lambda_eff = self.stage1_generator._select_lambda(g_observed, g_clean, lambda_reg=None)
+    def _stage1_initial(self, g_observed: torch.Tensor):
+        lambda_eff = self.stage1_generator._select_lambda(g_observed, lambda_reg=None)
         self.stage1_generator.last_lambda = lambda_eff
         return self.stage1_generator.solve_tikhonov_direct_init(g_observed, lambda_reg=lambda_eff)
 
@@ -215,7 +215,7 @@ class CascadeBatchGenerator:
         f_true = self.stage1_generator.image_gen(coeff_true)
         g16_clean, g16_observed = self._observed_pair(self.stage1_generator, coeff_true)
         _, g8_observed = self._observed_pair(self.stage2_generator, coeff_true)
-        coeff_initial16 = self._stage1_initial(g16_observed, g16_clean)
+        coeff_initial16 = self._stage1_initial(g16_observed)
         self.stage1_model.eval()
         with torch.no_grad():
             coeff_stage1, _, _ = self.stage1_model(

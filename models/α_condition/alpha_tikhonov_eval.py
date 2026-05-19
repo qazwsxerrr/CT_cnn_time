@@ -265,7 +265,6 @@ def build_observation(
 def choose_lambda(
     generator: TheoreticalDataGenerator,
     observed: torch.Tensor,
-    g_clean: torch.Tensor,
     *,
     lambda_mode: str,
     lambda_reg: float,
@@ -283,7 +282,6 @@ def choose_lambda(
         raise ValueError(f"Unsupported lambda_mode={lambda_mode!r}; expected 'morozov' or 'fixed'.")
     lam = generator.select_lambda_for_init_method(
         observed,
-        g_clean,
         init_method=str(method["init_method"]),
         lambda_reg=None,
     )
@@ -502,7 +500,6 @@ def evaluate(
                 lam = choose_lambda(
                     generator,
                     observed,
-                    g_clean,
                     lambda_mode=lambda_mode,
                     lambda_reg=float(lambda_reg),
                     method=method,
