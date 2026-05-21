@@ -100,7 +100,6 @@ def run_selected_angle_count_plots(
     noise_level: float,
     lambda_mode: str,
     lambda_reg: float,
-    morozov_form: str,
     phantom_seed: int,
     noise_seed: int,
     per_bucket_keep: int,
@@ -161,7 +160,6 @@ def run_selected_angle_count_plots(
                 method=method,
                 lambda_mode=lambda_mode,
                 lambda_reg=float(lambda_reg),
-                morozov_form=morozov_form,
                 noise_mode=noise_mode,
                 noise_level=float(noise_level),
                 noise_seed=int(noise_seed),
@@ -188,7 +186,6 @@ def run_selected_angle_count_plots(
             "noise_mode": str(noise_mode),
             "noise_level": float(noise_level),
             "lambda_mode": str(lambda_mode),
-            "morozov_form": str(morozov_form),
             "phantom_seed": int(phantom_seed),
             "noise_seed": int(noise_seed),
             "admm_iters": int(admm_iters),
@@ -239,7 +236,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--noise-level", type=float, default=0.1)
     parser.add_argument("--lambda-mode", type=str, default="morozov", choices=["morozov", "fixed"])
     parser.add_argument("--lambda-reg", type=float, default=1.0e-2)
-    parser.add_argument("--morozov-form", type=str, default="constrained", choices=["constrained", "regularized"])
     parser.add_argument("--phantom-seed", type=int, default=1234)
     parser.add_argument("--noise-seed", type=int, default=1234)
     parser.add_argument("--admm-iters", type=int, default=80)
@@ -267,7 +263,7 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     print(f"Using device: {device}", flush=True)
     print(f"angle_counts={angle_counts} methods={[item['name'] for item in methods]}", flush=True)
-    print(f"selected-only morozov_form={args.morozov_form} lambda_mode={args.lambda_mode} admm_iters={args.admm_iters}", flush=True)
+    print(f"selected-only lambda_mode={args.lambda_mode} admm_iters={args.admm_iters}", flush=True)
 
     run_selected_angle_count_plots(
         angle_counts=angle_counts,
@@ -278,7 +274,6 @@ def main(argv: Iterable[str] | None = None) -> None:
         noise_level=float(args.noise_level),
         lambda_mode=args.lambda_mode,
         lambda_reg=float(args.lambda_reg),
-        morozov_form=args.morozov_form,
         phantom_seed=int(args.phantom_seed),
         noise_seed=int(args.noise_seed),
         per_bucket_keep=int(args.per_bucket_keep),

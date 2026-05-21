@@ -296,11 +296,16 @@ def solve_method(
     method: dict[str, str],
 ) -> torch.Tensor:
     if dict(generator.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
-        return generator.solve_constrained_init(
+        coeff = generator.solve_constrained_init(
             observed,
             noise_radius=lambda_reg,
             init_method=str(method["init_method"]),
         )
+        info = dict(generator.last_lambda_info or {})
+        info["mode"] = "morozov_constrained"
+        info["solver_stats"] = dict(getattr(generator.time_operator, "last_split_admm_stats", None) or {})
+        generator.last_lambda_info = info
+        return coeff
     return generator.solve_regularized_init(
         observed,
         lambda_reg=lambda_reg,
@@ -326,10 +331,20 @@ def objective_value(
     lambda_info: dict[str, Any] | None = None,
 ) -> float:
     residual = generator.forward_operator(coeff_est) - observed.to(dtype=torch.float32, device=coeff_est.device)
-    if str((lambda_info or {}).get("mode", "")).startswith("morozov_constrained"):
-        return float(torch.sum(torch.abs(coeff_est)).item())
     lam = float(lambda_reg.view(-1)[0].item())
     objective = str(method["objective"])
+    info = dict(lambda_info or {})
+    if str(info.get("mode", "")).strip().lower() == "morozov_constrained":
+        if objective in {"l2_l1", "l1_l1"}:
+            return float(torch.sum(torch.abs(coeff_est)).item())
+        if objective == "l2_tv":
+            if hasattr(generator.time_operator, "anisotropic_tv_norm"):
+                return float(torch.sum(generator.time_operator.anisotropic_tv_norm(coeff_est)).item())
+            dx = coeff_est[:, :, :, 1:] - coeff_est[:, :, :, :-1]
+            dy = coeff_est[:, :, 1:, :] - coeff_est[:, :, :-1, :]
+            return float((torch.sum(torch.abs(dx)) + torch.sum(torch.abs(dy))).item())
+        if objective == "l2_l2":
+            return float((0.5 * torch.sum(coeff_est.square())).item())
     if objective == "l2_l2":
         return float((0.5 * torch.sum(residual.square()) + 0.5 * lam * torch.sum(coeff_est.square())).item())
     if objective == "l2_l1":
@@ -418,7 +433,7 @@ def _format_summary(results: list[dict[str, Any]], *, alpha_json: str, output_pr
         f"alpha_json: {alpha_json}",
         f"device: {device}",
         "",
-        "scenario | trial | method | lambda | constraint_radius | noise_l2 | noise_l1 | meas_l2 | meas_l1 | coeff_res | objective | solve_seconds",
+        "scenario | trial | method | morozov_form | lambda | constraint_radius | noise_l2 | noise_l1 | meas_l2 | meas_l1 | coeff_res | objective | solve_seconds",
     ]
     for item in results:
         lambda_value = item.get("lambda", None)
@@ -426,7 +441,8 @@ def _format_summary(results: list[dict[str, Any]], *, alpha_json: str, output_pr
         radius_value = item.get("constraint_radius", None)
         radius_text = "None" if radius_value is None else f"{float(radius_value):.6e}"
         lines.append(
-            f"{item['scenario']} | {item['trial']} | {item['method']} | {lambda_text} | {radius_text} | "
+            f"{item['scenario']} | {item['trial']} | {item['method']} | {item.get('morozov_form', 'regularized')} | "
+            f"{lambda_text} | {radius_text} | "
             f"{float(item['noise_l2']):.6e} | {float(item['noise_l1']):.6e} | "
             f"{float(item['measurement_l2']):.6e} | {float(item['measurement_l1']):.6e} | "
             f"{float(item['coeff_res']):.6e} | {float(item['objective_value']):.6e} | "
@@ -505,14 +521,13 @@ def evaluate(
                     method=method,
                 )
                 lambda_info = dict(generator.last_lambda_info or {})
-                constrained = str(lambda_info.get("mode", "")).startswith("morozov_constrained")
                 t1 = time.perf_counter()
                 coeff_est = solve_method(generator, observed, lambda_reg=lam, method=method)
-                solve_info = dict(generator.last_lambda_info or lambda_info)
-                if constrained:
-                    solve_info.update({"mode": "morozov_constrained", "solver_stats": dict(getattr(generator.time_operator, "last_split_admm_stats", None) or {})})
-                    generator.last_lambda_info = solve_info
                 t2 = time.perf_counter()
+                lambda_info_final = dict(generator.last_lambda_info or lambda_info)
+                is_constrained = str(lambda_info_final.get("mode", "")).strip().lower() == "morozov_constrained"
+                constraint_values = lambda_info_final.get("constraint_radius") or lambda_info_final.get("target_norm") or []
+                constraint_radius = float(constraint_values[0]) if is_constrained and constraint_values else None
                 norms = measurement_norms(generator, coeff_est, observed)
                 result = {
                     "scenario": str(scenario_item["name"]),
@@ -522,14 +537,15 @@ def evaluate(
                     "init_method": str(method["init_method"]),
                     "objective": str(method["objective"]),
                     "morozov_residual_norm": str(method["morozov_residual_norm"]),
-                    "lambda": None if constrained else float(lam.view(-1)[0].item()),
-                    "constraint_radius": float(lam.view(-1)[0].item()) if constrained else None,
-                    "lambda_info": dict(generator.last_lambda_info or lambda_info),
+                    "morozov_form": str(DATA_CONFIG.get("morozov_form", "regularized")),
+                    "lambda": None if is_constrained else float(lam.view(-1)[0].item()),
+                    "constraint_radius": constraint_radius,
+                    "lambda_info": lambda_info_final,
                     "noise_l2": float(noise_norm.view(-1)[0].item()),
                     "noise_l1": float(noise_l1.view(-1)[0].item()),
                     **norms,
                     "coeff_res": coeff_res(coeff_est.squeeze(0).squeeze(0), coeff_true.squeeze(0).squeeze(0)),
-                    "objective_value": objective_value(generator, coeff_est, observed, lambda_reg=lam, method=method, lambda_info=dict(generator.last_lambda_info or lambda_info)),
+                    "objective_value": objective_value(generator, coeff_est, observed, lambda_reg=lam, method=method, lambda_info=lambda_info_final),
                     "lambda_seconds": float(t1 - t0),
                     "solve_seconds": float(t2 - t1),
                     "num_angles": int(len(records)),

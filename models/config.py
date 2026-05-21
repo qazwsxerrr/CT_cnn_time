@@ -191,6 +191,7 @@ DATA_CONFIG = {
     "noise_level": 0.1,
     "target_snr_db": 30.0,
     "lambda_select_mode": "morozov",
+    "morozov_form": "regularized",
     "morozov_tau": 1.0,
     "morozov_max_iter": 8,
     "morozov_lambda_min": 1.0e-12,
@@ -238,6 +239,7 @@ _apply_string_override(DATA_CONFIG, "noise_mode", "NOISE_MODE_OVERRIDE", allowed
 _apply_float_override(DATA_CONFIG, "noise_level", "NOISE_LEVEL_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "target_snr_db", "TARGET_SNR_DB_OVERRIDE")
 _apply_string_override(DATA_CONFIG, "lambda_select_mode", "LAMBDA_SELECT_MODE_OVERRIDE", allowed_values={"fixed", "morozov"})
+_apply_string_override(DATA_CONFIG, "morozov_form", "MOROZOV_FORM_OVERRIDE", allowed_values={"regularized", "constrained"})
 _apply_float_override(DATA_CONFIG, "lambda_reg", "LAMBDA_REG_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "morozov_tau", "MOROZOV_TAU_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "morozov_lambda_min", "MOROZOV_LAMBDA_MIN_OVERRIDE")

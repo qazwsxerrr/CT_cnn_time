@@ -5,7 +5,7 @@ Default experiment matches the recent Shepp-Logan TV comparison:
 
 * condition-selected ``alpha_selected{k}.json`` versus random ``k`` angles;
 * multiplicative noise level ``0.1``;
-* constrained Morozov TV initialization;
+* Morozov lambda selection for TV initialization;
 * ADMM iterations ``80``;
 * configurable angle counts via ``--angle-counts``.
 
@@ -192,18 +192,26 @@ def _configure_runtime(
     )
 
 
-def _build_operator(*, alphas: list[float], tau_offsets: list[float] | None, height: int, width: int) -> AlphaContinuousB1B1Operator2D:
+def _build_operator(
+    *,
+    alphas: list[float],
+    tau_offsets: list[float] | None,
+    sampling_points_per_angle: list[list[float]] | None = None,
+    height: int,
+    width: int,
+) -> AlphaContinuousB1B1Operator2D:
     return AlphaContinuousB1B1Operator2D(
         alpha_values=[float(v) % math.pi for v in alphas],
         height=int(height),
         width=int(width),
         tau_offsets=None if tau_offsets is None else [float(v) for v in tau_offsets],
+        sampling_points_per_angle=sampling_points_per_angle,
     ).to(device)
 
 
 def _residual_ratio(result: dict[str, Any], *, method: dict[str, str], lambda_info: dict[str, Any]) -> float:
     norm_type = str(lambda_info.get("residual_norm") or method.get("morozov_residual_norm") or "l2").strip().lower()
-    target_values = lambda_info.get("target_norm") or lambda_info.get("constraint_radius") or []
+    target_values = lambda_info.get("target_norm") or []
     if isinstance(target_values, (int, float)):
         target = float(target_values)
     elif target_values:
@@ -220,11 +228,11 @@ def _solve_case(
     count: int,
     alphas: list[float],
     tau_offsets: list[float] | None,
+    sampling_points_per_angle: list[list[float]] | None = None,
     coeff_true: torch.Tensor,
     method: dict[str, str],
     lambda_mode: str,
     lambda_reg: float,
-    morozov_form: str,
     noise_mode: str,
     noise_level: float,
     noise_seed: int,
@@ -254,6 +262,7 @@ def _solve_case(
     op = _build_operator(
         alphas=alphas,
         tau_offsets=tau_offsets,
+        sampling_points_per_angle=sampling_points_per_angle,
         height=int(coeff_true.shape[-2]),
         width=int(coeff_true.shape[-1]),
     )
@@ -268,30 +277,21 @@ def _solve_case(
     noise_l1 = torch.sum(torch.abs(observed - g_clean), dim=-1)
 
     started = time.perf_counter()
-    constrained = (
-        str(lambda_mode).strip().lower() == "morozov"
-        and str(morozov_form).strip().lower() == "constrained"
-        and str(method["init_method"]) in {"l2_l1_admm", "l1_l1_admm", "l2_tv_admm"}
+    lam_tensor = evalmod.choose_lambda(
+        generator,
+        observed,
+        lambda_mode=lambda_mode,
+        lambda_reg=float(lambda_reg),
+        method=method,
     )
-    if constrained:
-        coeff_est = generator.solve_morozov_constrained_init(
-            observed,
-            init_method=str(method["init_method"]),
-        )
-        lam = None
-    else:
-        lam_tensor = evalmod.choose_lambda(
-            generator,
-            observed,
-            lambda_mode=lambda_mode,
-            lambda_reg=float(lambda_reg),
-            method=method,
-        )
-        coeff_est = evalmod.solve_method(generator, observed, lambda_reg=lam_tensor, method=method)
-        lam = float(lam_tensor.view(-1)[0].item()) if torch.is_tensor(lam_tensor) else float(lam_tensor)
+    coeff_est = evalmod.solve_method(generator, observed, lambda_reg=lam_tensor, method=method)
     solve_seconds = time.perf_counter() - started
 
     lambda_info = dict(generator.last_lambda_info or {})
+    lam = float(lam_tensor.view(-1)[0].item()) if torch.is_tensor(lam_tensor) else float(lam_tensor)
+    is_constrained = str(lambda_info.get("mode", "")).strip().lower() == "morozov_constrained"
+    constraint_values = lambda_info.get("constraint_radius") or lambda_info.get("target_norm") or []
+    constraint_radius = float(constraint_values[0]) if is_constrained and constraint_values else None
     norms = evalmod.measurement_norms(generator, coeff_est, observed)
     result = {
         "case": str(case_name),
@@ -300,10 +300,10 @@ def _solve_case(
         "method": str(method["name"]),
         "init_method": str(method["init_method"]),
         "objective": str(method["objective"]),
-        "morozov_form": "constrained" if constrained else "regularized",
         "lambda_mode": str(lambda_mode),
-        "lambda": lam,
-        "constraint_radius": None if not constrained else float((lambda_info.get("constraint_radius") or [0.0])[0]),
+        "morozov_form": str(DATA_CONFIG.get("morozov_form", "regularized")),
+        "lambda": None if is_constrained else lam,
+        "constraint_radius": constraint_radius,
         "lambda_info": lambda_info,
         "noise_mode": str(noise_mode),
         "noise_level": float(noise_level),
@@ -313,6 +313,7 @@ def _solve_case(
         "selected_source": selected_source,
         "alpha_values": [float(v) for v in alphas],
         "tau_offsets": None if tau_offsets is None else [float(v) for v in tau_offsets],
+        "sampling_mode": str(getattr(op, "sampling_mode", "shifted_lattice")),
         "noise_l2": float(noise_l2.view(-1)[0].item()),
         "noise_l1": float(noise_l1.view(-1)[0].item()),
         **norms,
@@ -390,8 +391,8 @@ def _format_summary(results: list[dict[str, Any]]) -> str:
         radius = item.get("constraint_radius")
         radius_text = "None" if radius is None else f"{float(radius):.6e}"
         lines.append(
-            f"{item['case']} | {item['num_angles']} | {item['method']} | {item['morozov_form']} | "
-            f"{lam_text} | {radius_text} | {float(item['residual_ratio']):.6f} | "
+            f"{item['case']} | {item['num_angles']} | {item['method']} | "
+            f"{item.get('morozov_form', 'regularized')} | {lam_text} | {radius_text} | {float(item['residual_ratio']):.6f} | "
             f"{float(item['measurement_l2']):.6e} | {float(item['measurement_l1']):.6e} | "
             f"{float(item['coeff_res']):.6e} | {float(item['tv_value']):.6e} | {float(item['solve_seconds']):.3f}"
         )
@@ -408,7 +409,6 @@ def run_comparison(
     noise_level: float,
     lambda_mode: str,
     lambda_reg: float,
-    morozov_form: str,
     phantom_seed: int,
     noise_seed: int,
     random_angle_seed: int,
@@ -471,7 +471,6 @@ def run_comparison(
                     method=method,
                     lambda_mode=lambda_mode,
                     lambda_reg=float(lambda_reg),
-                    morozov_form=morozov_form,
                     noise_mode=noise_mode,
                     noise_level=float(noise_level),
                     noise_seed=int(noise_seed),
@@ -497,7 +496,6 @@ def run_comparison(
             "noise_mode": str(noise_mode),
             "noise_level": float(noise_level),
             "lambda_mode": str(lambda_mode),
-            "morozov_form": str(morozov_form),
             "phantom_seed": int(phantom_seed),
             "noise_seed": int(noise_seed),
             "random_angle_seed": int(random_angle_seed),
@@ -555,13 +553,6 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--noise-level", type=float, default=0.1)
     parser.add_argument("--lambda-mode", type=str, default="morozov", choices=["morozov", "fixed"])
     parser.add_argument("--lambda-reg", type=float, default=1.0e-2)
-    parser.add_argument(
-        "--morozov-form",
-        type=str,
-        default="constrained",
-        choices=["constrained", "regularized"],
-        help="For split ADMM methods under Morozov, use constrained residual ball or regularized lambda search.",
-    )
     parser.add_argument("--phantom-seed", type=int, default=1234)
     parser.add_argument("--noise-seed", type=int, default=1234)
     parser.add_argument("--random-angle-seed", type=int, default=20260517)
@@ -590,7 +581,7 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     print(f"Using device: {device}", flush=True)
     print(f"angle_counts={angle_counts} methods={[item['name'] for item in methods]}", flush=True)
-    print(f"morozov_form={args.morozov_form} lambda_mode={args.lambda_mode} admm_iters={args.admm_iters}", flush=True)
+    print(f"lambda_mode={args.lambda_mode} admm_iters={args.admm_iters}", flush=True)
 
     run_comparison(
         angle_counts=angle_counts,
@@ -601,7 +592,6 @@ def main(argv: Iterable[str] | None = None) -> None:
         noise_level=float(args.noise_level),
         lambda_mode=args.lambda_mode,
         lambda_reg=float(args.lambda_reg),
-        morozov_form=args.morozov_form,
         phantom_seed=int(args.phantom_seed),
         noise_seed=int(args.noise_seed),
         random_angle_seed=int(args.random_angle_seed),

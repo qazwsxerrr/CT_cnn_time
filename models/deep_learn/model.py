@@ -119,7 +119,7 @@ class TheoreticalGradientDescent(nn.Module):
         eps = coeff_matrix.new_tensor(1e-6)
         grad_x, grad_y = self._forward_gradient(coeff_matrix)
         grad_norm = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + eps)
-        return self._divergence(grad_x / grad_norm, grad_y / grad_norm)
+        return -self._divergence(grad_x / grad_norm, grad_y / grad_norm)
 
     def _dirichlet_gradient(self, coeff_matrix):
         padded = F.pad(coeff_matrix, (1, 1, 1, 1), mode="replicate")

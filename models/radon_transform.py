@@ -13,6 +13,10 @@ The single-angle matrix is
 
     A_alpha_tau[i,j] = R_alpha phi(s_(i) + tau - s_(j)).
 
+Some comparison scripts may provide explicit per-angle sampling points t_i
+instead of the shifted-lattice rule; the matrix rows are then assembled from
+R_alpha phi(t_i - s_(j)) with the same sparse backend.
+
 Multiple angles are stacked vertically and solved with Tikhonov / Morozov.
 """
 
@@ -37,13 +41,13 @@ from image_generator import (
 try:
     from initialization_methods import (
         INIT_METHOD_CHOICES,
-        SPLIT_ADMM_INIT_METHODS,
+        MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS,
         normalize_init_method,
     )
 except ImportError:  # pragma: no cover - supports package-style imports.
     from models.initialization_methods import (
         INIT_METHOD_CHOICES,
-        SPLIT_ADMM_INIT_METHODS,
+        MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS,
         normalize_init_method,
     )
 from b_spline.b2b1_spline import (
@@ -398,19 +402,22 @@ def _alpha_projection_order(alpha: float, height: int, width: int, *, injective_
     }
 
 
-def _build_sparse_b1b1_block_from_continuous_proj(
+def _build_sparse_b1b1_block_from_sampling_points(
     *,
     sorted_proj: torch.Tensor,
     direction: torch.Tensor,
-    tau: float,
+    sampling_points: torch.Tensor,
     value_tol: float = 1.0e-15,
 ) -> dict[str, torch.Tensor]:
-    """Build the full sparse projection-order block for alpha-continuous sampling."""
+    """Build the full sparse projection-order block for arbitrary time samples."""
     sorted_proj = sorted_proj.detach().to(dtype=torch.float64, device="cpu")
     direction = direction.detach().to(dtype=torch.float64, device="cpu")
-    tau = float(tau)
+    sampling_points = sampling_points.detach().to(dtype=torch.float64, device="cpu").view(-1)
     proj_np = sorted_proj.numpy()
+    sample_np = sampling_points.numpy()
     n = int(proj_np.shape[0])
+    if int(sample_np.shape[0]) != n:
+        raise ValueError(f"sampling_points length={int(sample_np.shape[0])} but expected {n}.")
     support_lo, support_hi = phi_support_bounds_b1b1(direction)
     support_lo = float(support_lo)
     support_hi = float(support_hi)
@@ -422,7 +429,7 @@ def _build_sparse_b1b1_block_from_continuous_proj(
     upper_width = 0
 
     for row_idx in range(n):
-        t_i = float(proj_np[row_idx] + tau)
+        t_i = float(sample_np[row_idx])
         left = t_i - support_hi
         right = t_i - support_lo
         col0 = int(np.searchsorted(proj_np, left, side="left"))
@@ -453,7 +460,6 @@ def _build_sparse_b1b1_block_from_continuous_proj(
         cols_np = np.empty((0,), dtype=np.int64)
         vals_np = np.empty((0,), dtype=np.float64)
 
-    diag0 = float(radon_phi_b1b1(torch.tensor([tau], dtype=torch.float64), direction)[0].item())
     return {
         "sparse_rows": torch.from_numpy(rows_np),
         "sparse_cols": torch.from_numpy(cols_np),
@@ -461,10 +467,37 @@ def _build_sparse_b1b1_block_from_continuous_proj(
         "sparse_nnz": torch.tensor(int(vals_np.shape[0]), dtype=torch.int64),
         "lower_width": torch.tensor(int(lower_width), dtype=torch.int64),
         "upper_width": torch.tensor(int(upper_width), dtype=torch.int64),
-        "diag0": torch.tensor(float(diag0), dtype=torch.float64),
+        "diag0": torch.tensor(0.0, dtype=torch.float64),
         "support_lo": torch.tensor(float(support_lo), dtype=torch.float64),
         "support_hi": torch.tensor(float(support_hi), dtype=torch.float64),
     }
+
+
+def _build_sparse_b1b1_block_from_continuous_proj(
+    *,
+    sorted_proj: torch.Tensor,
+    direction: torch.Tensor,
+    tau: float,
+    value_tol: float = 1.0e-15,
+) -> dict[str, torch.Tensor]:
+    """Build the full sparse projection-order block for shifted-lattice sampling."""
+    sorted_proj = sorted_proj.detach().to(dtype=torch.float64, device="cpu")
+    direction = direction.detach().to(dtype=torch.float64, device="cpu")
+    tau = float(tau)
+    block = _build_sparse_b1b1_block_from_sampling_points(
+        sorted_proj=sorted_proj,
+        direction=direction,
+        sampling_points=sorted_proj + float(tau),
+        value_tol=float(value_tol),
+    )
+    diag0 = float(radon_phi_b1b1(torch.tensor([tau], dtype=torch.float64), direction)[0].item())
+    block["diag0"] = torch.tensor(float(diag0), dtype=torch.float64)
+    return block
+
+
+def _sampling_points_digest(sampling_points: torch.Tensor) -> str:
+    values = sampling_points.detach().to(dtype=torch.float64, device="cpu").contiguous().numpy()
+    return hashlib.sha256(values.tobytes()).hexdigest()
 
 
 class AlphaContinuousB1B1Operator2D(torch.nn.Module):
@@ -476,6 +509,7 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         height: int = IMAGE_SIZE,
         width: int = IMAGE_SIZE,
         tau_offsets=None,
+        sampling_points_per_angle=None,
         t0: float = 0.5,
         injective_tol: float = 1.0e-12,
     ):
@@ -498,6 +532,8 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "alpha_gram_cache"),
             )
         )
+        if tau_offsets is not None and sampling_points_per_angle is not None:
+            raise ValueError("Specify either tau_offsets or sampling_points_per_angle, not both.")
         if tau_offsets is None:
             tau_list = None
         else:
@@ -505,6 +541,25 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             if len(tau_list) != self.num_angles:
                 raise ValueError(f"tau_offsets length={len(tau_list)} but num_angles={self.num_angles}.")
         self.tau_offsets = tau_list
+        if sampling_points_per_angle is None:
+            sampling_points_list_input = None
+            self.sampling_mode = "shifted_lattice"
+        else:
+            sampling_points_list_input = []
+            for angle_idx, values in enumerate(list(sampling_points_per_angle)):
+                tensor = torch.as_tensor(values, dtype=torch.float64).view(-1)
+                if int(tensor.numel()) != self.N:
+                    raise ValueError(
+                        f"sampling_points_per_angle[{angle_idx}] length={int(tensor.numel())} "
+                        f"but expected height*width={self.N}."
+                    )
+                sampling_points_list_input.append(tensor)
+            if len(sampling_points_list_input) != self.num_angles:
+                raise ValueError(
+                    f"sampling_points_per_angle length={len(sampling_points_list_input)} "
+                    f"but num_angles={self.num_angles}."
+                )
+            self.sampling_mode = "custom_points"
 
         with torch.no_grad():
             directions = []
@@ -522,18 +577,32 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
                 info = _alpha_projection_order(alpha, self.height, self.width, injective_tol=float(injective_tol))
                 direction = info["direction"]
                 support_lo, support_hi = phi_support_bounds_b1b1(direction)
-                tau = float(support_lo) + float(t0) * (float(support_hi) - float(support_lo)) if tau_list is None else float(tau_list[angle_idx])
-                block = _build_sparse_b1b1_block_from_continuous_proj(sorted_proj=info["sorted_proj"], direction=direction, tau=tau)
+                if sampling_points_list_input is None:
+                    tau = float(support_lo) + float(t0) * (float(support_hi) - float(support_lo)) if tau_list is None else float(tau_list[angle_idx])
+                    sampling_points = info["sorted_proj"] + float(tau)
+                    block = _build_sparse_b1b1_block_from_continuous_proj(
+                        sorted_proj=info["sorted_proj"],
+                        direction=direction,
+                        tau=tau,
+                    )
+                else:
+                    tau = float("nan")
+                    sampling_points = sampling_points_list_input[angle_idx]
+                    block = _build_sparse_b1b1_block_from_sampling_points(
+                        sorted_proj=info["sorted_proj"],
+                        direction=direction,
+                        sampling_points=sampling_points,
+                    )
                 directions.append(direction)
                 sorted_proj_list.append(info["sorted_proj"])
-                sampling_points_list.append(info["sorted_proj"] + float(tau))
+                sampling_points_list.append(sampling_points)
                 lex_to_order_list.append(info["lex_to_order"])
                 order_to_lex_list.append(info["order_to_lex"])
                 min_gap_list.append(info["min_gap"])
                 support_lo_list.append(torch.tensor(float(support_lo), dtype=torch.float64))
                 support_hi_list.append(torch.tensor(float(support_hi), dtype=torch.float64))
                 blocks.append(block)
-                effective_tau.append(float(tau))
+                effective_tau.append(float(tau) if math.isfinite(float(tau)) else 0.0)
 
             sparse_nnz = torch.stack([blk["sparse_nnz"] for blk in blocks], dim=0).to(dtype=torch.int64, device=device)
             max_nnz = int(sparse_nnz.max().item()) if int(sparse_nnz.numel()) > 0 else 0
@@ -577,6 +646,8 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         self.last_morozov_cache_build_seconds: Optional[float] = None
         self._last_gram_context_signature: Optional[tuple[object, ...]] = None
         self._last_gram_context: Optional[dict[str, torch.Tensor]] = None
+        self._pdhg_lipschitz2_cache: dict[int, float] = {}
+        self.last_pdhg_stats: Optional[dict[str, object]] = None
 
     def _morozov_cache_fingerprint(self) -> dict[str, object]:
         return {
@@ -585,7 +656,17 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             "width": int(self.width),
             "num_angles": int(self.num_angles),
             "alpha_values": [round(float(v), 15) for v in self.alpha_values],
-            "tau_offsets": [round(float(v), 15) for v in self.tau_offsets_tensor.detach().cpu().tolist()],
+            "sampling_mode": str(self.sampling_mode),
+            "tau_offsets": (
+                [round(float(v), 15) for v in self.tau_offsets_tensor.detach().cpu().tolist()]
+                if str(self.sampling_mode) == "shifted_lattice"
+                else None
+            ),
+            "sampling_points_sha256": (
+                None
+                if str(self.sampling_mode) == "shifted_lattice"
+                else _sampling_points_digest(self.sampling_points_per_angle)
+            ),
             "sparse_nnz_per_angle": [int(v.item()) for v in self.sparse_nnz],
             "formula_mode": "alpha_continuous",
             "basis": "b1b1",
@@ -699,6 +780,130 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         """Return per-sample anisotropic TV, ``sum(|D_x x| + |D_y x|)``."""
         grad = self.tv_gradient(coeff_matrix)
         return torch.sum(torch.abs(grad).reshape(grad.shape[0], -1), dim=1)
+
+    @torch.no_grad()
+    def _estimate_pdhg_lipschitz2(self, n_power: int = 8) -> float:
+        """Estimate ``||K||^2`` for ``K x = (A x, D x)`` used by PDHG-TV."""
+        n_power = max(1, int(n_power))
+        cached = self._pdhg_lipschitz2_cache.get(n_power)
+        if cached is not None:
+            return float(cached)
+
+        x = torch.arange(
+            1,
+            int(self.N) + 1,
+            dtype=torch.float32,
+            device=self.sampling_points.device,
+        ).view(1, 1, self.height, self.width)
+        x = x - torch.mean(x)
+        x_norm = torch.norm(x.reshape(1, -1), dim=1).view(1, 1, 1, 1)
+        if float(x_norm.item()) <= 1.0e-12:
+            x = torch.ones_like(x)
+            x_norm = torch.norm(x.reshape(1, -1), dim=1).view(1, 1, 1, 1)
+        x = x / x_norm.clamp_min(1.0e-12)
+
+        for _ in range(n_power):
+            y = self.apply_normal(x) + self.apply_tv_normal(x)
+            y_norm = torch.norm(y.reshape(1, -1), dim=1).view(1, 1, 1, 1).clamp_min(1.0e-12)
+            x = y / y_norm
+
+        y = self.apply_normal(x) + self.apply_tv_normal(x)
+        num = torch.sum(x * y)
+        den = torch.sum(x * x).clamp_min(1.0e-12)
+        lipschitz2 = max(float((num / den).detach().cpu().item()), 1.0e-6)
+        self._pdhg_lipschitz2_cache[n_power] = lipschitz2
+        return lipschitz2
+
+    @torch.no_grad()
+    def solve_l2_tv_pdhg(
+        self,
+        b: torch.Tensor,
+        lambda_reg: float | torch.Tensor,
+        *,
+        max_iter: int = 10,
+        tau: Optional[float] = None,
+        sigma: Optional[float] = None,
+        theta: float = 1.0,
+        nonnegative: bool = False,
+        x0: Optional[torch.Tensor] = None,
+        power_iters: int = 8,
+    ) -> torch.Tensor:
+        """Run few-step PDHG for ``0.5 * ||A x - b||_2^2 + lambda * TV(x)``.
+
+        This is intended as a fast TV-informed neural-network initializer, not
+        as a fully converged classical TV baseline.  The TV term matches the
+        existing ADMM implementation: anisotropic forward-difference TV.
+        """
+        if b.dim() == 1:
+            b = b.unsqueeze(0)
+        b = b.to(dtype=torch.float32, device=self.sampling_points.device)
+        if b.dim() != 2:
+            raise ValueError(f"Expected b with shape (B,M), got {tuple(b.shape)}")
+        batch = int(b.shape[0])
+        lam = self._normalize_lambda_reg(lambda_reg, batch_size=batch, target_device=b.device)
+        lam_view = lam.view(batch, 1, 1, 1)
+
+        if x0 is None:
+            x = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
+        else:
+            if x0.dim() == 3:
+                x0 = x0.unsqueeze(1)
+            x = x0.to(dtype=torch.float32, device=b.device).clone()
+            if x.shape != (batch, 1, self.height, self.width):
+                raise ValueError(
+                    f"Expected x0 shape {(batch, 1, self.height, self.width)}, got {tuple(x.shape)}"
+                )
+
+        x_bar = x.clone()
+        p = torch.zeros_like(b)
+        q = torch.zeros((batch, 2, self.height, self.width), dtype=torch.float32, device=b.device)
+
+        lipschitz2 = None
+        if tau is None or sigma is None:
+            lipschitz2 = max(self._estimate_pdhg_lipschitz2(n_power=power_iters), 1.0e-6)
+            # Power iteration may slightly underestimate the true norm.  Use a
+            # conservative safety margin because initialization prefers
+            # stability over aggressive convergence.
+            step = 0.8 / math.sqrt(1.05 * lipschitz2)
+            tau = step if tau is None else float(tau)
+            sigma = step if sigma is None else float(sigma)
+
+        tau = float(tau)
+        sigma = float(sigma)
+        theta = float(theta)
+        if tau <= 0.0 or sigma <= 0.0:
+            raise ValueError(f"PDHG step sizes must be positive, got tau={tau!r}, sigma={sigma!r}.")
+
+        actual_iter = max(0, int(max_iter))
+        for _ in range(actual_iter):
+            p = (p + sigma * (self.forward(x_bar) - b)) / (1.0 + sigma)
+
+            q_candidate = q + sigma * self.tv_gradient(x_bar)
+            q = torch.maximum(torch.minimum(q_candidate, lam_view), -lam_view)
+
+            x_new = x - tau * (self.adjoint(p) + self.tv_divergence_adjoint(q))
+            if bool(nonnegative):
+                x_new = torch.clamp(x_new, min=0.0)
+
+            x_bar = x_new + theta * (x_new - x)
+            x = x_new
+
+        residual = self.forward(x) - b
+        self.last_pdhg_stats = {
+            "method": "l2_tv_pdhg",
+            "iterations": int(actual_iter),
+            "lambda_reg": [float(v) for v in lam.detach().cpu().view(-1).tolist()],
+            "tau": float(tau),
+            "sigma": float(sigma),
+            "theta": float(theta),
+            "nonnegative": bool(nonnegative),
+            "power_iters": int(power_iters),
+            "lipschitz2": None if lipschitz2 is None else float(lipschitz2),
+            "measurement_l2": [float(v) for v in torch.norm(residual.detach(), dim=-1).cpu().view(-1).tolist()],
+            "coeff_tv": [float(v) for v in self.anisotropic_tv_norm(x.detach()).detach().cpu().view(-1).tolist()],
+        }
+        self.last_split_admm_stats = None
+        return x
 
     def apply_normal_per_angle(self, coeff_per_angle: torch.Tensor) -> torch.Tensor:
         """Apply each single-angle normal matrix independently.
@@ -885,13 +1090,18 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         cg_tol: Optional[float] = None,
         rho_data: Optional[float] = None,
         rho_reg: Optional[float] = None,
-    ) -> dict[str, float | int]:
+    ) -> dict[str, float | int | str | bool]:
         return {
             "max_iter": max(0, int(DATA_CONFIG.get("l1_init_admm_iters", 80) if max_iter is None else max_iter)),
             "cg_iters": max(1, int(DATA_CONFIG.get("l1_init_admm_cg_iters", 30) if cg_iters is None else cg_iters)),
             "cg_tol": float(DATA_CONFIG.get("l1_init_admm_cg_tol", 1.0e-4) if cg_tol is None else cg_tol),
             "rho_data": max(float(DATA_CONFIG.get("l1_init_admm_rho_data", 1.0) if rho_data is None else rho_data), 1.0e-12),
             "rho_reg": max(float(DATA_CONFIG.get("l1_init_admm_rho_reg", 1.0) if rho_reg is None else rho_reg), 1.0e-12),
+            "stop_mode": str(DATA_CONFIG.get("admm_stop_mode", "fixed")).strip().lower(),
+            "min_iter": max(0, int(DATA_CONFIG.get("admm_min_iters", 10))),
+            "abs_tol": float(DATA_CONFIG.get("admm_abs_tol", 1.0e-4)),
+            "rel_tol": float(DATA_CONFIG.get("admm_rel_tol", 1.0e-3)),
+            "check_interval": max(1, int(DATA_CONFIG.get("admm_check_interval", 1))),
         }
 
     @torch.no_grad()
@@ -939,16 +1149,98 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             rr = rr_new
         return x
 
-    def _record_admm_stats(self, *, method: str, iterations: int, coeff: torch.Tensor, b: torch.Tensor, lambda_reg: torch.Tensor) -> None:
+    def _batch_l2_norm(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        return torch.norm(x.reshape(x.shape[0], -1), dim=1)
+
+    def _batch_l2_stack_norm(self, *xs: torch.Tensor) -> torch.Tensor:
+        vals = None
+        for x in xs:
+            n2 = self._batch_l2_norm(x).square()
+            vals = n2 if vals is None else vals + n2
+        if vals is None:
+            raise ValueError("_batch_l2_stack_norm requires at least one tensor.")
+        return torch.sqrt(vals.clamp_min(0.0))
+
+    def _admm_abs_rel_tol(
+        self,
+        *,
+        batch_size: int,
+        dim: int,
+        abs_tol: float,
+        rel_tol: float,
+        reference_terms: list[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        ref = torch.zeros((int(batch_size),), dtype=torch.float32, device=device)
+        for term in reference_terms:
+            ref = torch.maximum(ref, self._batch_l2_norm(term))
+        return (float(dim) ** 0.5) * float(abs_tol) + float(rel_tol) * ref
+
+    def _admm_should_stop(
+        self,
+        *,
+        opts: dict,
+        iteration: int,
+        primal_norm: torch.Tensor,
+        dual_norm: torch.Tensor,
+        eps_pri: torch.Tensor,
+        eps_dual: torch.Tensor,
+    ) -> tuple[bool, str]:
+        if str(opts.get("stop_mode", "fixed")).strip().lower() == "fixed":
+            return False, "fixed_iteration_mode"
+        current_iter = int(iteration) + 1
+        if current_iter < int(opts.get("min_iter", 0)):
+            return False, "below_min_iter"
+        if current_iter % int(opts.get("check_interval", 1)) != 0:
+            return False, "skip_check_interval"
+
+        ok_primal = torch.all(primal_norm <= eps_pri)
+        ok_dual = torch.all(dual_norm <= eps_dual)
+        ok = bool(ok_primal and ok_dual)
+        if ok:
+            return True, "primal_dual_residual_satisfied"
+        if not bool(ok_primal):
+            return False, "primal_residual_not_satisfied"
+        if not bool(ok_dual):
+            return False, "dual_residual_not_satisfied"
+        return False, "not_satisfied"
+
+    @staticmethod
+    def _admm_stats_values(x: Optional[torch.Tensor]) -> list[float]:
+        if x is None:
+            return []
+        return [float(v) for v in x.detach().cpu().view(-1).tolist()]
+
+    def _record_admm_stats(
+        self,
+        *,
+        method: str,
+        iterations: int,
+        coeff: torch.Tensor,
+        b: torch.Tensor,
+        lambda_reg: torch.Tensor,
+        stop_reason: str = "max_iter_reached",
+        primal_norm: Optional[torch.Tensor] = None,
+        dual_norm: Optional[torch.Tensor] = None,
+        eps_pri: Optional[torch.Tensor] = None,
+        eps_dual: Optional[torch.Tensor] = None,
+    ) -> None:
         residual = self(coeff) - b
         self.last_split_admm_stats = {
             "method": str(method),
             "iterations": int(iterations),
+            "stop_reason": str(stop_reason),
             "lambda_reg": [float(v) for v in lambda_reg.detach().cpu().view(-1).tolist()],
             "measurement_l2": [float(v) for v in torch.norm(residual.detach(), dim=-1).cpu().view(-1).tolist()],
             "measurement_l1": [float(v) for v in torch.sum(torch.abs(residual.detach()), dim=-1).cpu().view(-1).tolist()],
             "coeff_l1": [float(v) for v in torch.sum(torch.abs(coeff.detach()).reshape(coeff.shape[0], -1), dim=1).cpu().view(-1).tolist()],
             "coeff_tv": [float(v) for v in self.anisotropic_tv_norm(coeff.detach()).detach().cpu().view(-1).tolist()],
+            "primal_norm": self._admm_stats_values(primal_norm),
+            "dual_norm": self._admm_stats_values(dual_norm),
+            "eps_pri": self._admm_stats_values(eps_pri),
+            "eps_dual": self._admm_stats_values(eps_dual),
         }
 
     @torch.no_grad()
@@ -969,11 +1261,22 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         adj = self.adjoint(torch.sign(b)).reshape(b.shape[0], -1)
         return torch.amax(torch.abs(adj), dim=1).clamp_min(0.0)
 
-    def _record_constrained_admm_stats(self, *, method: str, iterations: int, coeff: torch.Tensor, b: torch.Tensor, noise_radius: torch.Tensor, residual_norm: str) -> None:
+    def _record_constrained_admm_stats(
+        self,
+        *,
+        method: str,
+        iterations: int,
+        coeff: torch.Tensor,
+        b: torch.Tensor,
+        noise_radius: torch.Tensor,
+        residual_norm: str,
+        stop_reason: str = "max_iter_reached",
+    ) -> None:
         residual = self(coeff) - b
         self.last_split_admm_stats = {
             "method": str(method),
             "iterations": int(iterations),
+            "stop_reason": str(stop_reason),
             "constraint_radius": [float(v) for v in noise_radius.detach().cpu().view(-1).tolist()],
             "residual_norm": str(residual_norm),
             "measurement_l2": [float(v) for v in torch.norm(residual.detach(), dim=-1).cpu().view(-1).tolist()],
@@ -1004,7 +1307,7 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         zero_active = lam >= zero_threshold * (1.0 - 1.0e-6)
         if bool(torch.all(zero_active)):
             x_zero = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
-            self._record_admm_stats(method="l2_l1_admm", iterations=0, coeff=x_zero, b=b, lambda_reg=lam)
+            self._record_admm_stats(method="l2_l1_admm", iterations=0, coeff=x_zero, b=b, lambda_reg=lam, stop_reason="zero_solution_threshold")
             return x_zero
         rho = float(opts["rho_reg"])
         rhs_data = self.adjoint(b)
@@ -1012,7 +1315,14 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         z = torch.zeros_like(x)
         u = torch.zeros_like(x)
         threshold = (lam / rho).view(batch, 1, 1, 1)
-        for _ in range(int(opts["max_iter"])):
+        stop_reason = "max_iter_reached"
+        actual_iter = 0
+        last_primal_norm = None
+        last_dual_norm = None
+        last_eps_pri = None
+        last_eps_dual = None
+        for it in range(int(opts["max_iter"])):
+            z_prev = z.clone()
             rhs = rhs_data + rho * (z - u)
             x = self._solve_weighted_normal_cg(
                 rhs,
@@ -1024,10 +1334,57 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             )
             z = _soft_threshold(x + u, threshold)
             u = u + x - z
+            primal = x - z
+            dual = rho * (z - z_prev)
+            primal_norm = self._batch_l2_norm(primal)
+            dual_norm = self._batch_l2_norm(dual)
+            eps_pri = self._admm_abs_rel_tol(
+                batch_size=batch,
+                dim=int(self.height * self.width),
+                abs_tol=float(opts["abs_tol"]),
+                rel_tol=float(opts["rel_tol"]),
+                reference_terms=[x, z],
+                device=b.device,
+            )
+            eps_dual = self._admm_abs_rel_tol(
+                batch_size=batch,
+                dim=int(self.height * self.width),
+                abs_tol=float(opts["abs_tol"]),
+                rel_tol=float(opts["rel_tol"]),
+                reference_terms=[rho * u],
+                device=b.device,
+            )
+            last_primal_norm = primal_norm
+            last_dual_norm = dual_norm
+            last_eps_pri = eps_pri
+            last_eps_dual = eps_dual
+            actual_iter = it + 1
+            should_stop, stop_candidate = self._admm_should_stop(
+                opts=opts,
+                iteration=it,
+                primal_norm=primal_norm,
+                dual_norm=dual_norm,
+                eps_pri=eps_pri,
+                eps_dual=eps_dual,
+            )
+            if should_stop:
+                stop_reason = stop_candidate
+                break
         if bool(torch.any(zero_active)):
             x = x.clone()
             x[zero_active.view(-1, 1, 1, 1).expand_as(x)] = 0.0
-        self._record_admm_stats(method="l2_l1_admm", iterations=int(opts["max_iter"]), coeff=x, b=b, lambda_reg=lam)
+        self._record_admm_stats(
+            method="l2_l1_admm",
+            iterations=int(actual_iter),
+            coeff=x,
+            b=b,
+            lambda_reg=lam,
+            stop_reason=stop_reason,
+            primal_norm=last_primal_norm,
+            dual_norm=last_dual_norm,
+            eps_pri=last_eps_pri,
+            eps_dual=last_eps_dual,
+        )
         return x
 
     @torch.no_grad()
@@ -1054,7 +1411,14 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         z = torch.zeros((batch, 2, self.height, self.width), dtype=torch.float32, device=b.device)
         u = torch.zeros_like(z)
         threshold = (lam / rho).view(batch, 1, 1, 1)
-        for _ in range(int(opts["max_iter"])):
+        stop_reason = "max_iter_reached"
+        actual_iter = 0
+        last_primal_norm = None
+        last_dual_norm = None
+        last_eps_pri = None
+        last_eps_dual = None
+        for it in range(int(opts["max_iter"])):
+            z_prev = z.clone()
             rhs = rhs_data + rho * self.tv_divergence_adjoint(z - u)
             x = self._solve_weighted_normal_cg(
                 rhs,
@@ -1068,7 +1432,54 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             grad = self.tv_gradient(x)
             z = _soft_threshold(grad + u, threshold)
             u = u + grad - z
-        self._record_admm_stats(method="l2_tv_admm", iterations=int(opts["max_iter"]), coeff=x, b=b, lambda_reg=lam)
+            primal = grad - z
+            dual = rho * self.tv_divergence_adjoint(z - z_prev)
+            primal_norm = self._batch_l2_norm(primal)
+            dual_norm = self._batch_l2_norm(dual)
+            eps_pri = self._admm_abs_rel_tol(
+                batch_size=batch,
+                dim=int(2 * self.height * self.width),
+                abs_tol=float(opts["abs_tol"]),
+                rel_tol=float(opts["rel_tol"]),
+                reference_terms=[grad, z],
+                device=b.device,
+            )
+            eps_dual = self._admm_abs_rel_tol(
+                batch_size=batch,
+                dim=int(self.height * self.width),
+                abs_tol=float(opts["abs_tol"]),
+                rel_tol=float(opts["rel_tol"]),
+                reference_terms=[rho * self.tv_divergence_adjoint(u)],
+                device=b.device,
+            )
+            last_primal_norm = primal_norm
+            last_dual_norm = dual_norm
+            last_eps_pri = eps_pri
+            last_eps_dual = eps_dual
+            actual_iter = it + 1
+            should_stop, stop_candidate = self._admm_should_stop(
+                opts=opts,
+                iteration=it,
+                primal_norm=primal_norm,
+                dual_norm=dual_norm,
+                eps_pri=eps_pri,
+                eps_dual=eps_dual,
+            )
+            if should_stop:
+                stop_reason = stop_candidate
+                break
+        self._record_admm_stats(
+            method="l2_tv_admm",
+            iterations=int(actual_iter),
+            coeff=x,
+            b=b,
+            lambda_reg=lam,
+            stop_reason=stop_reason,
+            primal_norm=last_primal_norm,
+            dual_norm=last_dual_norm,
+            eps_pri=last_eps_pri,
+            eps_dual=last_eps_dual,
+        )
         return x
 
     @torch.no_grad()
@@ -1094,7 +1505,7 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         zero_active = lam >= zero_threshold * (1.0 - 1.0e-6)
         if bool(torch.all(zero_active)):
             x_zero = torch.zeros((batch, 1, self.height, self.width), dtype=torch.float32, device=b.device)
-            self._record_admm_stats(method="l1_l1_admm", iterations=0, coeff=x_zero, b=b, lambda_reg=lam)
+            self._record_admm_stats(method="l1_l1_admm", iterations=0, coeff=x_zero, b=b, lambda_reg=lam, stop_reason="zero_solution_threshold")
             return x_zero
         rho_d = float(opts["rho_data"])
         rho_r = float(opts["rho_reg"])
@@ -1105,7 +1516,15 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         u_reg = torch.zeros_like(x)
         threshold_data = 1.0 / rho_d
         threshold_reg = (lam / rho_r).view(batch, 1, 1, 1)
-        for _ in range(int(opts["max_iter"])):
+        stop_reason = "max_iter_reached"
+        actual_iter = 0
+        last_primal_norm = None
+        last_dual_norm = None
+        last_eps_pri = None
+        last_eps_dual = None
+        for it in range(int(opts["max_iter"])):
+            r_prev = r.clone()
+            z_prev = z.clone()
             rhs = rho_d * self.adjoint(b + r - u_data) + rho_r * (z - u_reg)
             x = self._solve_weighted_normal_cg(
                 rhs,
@@ -1120,10 +1539,58 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             z = _soft_threshold(x + u_reg, threshold_reg)
             u_data = u_data + residual - r
             u_reg = u_reg + x - z
+            primal_data = residual - r
+            primal_reg = x - z
+            dual = rho_d * self.adjoint(r - r_prev) + rho_r * (z - z_prev)
+            primal_norm = self._batch_l2_stack_norm(primal_data, primal_reg)
+            dual_norm = self._batch_l2_norm(dual)
+            eps_pri = self._admm_abs_rel_tol(
+                batch_size=batch,
+                dim=int(b.shape[-1]) + int(self.height * self.width),
+                abs_tol=float(opts["abs_tol"]),
+                rel_tol=float(opts["rel_tol"]),
+                reference_terms=[residual, r, x, z],
+                device=b.device,
+            )
+            eps_dual = self._admm_abs_rel_tol(
+                batch_size=batch,
+                dim=int(self.height * self.width),
+                abs_tol=float(opts["abs_tol"]),
+                rel_tol=float(opts["rel_tol"]),
+                reference_terms=[rho_d * self.adjoint(u_data) + rho_r * u_reg],
+                device=b.device,
+            )
+            last_primal_norm = primal_norm
+            last_dual_norm = dual_norm
+            last_eps_pri = eps_pri
+            last_eps_dual = eps_dual
+            actual_iter = it + 1
+            should_stop, stop_candidate = self._admm_should_stop(
+                opts=opts,
+                iteration=it,
+                primal_norm=primal_norm,
+                dual_norm=dual_norm,
+                eps_pri=eps_pri,
+                eps_dual=eps_dual,
+            )
+            if should_stop:
+                stop_reason = stop_candidate
+                break
         if bool(torch.any(zero_active)):
             x = x.clone()
             x[zero_active.view(-1, 1, 1, 1).expand_as(x)] = 0.0
-        self._record_admm_stats(method="l1_l1_admm", iterations=int(opts["max_iter"]), coeff=x, b=b, lambda_reg=lam)
+        self._record_admm_stats(
+            method="l1_l1_admm",
+            iterations=int(actual_iter),
+            coeff=x,
+            b=b,
+            lambda_reg=lam,
+            stop_reason=stop_reason,
+            primal_norm=last_primal_norm,
+            dual_norm=last_dual_norm,
+            eps_pri=last_eps_pri,
+            eps_dual=last_eps_dual,
+        )
         return x
 
     @torch.no_grad()
@@ -1479,6 +1946,33 @@ class TheoreticalDataGenerator:
                 target_device=g_obs.device,
             )
             return self.time_operator.solve_l2_tv_admm(g_obs, lambda_reg=lam_solver)
+        if method == "l2_tv_pdhg":
+            if not hasattr(self.time_operator, "solve_l2_tv_pdhg"):
+                raise ValueError("Active operator does not expose solve_l2_tv_pdhg().")
+            if g_obs.dim() == 1:
+                g_obs = g_obs.unsqueeze(0)
+            g_obs = g_obs.to(device=device, dtype=torch.float32)
+            lam_solver = self._l1_init_lambda_to_solver_scale(
+                lambda_reg,
+                batch_size=int(g_obs.shape[0]),
+                measurement_count=int(g_obs.shape[-1]),
+                target_device=g_obs.device,
+            )
+            x0 = self._tikhonov_direct_init(g_obs, lambda_reg=lambda_reg)
+            coeff = self.time_operator.solve_l2_tv_pdhg(
+                g_obs,
+                lambda_reg=lam_solver,
+                max_iter=int(DATA_CONFIG.get("tv_pdhg_iters", 10)),
+                theta=float(DATA_CONFIG.get("tv_pdhg_theta", 1.0)),
+                nonnegative=bool(DATA_CONFIG.get("tv_pdhg_nonnegative", False)),
+                x0=x0,
+                power_iters=int(DATA_CONFIG.get("tv_pdhg_power_iters", 8)),
+            )
+            info = dict(self.last_lambda_info or {})
+            if info:
+                info["solver_stats"] = dict(getattr(self.time_operator, "last_pdhg_stats", None) or {})
+                self.last_lambda_info = info
+            return coeff
         raise ValueError(
             f"Unsupported init_method={method!r}; expected one of {list(INIT_METHOD_CHOICES)!r}."
         )
@@ -1508,7 +2002,10 @@ class TheoreticalDataGenerator:
             if not hasattr(self.time_operator, "solve_l2_tv_morozov_admm"):
                 raise ValueError("Active operator does not expose solve_l2_tv_morozov_admm().")
             return self.time_operator.solve_l2_tv_morozov_admm(g_obs, noise_radius=radius)
-        raise ValueError(f"Constrained Morozov initialization is only supported for 'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}.")
+        raise ValueError(
+            "Constrained Morozov initialization is only supported for "
+            f"'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}."
+        )
 
     @torch.no_grad()
     def solve_morozov_constrained_init(
@@ -1525,7 +2022,10 @@ class TheoreticalDataGenerator:
         elif method == "l2_tv_admm":
             norm_type = "l2"
         else:
-            raise ValueError(f"Constrained Morozov initialization is only supported for 'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}.")
+            raise ValueError(
+                "Constrained Morozov initialization is only supported for "
+                f"'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}."
+            )
         radius_base, radius_source = self._estimate_morozov_noise_norm_from_observed(g_obs, norm_type=norm_type)
         radius = radius_base * float(DATA_CONFIG.get("morozov_tau", 1.0))
         info = {
@@ -1748,6 +2248,8 @@ class TheoreticalDataGenerator:
             natural_lam_max = self.time_operator.l2_l1_zero_threshold(g_observed).to(dtype=torch.float32, device=g_observed.device) / float(max(measurement_count, 1))
             lambda_max_source = "l2_l1_zero_threshold_proxy"
             lambda_scale = "normalized_by_measurements"
+        elif init_method in MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS:
+            lambda_scale = "normalized_by_measurements"
         lam_values: list[float] = []
         final_residuals: list[float] = []
         statuses: list[str] = []
@@ -1776,7 +2278,61 @@ class TheoreticalDataGenerator:
             res_hi = evaluate(hi)
             candidates = [(abs(res_lo - target_i), lo, res_lo), (abs(res_hi - target_i), hi, res_hi)]
 
-            if target_i <= res_lo:
+            if init_method == "l2_tv_pdhg":
+                # Low-iteration PDHG is intentionally inexact for speed.  Its
+                # residual as a function of lambda can be non-monotone near
+                # tiny lambda values, so endpoint-only Morozov bracketing may
+                # miss a good interior lambda and jump to the configured upper
+                # limit.  Scan the configured log range first, then refine a
+                # sign-changing interval if one is found.
+                grid_size = max(3, int(max_iter))
+                log_lo = math.log10(max(lo, 1.0e-30))
+                log_hi = math.log10(max(hi, lo * 10.0))
+                if log_hi > log_lo:
+                    for pos in range(grid_size):
+                        frac = 0.0 if grid_size == 1 else float(pos) / float(grid_size - 1)
+                        lam_grid = 10.0 ** (log_lo + frac * (log_hi - log_lo))
+                        if lam_grid <= lo * (1.0 + 1.0e-12) or lam_grid >= hi * (1.0 - 1.0e-12):
+                            continue
+                        res_grid = evaluate(lam_grid)
+                        candidates.append((abs(res_grid - target_i), lam_grid, res_grid))
+                ordered = sorted((lam, res) for _, lam, res in candidates)
+                brackets = []
+                for (lam_a, res_a), (lam_b, res_b) in zip(ordered, ordered[1:]):
+                    diff_a = res_a - target_i
+                    diff_b = res_b - target_i
+                    if diff_a == 0.0:
+                        brackets.append((lam_a, lam_a, res_a, res_a))
+                    if diff_a * diff_b <= 0.0:
+                        brackets.append((lam_a, lam_b, res_a, res_b))
+                if brackets:
+                    bracket = max(brackets, key=lambda item: item[1])
+                    a, b_hi, res_a, res_b = bracket
+                    if a == b_hi:
+                        best_lam = a
+                        best_res = res_a
+                    else:
+                        bracket_candidates = [
+                            (abs(res_a - target_i), a, res_a),
+                            (abs(res_b - target_i), b_hi, res_b),
+                        ]
+                        for _ in range(max_iter):
+                            mid = math.sqrt(max(a, 1.0e-30) * max(b_hi, 1.0e-30))
+                            res_mid = evaluate(mid)
+                            candidates.append((abs(res_mid - target_i), mid, res_mid))
+                            bracket_candidates.append((abs(res_mid - target_i), mid, res_mid))
+                            if (res_a - target_i) * (res_mid - target_i) <= 0.0:
+                                b_hi = mid
+                                res_b = res_mid
+                            else:
+                                a = mid
+                                res_a = res_mid
+                        _, best_lam, best_res = min(bracket_candidates, key=lambda item: item[0])
+                    status = "bracketed_log_grid"
+                else:
+                    _, best_lam, best_res = min(candidates, key=lambda item: item[0])
+                    status = "log_grid_best"
+            elif target_i <= res_lo:
                 _, best_lam, best_res = min(candidates, key=lambda item: item[0])
                 status = "target_below_or_equal_lambda_min"
             elif target_i >= res_hi:
@@ -1838,14 +2394,14 @@ class TheoreticalDataGenerator:
                 self.last_lambda_info = {
                     "mode": "provided",
                     "method": provided_method,
-                    "lambda_scale": "normalized_by_measurements" if provided_method in SPLIT_ADMM_INIT_METHODS else "raw",
+                    "lambda_scale": "normalized_by_measurements" if provided_method in MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS else "raw",
                 }
                 return lambda_reg.to(dtype=torch.float32, device=g_observed.device)
             provided_method = normalize_init_method(str(init_method or TIME_DOMAIN_CONFIG.get("init_method", "cg")))
             self.last_lambda_info = {
                 "mode": "provided",
                 "method": provided_method,
-                "lambda_scale": "normalized_by_measurements" if provided_method in SPLIT_ADMM_INIT_METHODS else "raw",
+                "lambda_scale": "normalized_by_measurements" if provided_method in MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS else "raw",
             }
             return float(lambda_reg)
         mode = str(DATA_CONFIG.get("lambda_select_mode", "fixed")).strip().lower()
@@ -1855,11 +2411,41 @@ class TheoreticalDataGenerator:
                 "mode": "fixed",
                 "method": method,
                 "residual_norm": "none",
-                "lambda_scale": "normalized_by_measurements" if method in SPLIT_ADMM_INIT_METHODS else "raw",
+                "lambda_scale": "normalized_by_measurements" if method in MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS else "raw",
             }
             return float(DATA_CONFIG.get("lambda_reg", 1e-2))
         if mode == "morozov":
-            if method in SPLIT_ADMM_INIT_METHODS:
+            morozov_form = str(DATA_CONFIG.get("morozov_form", "regularized")).strip().lower()
+            if morozov_form not in {"regularized", "constrained"}:
+                raise ValueError(
+                    f"Unsupported morozov_form={morozov_form!r}; expected 'regularized' or 'constrained'."
+                )
+            if morozov_form == "constrained":
+                if method == "l2_l1_admm":
+                    norm_type = "l2"
+                elif method == "l1_l1_admm":
+                    norm_type = "l1"
+                elif method == "l2_tv_admm":
+                    norm_type = "l2"
+                else:
+                    raise ValueError(
+                        "morozov_form='constrained' is only supported for "
+                        f"'l2_l1_admm', 'l1_l1_admm', and 'l2_tv_admm', got {method!r}."
+                    )
+                radius_base, radius_source = self._estimate_morozov_noise_norm_from_observed(g_observed, norm_type=norm_type)
+                radius = radius_base * float(DATA_CONFIG.get("morozov_tau", 1.0))
+                self.last_lambda_info = {
+                    "mode": "morozov_constrained_radius",
+                    "method": method,
+                    "residual_norm": norm_type,
+                    "target_norm": [float(v) for v in radius.detach().cpu().view(-1).tolist()],
+                    "constraint_radius": [float(v) for v in radius.detach().cpu().view(-1).tolist()],
+                    "noise_radius_source": radius_source,
+                    "noise_mode": str(self.noise_mode),
+                    "noise_level": float(self.noise_level),
+                }
+                return radius.to(dtype=torch.float32, device=g_observed.device)
+            if method in MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS:
                 norm_type = "l1" if method == "l1_l1_admm" else "l2"
                 return self._choose_lambda_morozov_iterative(
                     g_observed,
@@ -1919,12 +2505,14 @@ class TheoreticalDataGenerator:
         batch_started = time.perf_counter()
         init_method = normalize_init_method(str(TIME_DOMAIN_CONFIG.get("init_method", "cg")))
         lambda_mode = "provided" if lambda_reg is not None else str(DATA_CONFIG.get("lambda_select_mode", "fixed")).strip().lower()
+        morozov_form = str(DATA_CONFIG.get("morozov_form", "regularized")).strip().lower()
         progress_enabled = (not self._first_batch_progress_logged) and init_method != "cg"
         if progress_enabled:
+            solver_name = "constrained_init" if lambda_mode == "morozov" and morozov_form == "constrained" else "regularized_init"
             print(
                 "[init] first batch start "
                 f"batch_size={int(batch_size)} angles={int(getattr(self.time_operator, 'num_angles', 1) or 1)} "
-                f"lambda_mode={lambda_mode} init_method={init_method} solver=regularized_init"
+                f"lambda_mode={lambda_mode} morozov_form={morozov_form} init_method={init_method} solver={solver_name}"
             )
         coeff_true = self._sample_coefficients(batch_size)
         f_true = self.image_gen(coeff_true)

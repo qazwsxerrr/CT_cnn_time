@@ -9,7 +9,15 @@ from pathlib import Path
 
 import numpy as np
 
+from models.sampling_design.bucketed_d_opt_selection import (
+    bucket_candidates_by_angle,
+    bucketed_d_opt_beam_select,
+)
 from models.sampling_design.d_opt_selection import d_opt_greedy_select
+from models.sampling_design.gap_constrained_d_opt_selection import (
+    circular_gap_stats,
+    gap_constrained_d_opt_select,
+)
 from models.sampling_design.reduced_operator import (
     load_candidate_records,
     make_random_sketch_basis,
@@ -94,6 +102,71 @@ class SamplingDesignTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in selected], ["x", "y"])
         self.assertEqual([item["step"] for item in trace], [1, 2])
         self.assertGreater(trace[0]["gain"], trace[1]["gain"])
+
+    def test_bucket_candidates_by_angle_keeps_best_records_per_bucket(self) -> None:
+        candidates = [
+            {"name": "b0_worse", "alpha": 0.10, "tau_star": 0.0, "log_cond": 5.0},
+            {"name": "b0_best", "alpha": 0.20, "tau_star": 0.0, "log_cond": 1.0},
+            {"name": "b1_best", "alpha": 2.00, "tau_star": 0.0, "log_cond": 2.0},
+            {"name": "b1_worse", "alpha": 2.20, "tau_star": 0.0, "log_cond": 4.0},
+        ]
+
+        buckets = bucket_candidates_by_angle(candidates, bucket_count=2, per_bucket_keep=1)
+
+        self.assertEqual([[item["name"] for item in bucket] for bucket in buckets], [["b0_best"], ["b1_best"]])
+
+    def test_bucketed_d_opt_beam_select_selects_one_candidate_per_bucket(self) -> None:
+        candidates = [
+            {"name": "a_strong_x", "alpha": 0.10, "tau_star": 0.0, "log_cond": 5.0, "reduced_info": np.diag([4.0, 0.0])},
+            {"name": "a_weak", "alpha": 0.20, "tau_star": 0.0, "log_cond": 1.0, "reduced_info": np.diag([1.0, 0.0])},
+            {"name": "b_strong_y", "alpha": 1.80, "tau_star": 0.0, "log_cond": 4.0, "reduced_info": np.diag([0.0, 3.0])},
+            {"name": "b_weak", "alpha": 2.20, "tau_star": 0.0, "log_cond": 2.0, "reduced_info": np.diag([0.0, 0.5])},
+        ]
+
+        selected, trace = bucketed_d_opt_beam_select(
+            candidates,
+            k=2,
+            sketch_rank=2,
+            lambda_info=1.0,
+            per_bucket_keep=2,
+            beam_size=4,
+            uniformity_epsilon=None,
+        )
+
+        self.assertEqual([item["name"] for item in selected], ["a_strong_x", "b_strong_y"])
+        self.assertEqual([item["bucket"] for item in selected], [0, 1])
+        self.assertEqual(len(trace), 2)
+        self.assertGreater(trace[-1]["best_logdet"], trace[0]["best_logdet"])
+
+    def test_circular_gap_stats_reports_min_and_max_gaps(self) -> None:
+        stats = circular_gap_stats([0.0, math.pi / 3.0])
+
+        self.assertAlmostEqual(stats["min_gap_deg"], 60.0)
+        self.assertAlmostEqual(stats["max_gap_deg"], 120.0)
+
+    def test_gap_constrained_d_opt_select_enforces_final_gap_bounds(self) -> None:
+        candidates = [
+            {"name": "a0", "alpha": 0.0, "tau_star": 0.0, "reduced_info": np.diag([4.0, 0.0, 0.0])},
+            {"name": "a_close", "alpha": 0.40, "tau_star": 0.0, "reduced_info": np.diag([9.0, 0.0, 0.0])},
+            {"name": "b", "alpha": math.pi / 3.0, "tau_star": 0.0, "reduced_info": np.diag([0.0, 4.0, 0.0])},
+            {"name": "c", "alpha": 2.0 * math.pi / 3.0, "tau_star": 0.0, "reduced_info": np.diag([0.0, 0.0, 4.0])},
+        ]
+
+        selected, trace = gap_constrained_d_opt_select(
+            candidates,
+            k=3,
+            sketch_rank=3,
+            lambda_info=1.0,
+            min_gap_deg=50.0,
+            max_gap_deg=130.0,
+            beam_size=16,
+        )
+
+        self.assertEqual([item["name"] for item in selected], ["a0", "b", "c"])
+        stats = circular_gap_stats([float(item["alpha"]) for item in selected])
+        self.assertGreaterEqual(stats["min_gap_deg"], 50.0)
+        self.assertLessEqual(stats["max_gap_deg"], 130.0)
+        self.assertGreaterEqual(trace[-1]["feasible_final_count"], 1)
 
 
 if __name__ == "__main__":

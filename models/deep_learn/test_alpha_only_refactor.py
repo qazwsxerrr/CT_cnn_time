@@ -1,4 +1,5 @@
 import inspect
+import math
 import os
 import sys
 import tempfile
@@ -105,16 +106,21 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
         self.assertFalse(lgd.physics_residual_enabled)
 
     def test_checkpoint_config_restore_preserves_explicit_cnn_angle_indices(self):
-        from config import TIME_DOMAIN_CONFIG
+        from config import DATA_CONFIG, THEORETICAL_CONFIG, TIME_DOMAIN_CONFIG
         from test import _temporary_experiment_config
 
+        data_backup = dict(DATA_CONFIG)
         backup = dict(TIME_DOMAIN_CONFIG)
+        regularizer_backup = dict(THEORETICAL_CONFIG)
         try:
+            DATA_CONFIG["l1_init_admm_iters"] = 12
+            THEORETICAL_CONFIG["regularizer_type"] = "tikhonov"
             TIME_DOMAIN_CONFIG.update(
                 {
                     "cnn_angle_indices_override": [0, 2],
                     "cnn_num_angles_override": 2,
                     "physics_residual_mode": "per_angle_cg",
+                    "init_method": "tikhonov_direct",
                 }
             )
             metadata = {
@@ -128,14 +134,76 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
                 "theoretical_formula_mode": "alpha_continuous",
                 "data_formula_mode": "auto_complete",
                 "physics_residual_mode": "per_angle_cg",
+                "regularizer_type": "tv",
+                "init_method": "l2_tv_admm",
+                "l1_init_admm_iters": 80,
             }
             with _temporary_experiment_config(metadata):
                 self.assertEqual(TIME_DOMAIN_CONFIG["cnn_angle_indices_override"], [0, 2])
                 self.assertEqual(TIME_DOMAIN_CONFIG["cnn_num_angles_override"], 2)
                 self.assertEqual(TIME_DOMAIN_CONFIG["physics_residual_mode"], "per_angle_cg")
+                self.assertEqual(THEORETICAL_CONFIG["regularizer_type"], "tv")
+                self.assertEqual(TIME_DOMAIN_CONFIG["init_method"], "l2_tv_admm")
+                self.assertEqual(DATA_CONFIG["l1_init_admm_iters"], 80)
         finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
             TIME_DOMAIN_CONFIG.clear()
             TIME_DOMAIN_CONFIG.update(backup)
+            THEORETICAL_CONFIG.clear()
+            THEORETICAL_CONFIG.update(regularizer_backup)
+
+    def test_config_regularizer_type_env_override_accepts_tv_and_rejects_invalid(self):
+        import importlib
+        import config
+
+        env_names = ("EXPERIMENT_PROFILE_OVERRIDE", "REGULARIZER_TYPE_OVERRIDE")
+        env_backup = {name: os.environ.get(name) for name in env_names}
+        try:
+            os.environ["EXPERIMENT_PROFILE_OVERRIDE"] = "runtime_alpha"
+            os.environ["REGULARIZER_TYPE_OVERRIDE"] = "tv"
+            cfg = importlib.reload(config)
+            self.assertEqual(cfg.THEORETICAL_CONFIG["regularizer_type"], "tv")
+
+            os.environ["REGULARIZER_TYPE_OVERRIDE"] = "unsupported_regularizer"
+            with self.assertRaises(ValueError):
+                importlib.reload(config)
+        finally:
+            for name, value in env_backup.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            importlib.reload(config)
+
+    def test_theoretical_gd_tv_regularization_gradient_matches_smoothed_tv_derivative(self):
+        from model import TheoreticalGradientDescent
+
+        x = torch.tensor(
+            [[[[0.0, 2.0], [1.0, 4.0]]]],
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+        gd = TheoreticalGradientDescent(
+            height=2,
+            width=2,
+            regularizer_type="tv",
+            operator=torch.nn.Identity(),
+        )
+
+        grad = gd.compute_regularization_gradient(x.detach())
+
+        grad_x = torch.zeros_like(x)
+        grad_y = torch.zeros_like(x)
+        grad_y[:, :, :-1, :] = x[:, :, 1:, :] - x[:, :, :-1, :]
+        grad_x[:, :, :, :-1] = x[:, :, :, 1:] - x[:, :, :, :-1]
+        tv_value = torch.sqrt(grad_x.pow(2) + grad_y.pow(2) + 1.0e-6).sum()
+        expected = torch.autograd.grad(tv_value, x)[0]
+
+        self.assertTrue(
+            torch.allclose(grad, expected, atol=1.0e-5, rtol=1.0e-4),
+            f"got {grad.detach().cpu().tolist()}, expected {expected.detach().cpu().tolist()}",
+        )
 
     def test_train_helpers_resume_after_loaded_checkpoint_iteration(self):
         import train as train_module
@@ -238,7 +306,7 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             DATA_CONFIG.clear()
             DATA_CONFIG.update(data_backup)
 
-    def test_l1_and_tv_admm_initializers_reduce_their_objectives_and_dispatch(self):
+    def test_l1_tv_admm_and_pdhg_initializers_reduce_their_objectives_and_dispatch(self):
         from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
         from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
 
@@ -253,6 +321,10 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
                     "l1_init_admm_cg_tol": 1.0e-5,
                     "l1_init_admm_rho_data": 4.0,
                     "l1_init_admm_rho_reg": 1.0,
+                    "tv_pdhg_iters": 6,
+                    "tv_pdhg_theta": 0.0,
+                    "tv_pdhg_nonnegative": False,
+                    "tv_pdhg_power_iters": 3,
                 }
             )
             TIME_DOMAIN_CONFIG.update(
@@ -297,16 +369,27 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             coeff_l2_l1 = op.solve_l2_l1_admm(g_observed, lambda_reg=lam)
             coeff_l1_l1 = op.solve_l1_l1_admm(g_observed, lambda_reg=lam)
             coeff_l2_tv = op.solve_l2_tv_admm(g_observed, lambda_reg=lam)
+            coeff_l2_tv_pdhg = op.solve_l2_tv_pdhg(
+                g_observed,
+                lambda_reg=lam,
+                max_iter=6,
+                theta=0.0,
+                x0=zero,
+                power_iters=3,
+            )
 
             self.assertEqual(tuple(coeff_l2_l1.shape), (1, 1, 4, 4))
             self.assertEqual(tuple(coeff_l1_l1.shape), (1, 1, 4, 4))
             self.assertEqual(tuple(coeff_l2_tv.shape), (1, 1, 4, 4))
+            self.assertEqual(tuple(coeff_l2_tv_pdhg.shape), (1, 1, 4, 4))
             self.assertTrue(torch.isfinite(coeff_l2_l1).all())
             self.assertTrue(torch.isfinite(coeff_l1_l1).all())
             self.assertTrue(torch.isfinite(coeff_l2_tv).all())
+            self.assertTrue(torch.isfinite(coeff_l2_tv_pdhg).all())
             self.assertLess(float(objective_l2_l1(coeff_l2_l1)), float(objective_l2_l1(zero)))
             self.assertLess(float(objective_l1_l1(coeff_l1_l1)), float(objective_l1_l1(zero)))
             self.assertLess(float(objective_l2_tv(coeff_l2_tv)), float(objective_l2_tv(zero)))
+            self.assertLess(float(objective_l2_tv(coeff_l2_tv_pdhg)), float(objective_l2_tv(zero)))
 
             lam_normalized = lam / float(op.M)
             dispatched_l2_l1 = generator.solve_regularized_init(
@@ -324,9 +407,16 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
                 lambda_reg=lam_normalized,
                 init_method="l2_tv_admm",
             )
+            dispatched_l2_tv_pdhg = generator.solve_regularized_init(
+                g_observed,
+                lambda_reg=lam_normalized,
+                init_method="l2_tv_pdhg",
+            )
             self.assertEqual(tuple(dispatched_l2_l1.shape), (1, 1, 4, 4))
             self.assertEqual(tuple(dispatched_l1_l1.shape), (1, 1, 4, 4))
             self.assertEqual(tuple(dispatched_l2_tv.shape), (1, 1, 4, 4))
+            self.assertEqual(tuple(dispatched_l2_tv_pdhg.shape), (1, 1, 4, 4))
+            self.assertTrue(torch.isfinite(dispatched_l2_tv_pdhg).all())
             self.assertTrue(torch.allclose(dispatched_l2_l1, coeff_l2_l1, atol=1.0e-4, rtol=1.0e-3))
             self.assertTrue(torch.allclose(dispatched_l1_l1, coeff_l1_l1, atol=1.0e-4, rtol=1.0e-3))
             self.assertTrue(torch.allclose(dispatched_l2_tv, coeff_l2_tv, atol=1.0e-4, rtol=1.0e-3))
@@ -430,11 +520,117 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             self.assertEqual(info_tv["lambda_max_source"], "l2_l1_zero_threshold_proxy")
             self.assertEqual(info_tv["lambda_scale"], "normalized_by_measurements")
             self.assertLess(float(lam_tv.view(-1)[0].item()), 1.0e6)
+
+            TIME_DOMAIN_CONFIG["init_method"] = "l2_tv_pdhg"
+            lam_pdhg = generator._select_lambda(g_observed)
+            info_pdhg = dict(generator.last_lambda_info)
+            self.assertTrue(torch.isfinite(lam_pdhg).all())
+            self.assertEqual(info_pdhg["method"], "l2_tv_pdhg")
+            self.assertEqual(info_pdhg["residual_norm"], "l2")
+            self.assertEqual(info_pdhg["mode"], "morozov_iterative")
+            self.assertEqual(info_pdhg["lambda_max_source"], "configured")
+            self.assertEqual(info_pdhg["lambda_scale"], "normalized_by_measurements")
         finally:
             DATA_CONFIG.clear()
             DATA_CONFIG.update(data_backup)
             TIME_DOMAIN_CONFIG.clear()
             TIME_DOMAIN_CONFIG.update(time_backup)
+
+    def test_pdhg_morozov_search_checks_interior_lambdas_when_endpoint_residuals_are_large(self):
+        from config import DATA_CONFIG
+        from radon_transform import TheoreticalDataGenerator
+
+        class DummyPDHGGenerator(TheoreticalDataGenerator):
+            def __init__(self):
+                self.time_operator = object()
+                self.noise_mode = "additive"
+                self.noise_level = 1.0
+                self.last_lambda_info = None
+
+            def solve_regularized_init(self, g_obs, lambda_reg, *, init_method=None):
+                return torch.as_tensor(lambda_reg, dtype=torch.float32, device=g_obs.device).view(1, 1, 1, 1)
+
+            @torch.no_grad()
+            def _measurement_residual_norm(self, coeff, observed, *, norm_type: str):
+                lam_value = max(float(coeff.detach().view(-1)[0].item()), 1.0e-30)
+                residual = 1.0 + abs(math.log10(lam_value) - 1.0)
+                return torch.tensor([residual], dtype=torch.float32, device=observed.device)
+
+        data_backup = dict(DATA_CONFIG)
+        try:
+            DATA_CONFIG.update(
+                {
+                    "noise_mode": "additive",
+                    "noise_level": 1.0,
+                    "morozov_tau": 1.0,
+                    "morozov_max_iter": 13,
+                    "morozov_lambda_min": 1.0e-6,
+                    "morozov_lambda_max": 1.0e6,
+                }
+            )
+            generator = DummyPDHGGenerator()
+            observed = torch.zeros(1, 1)
+            lam = generator._choose_lambda_morozov_iterative(
+                observed,
+                init_method="l2_tv_pdhg",
+                residual_norm="l2",
+            )
+            info = dict(generator.last_lambda_info)
+
+            self.assertAlmostEqual(float(lam.view(-1)[0].item()), 10.0, delta=1.0e-4)
+            self.assertEqual(info["lambda_max_source"], "configured")
+            self.assertEqual(info["lambda_scale"], "normalized_by_measurements")
+            self.assertIn(info["status"][0], {"log_grid_best", "bracketed_log_grid"})
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
+
+    def test_pdhg_morozov_prefers_largest_discrepancy_feasible_lambda_branch(self):
+        from config import DATA_CONFIG
+        from radon_transform import TheoreticalDataGenerator
+
+        class DummyPDHGGenerator(TheoreticalDataGenerator):
+            def __init__(self):
+                self.time_operator = object()
+                self.noise_mode = "additive"
+                self.noise_level = 2.0
+                self.last_lambda_info = None
+
+            def solve_regularized_init(self, g_obs, lambda_reg, *, init_method=None):
+                return torch.as_tensor(lambda_reg, dtype=torch.float32, device=g_obs.device).view(1, 1, 1, 1)
+
+            @torch.no_grad()
+            def _measurement_residual_norm(self, coeff, observed, *, norm_type: str):
+                lam_value = max(float(coeff.detach().view(-1)[0].item()), 1.0e-30)
+                residual = 1.0 + abs(math.log10(lam_value) - 1.0)
+                return torch.tensor([residual], dtype=torch.float32, device=observed.device)
+
+        data_backup = dict(DATA_CONFIG)
+        try:
+            DATA_CONFIG.update(
+                {
+                    "noise_mode": "additive",
+                    "noise_level": 2.0,
+                    "morozov_tau": 1.0,
+                    "morozov_max_iter": 17,
+                    "morozov_lambda_min": 1.0e-6,
+                    "morozov_lambda_max": 1.0e6,
+                }
+            )
+            generator = DummyPDHGGenerator()
+            observed = torch.zeros(1, 1)
+            lam = generator._choose_lambda_morozov_iterative(
+                observed,
+                init_method="l2_tv_pdhg",
+                residual_norm="l2",
+            )
+            info = dict(generator.last_lambda_info)
+
+            self.assertAlmostEqual(float(lam.view(-1)[0].item()), 100.0, delta=1.0e-3)
+            self.assertEqual(info["status"][0], "bracketed_log_grid")
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
 
     def test_morozov_lambda_uses_observed_multiplicative_noise_bound_not_clean_data(self):
         from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
@@ -478,7 +674,6 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             generator = TheoreticalDataGenerator(img_size=4, data_source="shepp_logan", time_operator=op)
             g_observed = torch.linspace(0.2, 1.1, steps=op.M, dtype=torch.float32, device=device).view(1, -1)
             self.assertNotIn("g_clean", inspect.signature(generator.select_lambda_for_init_method).parameters)
-            self.assertNotIn("g_clean", inspect.signature(generator.solve_morozov_constrained_init).parameters)
 
             expected_l2 = (0.1 / (3.0 + 0.1 * 0.1) ** 0.5) * torch.norm(g_observed, dim=-1)
             lam_a = generator.select_lambda_for_init_method(g_observed, init_method="tikhonov_direct")
@@ -501,6 +696,106 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             self.assertAlmostEqual(float(info_l1_a["target_norm"][0]), float(expected_l1[0].item()), places=6)
             self.assertEqual(info_l1_a["target_norm"], info_l1_b["target_norm"])
             self.assertEqual(info_l1_a["noise_radius_source"], "observed_multiplicative_rms")
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(data_backup)
+            TIME_DOMAIN_CONFIG.clear()
+            TIME_DOMAIN_CONFIG.update(time_backup)
+
+    def test_morozov_form_config_and_constrained_api_are_available(self):
+        import importlib
+        import config
+        import radon_transform
+        from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
+
+        config_source = Path(MODELS_DIR / "config.py").read_text(encoding="utf-8")
+
+        self.assertIn('"morozov_form": "regularized"', config_source)
+        self.assertIn("MOROZOV_FORM_OVERRIDE", config_source)
+        self.assertIn("MOROZOV_NOISE_RADIUS_MODE_OVERRIDE", config_source)
+        self.assertNotIn("ADMM_MOROZOV_CHECK_OVERRIDE", config_source)
+        self.assertNotIn("ADMM_MOROZOV_TAU_OVERRIDE", config_source)
+        self.assertNotIn("admm_morozov_check", config_source)
+        self.assertNotIn("admm_morozov_tau", config_source)
+        self.assertTrue(hasattr(radon_transform.AlphaContinuousB1B1Operator2D, "solve_l2_l1_morozov_admm"))
+        self.assertTrue(hasattr(radon_transform.AlphaContinuousB1B1Operator2D, "solve_l1_l1_morozov_admm"))
+        self.assertTrue(hasattr(radon_transform.AlphaContinuousB1B1Operator2D, "solve_l2_tv_morozov_admm"))
+        self.assertTrue(hasattr(TheoreticalDataGenerator, "solve_constrained_init"))
+        self.assertTrue(hasattr(TheoreticalDataGenerator, "solve_morozov_constrained_init"))
+
+        env_backup = os.environ.get("MOROZOV_FORM_OVERRIDE")
+        try:
+            os.environ["MOROZOV_FORM_OVERRIDE"] = "constrained"
+            reloaded = importlib.reload(config)
+            self.assertEqual(reloaded.DATA_CONFIG["morozov_form"], "constrained")
+        finally:
+            if env_backup is None:
+                os.environ.pop("MOROZOV_FORM_OVERRIDE", None)
+            else:
+                os.environ["MOROZOV_FORM_OVERRIDE"] = env_backup
+            importlib.reload(config)
+            importlib.reload(radon_transform)
+
+    def test_constrained_morozov_form_uses_radius_instead_of_lambda_search(self):
+        from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
+        from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
+
+        data_backup = dict(DATA_CONFIG)
+        time_backup = dict(TIME_DOMAIN_CONFIG)
+        try:
+            DATA_CONFIG.update(
+                {
+                    "lambda_select_mode": "morozov",
+                    "morozov_form": "constrained",
+                    "noise_mode": "additive",
+                    "noise_level": 0.25,
+                    "morozov_tau": 2.0,
+                    "l1_init_admm_iters": 2,
+                    "l1_init_admm_cg_iters": 2,
+                    "l1_init_admm_cg_tol": 1.0e-4,
+                    "l1_init_admm_rho_data": 1.0,
+                    "l1_init_admm_rho_reg": 1.0,
+                }
+            )
+            TIME_DOMAIN_CONFIG.update(
+                {
+                    "experiment_profile": "runtime_alpha",
+                    "operator_mode": "theoretical_b1b1",
+                    "use_multi_angle": True,
+                    "alpha_values": [0.23, 1.11],
+                    "alpha_tau_offsets": [0.15, 0.35],
+                    "num_angles_total": 2,
+                    "num_angles": 2,
+                    "theoretical_formula_mode": "alpha_continuous",
+                    "data_formula_mode": "auto_complete",
+                    "init_method": "l2_tv_admm",
+                }
+            )
+            op = AlphaContinuousB1B1Operator2D(
+                alpha_values=[0.23, 1.11],
+                height=4,
+                width=4,
+                tau_offsets=[0.15, 0.35],
+            ).to(device)
+            generator = TheoreticalDataGenerator(img_size=4, data_source="shepp_logan", time_operator=op)
+            g_observed = torch.linspace(0.1, 0.9, steps=op.M, dtype=torch.float32, device=device).view(1, -1)
+            expected_radius = 2.0 * 0.25 * math.sqrt(float(op.M))
+
+            radius = generator._select_lambda(g_observed)
+            info = dict(generator.last_lambda_info)
+            self.assertEqual(info["mode"], "morozov_constrained_radius")
+            self.assertEqual(info["method"], "l2_tv_admm")
+            self.assertEqual(info["residual_norm"], "l2")
+            self.assertAlmostEqual(float(radius.view(-1)[0].item()), expected_radius, places=5)
+            self.assertAlmostEqual(float(info["constraint_radius"][0]), expected_radius, places=5)
+
+            coeff = generator.solve_morozov_constrained_init(g_observed, init_method="l2_tv_admm")
+            info = dict(generator.last_lambda_info)
+            self.assertEqual(tuple(coeff.shape), (1, 1, 4, 4))
+            self.assertTrue(torch.isfinite(coeff).all())
+            self.assertEqual(info["mode"], "morozov_constrained")
+            self.assertEqual(info["solver_stats"]["method"], "l2_tv_morozov_admm")
+            self.assertIn("constraint_radius", info["solver_stats"])
         finally:
             DATA_CONFIG.clear()
             DATA_CONFIG.update(data_backup)
@@ -558,88 +853,6 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             TIME_DOMAIN_CONFIG.clear()
             TIME_DOMAIN_CONFIG.update(time_backup)
 
-    def test_morozov_constrained_l1_initializers_enforce_residual_balls(self):
-        from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
-        from radon_transform import AlphaContinuousB1B1Operator2D, TheoreticalDataGenerator
-
-        data_backup = dict(DATA_CONFIG)
-        time_backup = dict(TIME_DOMAIN_CONFIG)
-        try:
-            DATA_CONFIG.update(
-                {
-                    "lambda_select_mode": "morozov",
-                    "morozov_tau": 1.0,
-                    "l1_init_admm_iters": 96,
-                    "l1_init_admm_cg_iters": 16,
-                    "l1_init_admm_cg_tol": 1.0e-5,
-                    "l1_init_admm_rho_data": 4.0,
-                    "l1_init_admm_rho_reg": 4.0,
-                }
-            )
-            TIME_DOMAIN_CONFIG.update(
-                {
-                    "experiment_profile": "runtime_alpha",
-                    "operator_mode": "theoretical_b1b1",
-                    "use_multi_angle": True,
-                    "alpha_values": [0.23, 1.11],
-                    "alpha_tau_offsets": [0.15, 0.35],
-                    "num_angles_total": 2,
-                    "num_angles": 2,
-                    "theoretical_formula_mode": "alpha_continuous",
-                    "data_formula_mode": "auto_complete",
-                }
-            )
-            torch.manual_seed(17)
-            op = AlphaContinuousB1B1Operator2D(
-                alpha_values=[0.23, 1.11],
-                height=4,
-                width=4,
-                tau_offsets=[0.15, 0.35],
-            ).to(device)
-            generator = TheoreticalDataGenerator(img_size=4, data_source="shepp_logan", time_operator=op)
-            coeff_true = torch.randn(1, 1, 4, 4, device=device)
-            g_clean = op(coeff_true)
-            g_observed = g_clean + 0.05 * torch.randn_like(g_clean)
-
-            coeff_l2 = generator.solve_morozov_constrained_init(
-                g_observed,
-                init_method="l2_l1_admm",
-            )
-            info_l2 = dict(generator.last_lambda_info)
-            target_l2 = float(info_l2["target_norm"][0])
-            residual_l2 = float(torch.norm(op(coeff_l2) - g_observed, dim=-1).view(-1)[0].item())
-            self.assertEqual(info_l2["mode"], "morozov_constrained")
-            self.assertEqual(info_l2["residual_norm"], "l2")
-            self.assertLessEqual(residual_l2, target_l2 * 1.08 + 1.0e-5)
-
-            coeff_l1 = generator.solve_morozov_constrained_init(
-                g_observed,
-                init_method="l1_l1_admm",
-            )
-            info_l1 = dict(generator.last_lambda_info)
-            target_l1 = float(info_l1["target_norm"][0])
-            residual_l1 = float(torch.sum(torch.abs(op(coeff_l1) - g_observed), dim=-1).view(-1)[0].item())
-            self.assertEqual(info_l1["mode"], "morozov_constrained")
-            self.assertEqual(info_l1["residual_norm"], "l1")
-            self.assertLessEqual(residual_l1, target_l1 * 1.08 + 1.0e-5)
-
-            coeff_tv = generator.solve_morozov_constrained_init(
-                g_observed,
-                init_method="l2_tv_admm",
-            )
-            info_tv = dict(generator.last_lambda_info)
-            target_tv = float(info_tv["target_norm"][0])
-            residual_tv = float(torch.norm(op(coeff_tv) - g_observed, dim=-1).view(-1)[0].item())
-            self.assertEqual(info_tv["mode"], "morozov_constrained")
-            self.assertEqual(info_tv["residual_norm"], "l2")
-            self.assertLessEqual(residual_tv, target_tv * 1.08 + 1.0e-5)
-            self.assertTrue(torch.isfinite(coeff_tv).all())
-        finally:
-            DATA_CONFIG.clear()
-            DATA_CONFIG.update(data_backup)
-            TIME_DOMAIN_CONFIG.clear()
-            TIME_DOMAIN_CONFIG.update(time_backup)
-
     def test_alpha_eval_defines_regularized_baseline_methods(self):
         alpha_dir = MODELS_DIR / "α_condition"
         if str(alpha_dir) not in sys.path:
@@ -651,7 +864,7 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             list(by_name.keys()),
-            ["tikhonov_l2_l2", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm"],
+            ["tikhonov_l2_l2", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm", "l2_tv_pdhg"],
         )
         self.assertEqual(by_name["tikhonov_l2_l2"]["init_method"], "tikhonov_direct")
         self.assertEqual(by_name["tikhonov_l2_l2"]["morozov_residual_norm"], "l2")
@@ -662,6 +875,9 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
         self.assertEqual(by_name["l2_tv_admm"]["init_method"], "l2_tv_admm")
         self.assertEqual(by_name["l2_tv_admm"]["objective"], "l2_tv")
         self.assertEqual(by_name["l2_tv_admm"]["morozov_residual_norm"], "l2")
+        self.assertEqual(by_name["l2_tv_pdhg"]["init_method"], "l2_tv_pdhg")
+        self.assertEqual(by_name["l2_tv_pdhg"]["objective"], "l2_tv")
+        self.assertEqual(by_name["l2_tv_pdhg"]["morozov_residual_norm"], "l2")
 
     def test_initialization_methods_are_available_as_shared_model_choices(self):
         import initialization_methods as init_methods
@@ -669,17 +885,24 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
 
         self.assertEqual(
             list(init_methods.REGULARIZED_INIT_METHOD_CHOICES),
-            ["tikhonov_direct", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm"],
+            ["tikhonov_direct", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm", "l2_tv_pdhg"],
         )
         self.assertTrue(set(init_methods.REGULARIZED_INIT_METHOD_CHOICES).issubset(set(INIT_METHOD_CHOICES)))
+        self.assertEqual(
+            list(init_methods.MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS),
+            ["l2_l1_admm", "l1_l1_admm", "l2_tv_admm", "l2_tv_pdhg"],
+        )
         self.assertEqual(init_methods.normalize_init_method("tikhonov"), "tikhonov_direct")
         self.assertEqual(init_methods.normalize_init_method("L2/L1"), "l2_l1_admm")
         self.assertEqual(init_methods.normalize_init_method("l1-l1"), "l1_l1_admm")
         self.assertEqual(init_methods.normalize_init_method("tv"), "l2_tv_admm")
+        self.assertEqual(init_methods.normalize_init_method("tv_pdhg"), "l2_tv_pdhg")
+        self.assertEqual(init_methods.normalize_init_method("pdhg_tv"), "l2_tv_pdhg")
 
         methods = init_methods.reconstruction_method_defs()
-        self.assertEqual([item["name"] for item in methods], ["tikhonov_l2_l2", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm"])
+        self.assertEqual([item["name"] for item in methods], ["tikhonov_l2_l2", "l2_l1_admm", "l1_l1_admm", "l2_tv_admm", "l2_tv_pdhg"])
         self.assertEqual(init_methods.method_spec_from_init_method("tv")["objective"], "l2_tv")
+        self.assertEqual(init_methods.method_spec_from_init_method("tv_pdhg")["init_method"], "l2_tv_pdhg")
 
     def test_shepp_logan_comparison_exposes_adjustable_angle_count_helpers(self):
         comparison_dir = MODELS_DIR / "shepp_logan_comparison"

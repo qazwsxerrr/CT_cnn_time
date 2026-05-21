@@ -20,8 +20,10 @@ if str(MODELS_DIR) not in sys.path:
 
 from model import initialize_model, load_trainable_state_dict
 from radon_transform import TheoreticalDataGenerator
+from initialization_methods import normalize_init_method
 from config import (
     device,
+    THEORETICAL_CONFIG,
     BEST_MODEL_PATH,
     MODEL_PATH,
     MODEL_DIR,
@@ -172,14 +174,43 @@ def _temporary_experiment_config(experiment_metadata: dict):
         return
 
     backup = copy.deepcopy(TIME_DOMAIN_CONFIG)
+    data_backup = copy.deepcopy(DATA_CONFIG)
+    theoretical_backup = copy.deepcopy(THEORETICAL_CONFIG)
     backup_cnn_angle_indices = backup.get("cnn_angle_indices_override", None)
     try:
+        if experiment_metadata.get("regularizer_type"):
+            regularizer_type = str(experiment_metadata["regularizer_type"]).strip().lower()
+            allowed_regularizers = {"tikhonov", "dirichlet", "tv"}
+            if regularizer_type not in allowed_regularizers:
+                raise ValueError(
+                    f"Unsupported checkpoint regularizer_type={regularizer_type!r}; "
+                    f"expected one of {sorted(allowed_regularizers)!r}."
+                )
+            THEORETICAL_CONFIG["regularizer_type"] = regularizer_type
         profile_name = str(experiment_metadata.get("experiment_profile", "") or "").strip()
         if profile_name:
             try:
                 _apply_experiment_profile(profile_name)
             except ValueError:
                 TIME_DOMAIN_CONFIG["experiment_profile"] = profile_name
+        if experiment_metadata.get("init_method"):
+            TIME_DOMAIN_CONFIG["init_method"] = normalize_init_method(str(experiment_metadata["init_method"]))
+        data_restore_types = {
+            "lambda_select_mode": str,
+            "l1_init_admm_iters": int,
+            "l1_init_admm_cg_iters": int,
+            "l1_init_admm_cg_tol": float,
+            "l1_init_admm_rho_data": float,
+            "l1_init_admm_rho_reg": float,
+            "admm_stop_mode": str,
+            "tv_pdhg_iters": int,
+            "tv_pdhg_theta": float,
+            "tv_pdhg_nonnegative": bool,
+            "tv_pdhg_power_iters": int,
+        }
+        for key, caster in data_restore_types.items():
+            if key in experiment_metadata:
+                DATA_CONFIG[key] = caster(experiment_metadata[key])
         if experiment_metadata.get("operator_mode"):
             TIME_DOMAIN_CONFIG["operator_mode"] = str(experiment_metadata["operator_mode"])
         if experiment_metadata.get("theoretical_formula_mode"):
@@ -250,6 +281,10 @@ def _temporary_experiment_config(experiment_metadata: dict):
     finally:
         TIME_DOMAIN_CONFIG.clear()
         TIME_DOMAIN_CONFIG.update(backup)
+        DATA_CONFIG.clear()
+        DATA_CONFIG.update(data_backup)
+        THEORETICAL_CONFIG.clear()
+        THEORETICAL_CONFIG.update(theoretical_backup)
 
 
 def evaluate(

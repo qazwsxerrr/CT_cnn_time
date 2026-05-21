@@ -7,7 +7,8 @@ training, testing, and standalone Shepp-Logan comparison scripts:
 * Tikhonov: ``||Ax-b||_2^2 + lambda ||x||_2^2``
 * L2/L1: ``||Ax-b||_2^2 + lambda ||x||_1``
 * L1/L1: ``||Ax-b||_1 + lambda ||x||_1``
-* L2/TV: ``||Ax-b||_2^2 + lambda TV(x)``
+* L2/TV ADMM: ``||Ax-b||_2^2 + lambda TV(x)``
+* L2/TV PDHG: few primal-dual steps for fast TV-informed initialization
 
 Keep the canonical names centralized here so command-line overrides,
 experiment scripts, and data generators dispatch to the same methods.
@@ -20,18 +21,27 @@ TIKHONOV_INIT_METHOD = "tikhonov_direct"
 L2_L1_INIT_METHOD = "l2_l1_admm"
 L1_L1_INIT_METHOD = "l1_l1_admm"
 L2_TV_INIT_METHOD = "l2_tv_admm"
+L2_TV_PDHG_INIT_METHOD = "l2_tv_pdhg"
 
 REGULARIZED_INIT_METHOD_CHOICES = (
     TIKHONOV_INIT_METHOD,
     L2_L1_INIT_METHOD,
     L1_L1_INIT_METHOD,
     L2_TV_INIT_METHOD,
+    L2_TV_PDHG_INIT_METHOD,
 )
 
 SPLIT_ADMM_INIT_METHODS = (
     L2_L1_INIT_METHOD,
     L1_L1_INIT_METHOD,
     L2_TV_INIT_METHOD,
+)
+
+MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS = (
+    L2_L1_INIT_METHOD,
+    L1_L1_INIT_METHOD,
+    L2_TV_INIT_METHOD,
+    L2_TV_PDHG_INIT_METHOD,
 )
 
 INIT_METHOD_CHOICES = (
@@ -60,6 +70,11 @@ _ALIASES = {
     "l2/tv": L2_TV_INIT_METHOD,
     "l2-tv": L2_TV_INIT_METHOD,
     "l2_tv_admm": L2_TV_INIT_METHOD,
+    "tv_pdhg": L2_TV_PDHG_INIT_METHOD,
+    "l2_tv_pdhg": L2_TV_PDHG_INIT_METHOD,
+    "pdhg_tv": L2_TV_PDHG_INIT_METHOD,
+    "pdhg-tv": L2_TV_PDHG_INIT_METHOD,
+    "l2/tv/pdhg": L2_TV_PDHG_INIT_METHOD,
 }
 
 _RECONSTRUCTION_METHODS: tuple[dict[str, str], ...] = (
@@ -84,6 +99,12 @@ _RECONSTRUCTION_METHODS: tuple[dict[str, str], ...] = (
     {
         "name": L2_TV_INIT_METHOD,
         "init_method": L2_TV_INIT_METHOD,
+        "objective": "l2_tv",
+        "morozov_residual_norm": "l2",
+    },
+    {
+        "name": L2_TV_PDHG_INIT_METHOD,
+        "init_method": L2_TV_PDHG_INIT_METHOD,
         "objective": "l2_tv",
         "morozov_residual_norm": "l2",
     },
@@ -141,8 +162,10 @@ __all__ = [
     "L2_L1_INIT_METHOD",
     "L1_L1_INIT_METHOD",
     "L2_TV_INIT_METHOD",
+    "L2_TV_PDHG_INIT_METHOD",
     "REGULARIZED_INIT_METHOD_CHOICES",
     "SPLIT_ADMM_INIT_METHODS",
+    "MEASUREMENT_NORMALIZED_REGULARIZED_INIT_METHODS",
     "INIT_METHOD_CHOICES",
     "normalize_init_method",
     "reconstruction_method_defs",
