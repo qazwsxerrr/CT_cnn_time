@@ -26,6 +26,7 @@ from model import (
     load_trainable_state_dict,
 )
 from radon_transform import TheoreticalDataGenerator
+from data_genoration import OfflineBatchProvider
 from config import (
     n_data, n_train,
     device, MODEL_PATH, BEST_MODEL_PATH, CHECKPOINT_DIR,
@@ -40,6 +41,20 @@ N_DATA = int(os.environ.get("N_DATA_OVERRIDE", n_data))
 def _resolve_resume_checkpoint_path():
     resume_path = str(os.environ.get("RESUME_CHECKPOINT_OVERRIDE", "") or "").strip()
     return resume_path or None
+
+
+def _build_train_or_val_generator(*, data_source, shared_time_operator, offline_env_name, shuffle_offline):
+    offline_path = str(os.environ.get(offline_env_name, "") or "").strip()
+    if offline_path:
+        return OfflineBatchProvider(
+            offline_path,
+            shuffle=bool(shuffle_offline),
+            target_device=None,
+        )
+    return TheoreticalDataGenerator(
+        data_source=data_source,
+        time_operator=shared_time_operator,
+    )
 
 
 def _next_training_start_iter(current_iter):
@@ -65,7 +80,11 @@ def _build_cnn_angle_selection_summary(
 ):
     indices = [int(idx) for idx in list(cnn_angle_indices or [])]
     physics_mode = str(physics_residual_mode or "").strip().lower()
-    physics_indices = indices if bool(physics_residual_enabled) and physics_mode == "per_angle_cg" else []
+    physics_indices = (
+        indices
+        if bool(physics_residual_enabled) and physics_mode in {"per_angle_cg", "stacked_selected_cg"}
+        else []
+    )
     return {
         "count": int(len(indices)),
         "indices": indices,
@@ -105,16 +124,24 @@ class TheoreticalTrainer:
             DATA_CONFIG.get("val_data_source", DATA_CONFIG.get("data_source", train_data_source))
         ).strip().lower()
         shared_time_operator = getattr(self.model.optimizer, "operator", None)
-        self.data_generator = TheoreticalDataGenerator(
+        self.data_generator = _build_train_or_val_generator(
             data_source=train_data_source,
-            time_operator=shared_time_operator,
+            shared_time_operator=shared_time_operator,
+            offline_env_name="OFFLINE_TRAIN_DATASET_OVERRIDE",
+            shuffle_offline=True,
         )
-        self.val_data_generator = TheoreticalDataGenerator(
+        self.val_data_generator = _build_train_or_val_generator(
             data_source=val_data_source,
-            time_operator=shared_time_operator,
+            shared_time_operator=shared_time_operator,
+            offline_env_name="OFFLINE_VAL_DATASET_OVERRIDE",
+            shuffle_offline=False,
         )
         self.logger.info("Train data source: %s", train_data_source)
         self.logger.info("Validation data source: %s", val_data_source)
+        if os.environ.get("OFFLINE_TRAIN_DATASET_OVERRIDE", "").strip():
+            self.logger.info("Offline train dataset: %s", os.environ["OFFLINE_TRAIN_DATASET_OVERRIDE"])
+        if os.environ.get("OFFLINE_VAL_DATASET_OVERRIDE", "").strip():
+            self.logger.info("Offline validation dataset: %s", os.environ["OFFLINE_VAL_DATASET_OVERRIDE"])
         self.logger.info("Experiment tag: %s", self.experiment_metadata["output_tag"])
         self.logger.info("Operator mode: %s", self.experiment_metadata["operator_mode"])
         self.logger.info("Operator class: %s", self.experiment_metadata["operator_class"])
@@ -153,14 +180,35 @@ class TheoreticalTrainer:
             "Data fidelity gradient channel angle indices: %s",
             self.experiment_metadata["cnn_angle_selection"]["data_fidelity_gradient_channel_indices"],
         )
+        self.logger.info(
+            "Data fidelity channel mode: %s channels=%d",
+            self.experiment_metadata["data_fidelity_channel_mode"],
+            self.experiment_metadata["data_fidelity_channels"],
+        )
         if self.experiment_metadata["cnn_angle_selection"]["physics_residual_channel_indices"]:
             self.logger.info(
                 "Physics residual channel angle indices: %s",
                 self.experiment_metadata["cnn_angle_selection"]["physics_residual_channel_indices"],
             )
         self.logger.info(
+            "Physics residual: enabled=%s mode=%s channels=%d explicit_update=%s",
+            self.experiment_metadata["physics_residual_channel_enabled"],
+            self.experiment_metadata["physics_residual_mode"],
+            self.experiment_metadata["physics_residual_channels"],
+            self.experiment_metadata["physics_explicit_update_enabled"],
+        )
+        self.logger.info(
             "Active alpha JSON: %s",
             self.experiment_metadata.get("alpha_condition_constrained_json"),
+        )
+        self.logger.info(
+            "Init alpha JSON: %s",
+            self.experiment_metadata.get("init_alpha_condition_constrained_json"),
+        )
+        self.logger.info(
+            "Generator init operator shared with data operator: train=%s val=%s",
+            bool(getattr(self.data_generator, "init_time_operator", None) is getattr(self.data_generator, "data_time_operator", None)),
+            bool(getattr(self.val_data_generator, "init_time_operator", None) is getattr(self.val_data_generator, "data_time_operator", None)),
         )
         self.logger.info(
             "Active alpha angles (%d): %s",
@@ -181,6 +229,13 @@ class TheoreticalTrainer:
                 noise_mode,
                 DATA_CONFIG.get("noise_level", 0.1),
             )
+        self.logger.info(
+            "Validation: interval=%d batch_size=%d random_subsample=%s reproducible=%s",
+            int(TRAINING_CONFIG.get("validation_interval", 10)),
+            int(DATA_CONFIG.get("val_batch_size", N_DATA)),
+            bool(DATA_CONFIG.get("val_random_subsample", False)),
+            bool(DATA_CONFIG.get("val_reproducible", False)),
+        )
 
         # Separate parameter groups: zero weight_decay and lower LR for per-iteration scalars
         scalar_params = []
@@ -240,6 +295,7 @@ class TheoreticalTrainer:
                 TIME_DOMAIN_CONFIG.get("physics_residual_mode", "per_angle_cg"),
             )
         )
+        init_records = list(TIME_DOMAIN_CONFIG.get("init_alpha_condition_constrained_records") or [])
         angle_selection = _build_cnn_angle_selection_summary(
             cnn_angle_indices=cnn_angle_indices,
             alpha_values=alpha_values,
@@ -275,8 +331,11 @@ class TheoreticalTrainer:
             "cnn_angle_alpha_values": list(angle_selection["alpha_values"]),
             "cnn_angle_tau_offsets": list(angle_selection["tau_offsets"]),
             "cnn_angle_selection": angle_selection,
+            "data_fidelity_channel_mode": str(getattr(self.model.optimizer, "data_fidelity_channel_mode", DATA_CONFIG.get("data_fidelity_channel_mode", "per_angle"))),
+            "data_fidelity_channels": int(getattr(self.model.optimizer, "data_fidelity_channels", getattr(self.model.optimizer, "cnn_num_angles", 1)) or 1),
             "physics_residual_channel_enabled": physics_residual_enabled,
             "physics_residual_mode": physics_residual_mode,
+            "physics_residual_channels": int(getattr(self.model.optimizer, "physics_residual_channels", 0) or 0),
             "physics_residual_cg_iters": int(getattr(self.model.optimizer, "physics_residual_cg_iters", TIME_DOMAIN_CONFIG.get("physics_residual_cg_iters", 8)) or 0),
             "physics_residual_damping": float(getattr(self.model.optimizer, "physics_residual_damping", TIME_DOMAIN_CONFIG.get("physics_residual_damping", 1.0e-2))),
             "physics_residual_detach": bool(getattr(self.model.optimizer, "physics_residual_detach", TIME_DOMAIN_CONFIG.get("physics_residual_detach", True))),
@@ -285,6 +344,9 @@ class TheoreticalTrainer:
             "alpha_values": list(TIME_DOMAIN_CONFIG.get("alpha_values") or []),
             "alpha_tau_offsets": list(TIME_DOMAIN_CONFIG.get("alpha_tau_offsets") or []),
             "alpha_condition_constrained_json": TIME_DOMAIN_CONFIG.get("alpha_condition_constrained_json", None),
+            "init_alpha_values": [float(item["alpha"]) for item in init_records],
+            "init_alpha_tau_offsets": [float(item["tau_star"] if "tau_star" in item else item["tau"]) for item in init_records],
+            "init_alpha_condition_constrained_json": TIME_DOMAIN_CONFIG.get("init_alpha_condition_constrained_json", None),
             "theoretical_formula_mode": str(TIME_DOMAIN_CONFIG.get("theoretical_formula_mode", "auto")),
             "data_formula_mode": str(TIME_DOMAIN_CONFIG.get("data_formula_mode", "auto_complete")),
         }
@@ -324,7 +386,16 @@ class TheoreticalTrainer:
         seed = None
         if val_repro:
             seed = int(os.environ.get("VAL_SEED_OVERRIDE", DATA_CONFIG.get("validation_seed", 42)))
-        if seed is not None:
+        val_random_subsample = bool(DATA_CONFIG.get("val_random_subsample", False))
+        if val_random_subsample and hasattr(self.val_data_generator, "generate_random_batch"):
+            subset_seed = None
+            if seed is not None:
+                subset_seed = seed + max(int(getattr(self, "current_iter", 0)), 0)
+            coeff_true_val, _, g_observed_val, coeff_initial_val = self.val_data_generator.generate_random_batch(
+                batch_size=val_bs,
+                random_seed=subset_seed,
+            )
+        elif seed is not None:
             # NOTE: generate_batch(random_seed=...) calls torch.manual_seed/np.random.seed.
             # If we don't restore RNG states, this will reset the global RNG and make subsequent
             # training batches partially deterministic (hurts generalization and confuses curves).

@@ -114,6 +114,7 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
         regularizer_backup = dict(THEORETICAL_CONFIG)
         try:
             DATA_CONFIG["l1_init_admm_iters"] = 12
+            DATA_CONFIG["data_fidelity_channel_mode"] = "per_angle"
             THEORETICAL_CONFIG["regularizer_type"] = "tikhonov"
             TIME_DOMAIN_CONFIG.update(
                 {
@@ -137,6 +138,7 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
                 "regularizer_type": "tv",
                 "init_method": "l2_tv_admm",
                 "l1_init_admm_iters": 80,
+                "data_fidelity_channel_mode": "stacked_selected",
             }
             with _temporary_experiment_config(metadata):
                 self.assertEqual(TIME_DOMAIN_CONFIG["cnn_angle_indices_override"], [0, 2])
@@ -145,6 +147,7 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
                 self.assertEqual(THEORETICAL_CONFIG["regularizer_type"], "tv")
                 self.assertEqual(TIME_DOMAIN_CONFIG["init_method"], "l2_tv_admm")
                 self.assertEqual(DATA_CONFIG["l1_init_admm_iters"], 80)
+                self.assertEqual(DATA_CONFIG["data_fidelity_channel_mode"], "stacked_selected")
         finally:
             DATA_CONFIG.clear()
             DATA_CONFIG.update(data_backup)
@@ -956,6 +959,52 @@ class AlphaOnlyRefactorTests(unittest.TestCase):
             plot_selected_angle_counts.safe_method_filename("l2_tv_admm"),
             "l2_tv_admm",
         )
+
+    def test_data_generator_can_use_separate_init_alpha_records(self):
+        import radon_transform
+        from config import DATA_CONFIG, TIME_DOMAIN_CONFIG
+
+        old_data_config = dict(DATA_CONFIG)
+        old_time_config = dict(TIME_DOMAIN_CONFIG)
+        try:
+            TIME_DOMAIN_CONFIG.update(
+                {
+                    "alpha_values": [0.1, 0.9],
+                    "alpha_tau_offsets": [0.2, 0.3],
+                    "init_alpha_condition_constrained_records": [
+                        {"alpha": 0.25, "tau_star": 0.4},
+                    ],
+                    "init_alpha_condition_constrained_json": "unit-test-init-alpha.json",
+                    "init_method": "tikhonov_direct",
+                }
+            )
+            DATA_CONFIG.update(
+                {
+                    "lambda_select_mode": "fixed",
+                    "lambda_reg": 1.0e-2,
+                    "noise_mode": "multiplicative",
+                    "noise_level": 0.1,
+                }
+            )
+
+            generator = radon_transform.TheoreticalDataGenerator(img_size=4, data_source="shepp_logan")
+
+            self.assertEqual(generator.data_time_operator.num_angles, 2)
+            self.assertEqual(generator.init_time_operator.num_angles, 1)
+            self.assertIs(generator.time_operator, generator.data_time_operator)
+            self.assertIsNot(generator.init_time_operator, generator.data_time_operator)
+
+            coeff_true, _f_true, g_observed, coeff_initial = generator.generate_batch(batch_size=1, random_seed=123)
+            self.assertEqual(tuple(coeff_true.shape), (1, 1, 4, 4))
+            self.assertEqual(tuple(coeff_initial.shape), (1, 1, 4, 4))
+            self.assertEqual(int(g_observed.shape[-1]), int(generator.data_time_operator.M))
+            self.assertNotEqual(int(generator.init_time_operator.M), int(generator.data_time_operator.M))
+            self.assertIs(generator.time_operator, generator.data_time_operator)
+        finally:
+            DATA_CONFIG.clear()
+            DATA_CONFIG.update(old_data_config)
+            TIME_DOMAIN_CONFIG.clear()
+            TIME_DOMAIN_CONFIG.update(old_time_config)
 
 
 if __name__ == "__main__":

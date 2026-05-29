@@ -27,6 +27,7 @@ import json
 import math
 import os
 import time
+from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -737,6 +738,43 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
     def apply_normal(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.adjoint(self.forward(coeff_matrix))
 
+    def _normalize_angle_indices(self, angle_indices) -> list[int]:
+        if angle_indices is None:
+            indices = []
+        elif torch.is_tensor(angle_indices):
+            indices = [int(idx) for idx in angle_indices.detach().cpu().view(-1).tolist()]
+        else:
+            indices = [int(idx) for idx in list(angle_indices)]
+        if not indices:
+            raise ValueError("angle_indices must not be empty.")
+        if len(set(indices)) != len(indices):
+            raise ValueError(f"angle_indices contains duplicates: {indices!r}.")
+        invalid = [idx for idx in indices if idx < 0 or idx >= int(self.num_angles)]
+        if invalid:
+            raise ValueError(
+                f"angle_indices contains out-of-range indices {invalid!r} "
+                f"for num_angles={int(self.num_angles)}."
+            )
+        return indices
+
+    def apply_normal_selected_angles(self, coeff_matrix: torch.Tensor, angle_indices) -> torch.Tensor:
+        """Apply the stacked normal matrix for a selected angle subset.
+
+        This computes ``sum_{k in S} A_k^T A_k coeff_matrix`` without using
+        the unselected angle blocks.  It is the normal operator for the
+        selected stacked matrix ``A_S``.
+        """
+        indices = self._normalize_angle_indices(angle_indices)
+        measurement_pa = self.forward_per_angle(coeff_matrix)
+        mask = torch.zeros(
+            int(self.num_angles),
+            dtype=measurement_pa.dtype,
+            device=measurement_pa.device,
+        )
+        mask[torch.as_tensor(indices, dtype=torch.long, device=measurement_pa.device)] = 1.0
+        measurement_pa = measurement_pa * mask.view(1, int(self.num_angles), 1)
+        return self.adjoint_per_angle(measurement_pa).sum(dim=1)
+
     def tv_gradient(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         """Forward finite-difference gradient used by anisotropic TV.
 
@@ -1012,6 +1050,43 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             rs_old = rs_new
         return x
 
+    def solve_shifted_selected_normal_cg(
+        self,
+        rhs: torch.Tensor,
+        angle_indices,
+        damping: float = 1.0e-2,
+        cg_iters: int = 8,
+    ) -> torch.Tensor:
+        """Solve ``(A_S^T A_S + damping I)x = rhs`` for selected stacked angles."""
+        indices = self._normalize_angle_indices(angle_indices)
+        if rhs.dim() == 3:
+            rhs = rhs.unsqueeze(1)
+        if rhs.dim() != 4:
+            raise ValueError(f"rhs must have shape (B,1,H,W), got {tuple(rhs.shape)}")
+        rhs = rhs.to(dtype=torch.float32, device=self.sampling_points.device)
+        x = torch.zeros_like(rhs)
+        mu = float(damping)
+
+        def normal_plus_mu(z: torch.Tensor) -> torch.Tensor:
+            return self.apply_normal_selected_angles(z, indices) + mu * z
+
+        r = rhs - normal_plus_mu(x)
+        p = r.clone()
+        rs_old = torch.sum(r.reshape(r.shape[0], -1).square(), dim=1, keepdim=True)
+        eps = rhs.new_tensor(1.0e-12)
+        for _ in range(max(int(cg_iters), 0)):
+            Ap = normal_plus_mu(p)
+            denom = torch.sum(p.reshape(p.shape[0], -1) * Ap.reshape(Ap.shape[0], -1), dim=1, keepdim=True).clamp_min(eps)
+            alpha = rs_old / denom
+            alpha_view = alpha.view(-1, 1, 1, 1)
+            x = x + alpha_view * p
+            r = r - alpha_view * Ap
+            rs_new = torch.sum(r.reshape(r.shape[0], -1).square(), dim=1, keepdim=True)
+            cg_ratio = rs_new / rs_old.clamp_min(eps)
+            p = r + cg_ratio.view(-1, 1, 1, 1) * p
+            rs_old = rs_new
+        return x
+
     def residual_inverse_correction(
         self,
         coeff: torch.Tensor,
@@ -1030,6 +1105,54 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         residual = g_observed.to(dtype=pred.dtype, device=pred.device) - pred
         rhs = self.adjoint(residual)
         correction = self.solve_shifted_normal_cg(rhs, damping=damping, cg_iters=cg_iters)
+        if normalize:
+            flat = correction.reshape(correction.shape[0], -1)
+            norm = torch.norm(flat, dim=1, keepdim=True).clamp_min(1.0e-6)
+            correction = correction / norm.view(-1, 1, 1, 1)
+        return correction
+
+    def residual_inverse_correction_selected_angles(
+        self,
+        coeff: torch.Tensor,
+        g_observed: torch.Tensor,
+        angle_indices,
+        damping: float = 1.0e-2,
+        cg_iters: int = 8,
+        detach: bool = True,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """Return one selected-stacked inverse-residual correction image.
+
+        This approximates
+
+            ``(A_S^T A_S + damping I)^-1 A_S^T (g_S - A_S c)``
+
+        where ``S`` is the provided subset of original alpha-angle indices.
+        The returned shape is ``(B,1,H,W)``.
+        """
+        indices = self._normalize_angle_indices(angle_indices)
+        if g_observed.dim() == 3 and g_observed.shape[1] == 1:
+            g_observed = g_observed.squeeze(1)
+        if detach:
+            coeff = coeff.detach()
+            g_observed = g_observed.detach()
+        pred_pa = self.forward_per_angle(coeff)
+        observed_pa = self.split_measurements(g_observed).to(dtype=pred_pa.dtype, device=pred_pa.device)
+        residual_pa = observed_pa - pred_pa
+        mask = torch.zeros(
+            int(self.num_angles),
+            dtype=residual_pa.dtype,
+            device=residual_pa.device,
+        )
+        mask[torch.as_tensor(indices, dtype=torch.long, device=residual_pa.device)] = 1.0
+        residual_pa = residual_pa * mask.view(1, int(self.num_angles), 1)
+        rhs = self.adjoint_per_angle(residual_pa).sum(dim=1)
+        correction = self.solve_shifted_selected_normal_cg(
+            rhs,
+            indices,
+            damping=damping,
+            cg_iters=cg_iters,
+        )
         if normalize:
             flat = correction.reshape(correction.shape[0], -1)
             norm = torch.norm(flat, dim=1, keepdim=True).clamp_min(1.0e-6)
@@ -1829,6 +1952,17 @@ def build_time_domain_operator(height: int = IMAGE_SIZE, width: int = IMAGE_SIZE
     return AlphaContinuousB1B1Operator2D(alpha_values=alpha_values, tau_offsets=tau_offsets, height=int(height), width=int(width)).to(device)
 
 
+def build_time_domain_operator_from_alpha_records(records, height: int = IMAGE_SIZE, width: int = IMAGE_SIZE) -> torch.nn.Module:
+    """Build an alpha-continuous operator from selected JSON-style records."""
+    alpha_values = [float(item["alpha"]) for item in list(records or [])]
+    tau_offsets = [float(item["tau_star"] if "tau_star" in item else item["tau"]) for item in list(records or [])]
+    if not alpha_values:
+        raise ValueError("init alpha records must contain at least one selected angle.")
+    if len(alpha_values) != len(tau_offsets):
+        raise ValueError(f"init alpha/tau length mismatch: {len(alpha_values)} vs {len(tau_offsets)}.")
+    return AlphaContinuousB1B1Operator2D(alpha_values=alpha_values, tau_offsets=tau_offsets, height=int(height), width=int(width)).to(device)
+
+
 def _resolve_data_formula_mode(reconstruction_formula_mode: str) -> str:
     raw = str(TIME_DOMAIN_CONFIG.get("data_formula_mode", "auto_complete") or "").strip().lower()
     if raw in {"", "auto", "auto_complete", "alpha_continuous"}:
@@ -1852,6 +1986,15 @@ class TheoreticalDataGenerator:
         reconstruction_formula_mode = str(TIME_DOMAIN_CONFIG.get("theoretical_formula_mode", "alpha_continuous")).strip().lower()
         self.data_formula_mode = _resolve_data_formula_mode(reconstruction_formula_mode)
         self.data_time_operator = self.time_operator
+        init_records = TIME_DOMAIN_CONFIG.get("init_alpha_condition_constrained_records", None)
+        if init_records:
+            self.init_time_operator = build_time_domain_operator_from_alpha_records(
+                init_records,
+                height=self.img_size,
+                width=self.img_size,
+            )
+        else:
+            self.init_time_operator = self.time_operator
         self.feature_time_operator = None
         self.M = int(getattr(self.time_operator, "M", int(TIME_DOMAIN_CONFIG.get("num_detector_samples", self.N))))
         self.last_lambda: Optional[float | torch.Tensor] = None
@@ -1884,8 +2027,20 @@ class TheoreticalDataGenerator:
     def data_forward_operator(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.data_time_operator.forward(coeff_matrix)
 
+    def init_forward_operator(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
+        return self.init_time_operator.forward(coeff_matrix)
+
     def adjoint_operator(self, residual: torch.Tensor) -> torch.Tensor:
         return self.time_operator.adjoint(residual)
+
+    @contextmanager
+    def _using_init_operator(self):
+        old_operator = self.time_operator
+        self.time_operator = self.init_time_operator
+        try:
+            yield
+        finally:
+            self.time_operator = old_operator
 
     @torch.no_grad()
     def solve_tikhonov_direct_init(self, g_obs: torch.Tensor, lambda_reg: float | torch.Tensor) -> torch.Tensor:
@@ -2485,17 +2640,23 @@ class TheoreticalDataGenerator:
         with torch.no_grad():
             g_clean = self.data_forward_operator(coeff_true).to(torch.float32)
             g_observed = self._apply_noise(g_clean)
-            lambda_eff = self._select_lambda(g_observed, lambda_reg=lambda_reg)
-            self.last_lambda = lambda_eff
-            init_method = normalize_init_method(str(TIME_DOMAIN_CONFIG.get("init_method", "cg")))
-            if dict(self.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
-                coeff_initial = self.solve_constrained_init(g_observed, noise_radius=lambda_eff, init_method=init_method)
-                info = dict(self.last_lambda_info or {})
-                info["mode"] = "morozov_constrained"
-                info["solver_stats"] = dict(getattr(self.time_operator, "last_split_admm_stats", None) or {})
-                self.last_lambda_info = info
+            if self.init_time_operator is self.data_time_operator:
+                g_init_observed = g_observed
             else:
-                coeff_initial = self.solve_regularized_init(g_observed, lambda_reg=lambda_eff, init_method=init_method)
+                g_init_clean = self.init_forward_operator(coeff_true).to(torch.float32)
+                g_init_observed = self._apply_noise(g_init_clean)
+            init_method = normalize_init_method(str(TIME_DOMAIN_CONFIG.get("init_method", "cg")))
+            with self._using_init_operator():
+                lambda_eff = self._select_lambda(g_init_observed, lambda_reg=lambda_reg)
+                self.last_lambda = lambda_eff
+                if dict(self.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
+                    coeff_initial = self.solve_constrained_init(g_init_observed, noise_radius=lambda_eff, init_method=init_method)
+                    info = dict(self.last_lambda_info or {})
+                    info["mode"] = "morozov_constrained"
+                    info["solver_stats"] = dict(getattr(self.time_operator, "last_split_admm_stats", None) or {})
+                    self.last_lambda_info = info
+                else:
+                    coeff_initial = self.solve_regularized_init(g_init_observed, lambda_reg=lambda_eff, init_method=init_method)
         return coeff_true.squeeze(0).squeeze(0), f_true.squeeze(0), g_observed.squeeze(0), coeff_initial.squeeze(0).squeeze(0)
 
     def generate_batch(self, batch_size, random_seed=None, lambda_reg: float | torch.Tensor = None):
@@ -2511,7 +2672,8 @@ class TheoreticalDataGenerator:
             solver_name = "constrained_init" if lambda_mode == "morozov" and morozov_form == "constrained" else "regularized_init"
             print(
                 "[init] first batch start "
-                f"batch_size={int(batch_size)} angles={int(getattr(self.time_operator, 'num_angles', 1) or 1)} "
+                f"batch_size={int(batch_size)} data_angles={int(getattr(self.data_time_operator, 'num_angles', 1) or 1)} "
+                f"init_angles={int(getattr(self.init_time_operator, 'num_angles', 1) or 1)} "
                 f"lambda_mode={lambda_mode} morozov_form={morozov_form} init_method={init_method} solver={solver_name}"
             )
         coeff_true = self._sample_coefficients(batch_size)
@@ -2519,17 +2681,23 @@ class TheoreticalDataGenerator:
         with torch.no_grad():
             g_clean = self.data_forward_operator(coeff_true).to(torch.float32)
             g_observed = self._apply_noise(g_clean)
-        lambda_eff = self._select_lambda(g_observed, lambda_reg=lambda_reg)
-        self.last_lambda = lambda_eff
+            if self.init_time_operator is self.data_time_operator:
+                g_init_observed = g_observed
+            else:
+                g_init_clean = self.init_forward_operator(coeff_true).to(torch.float32)
+                g_init_observed = self._apply_noise(g_init_clean)
         coeff_init_started = time.perf_counter()
-        if dict(self.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
-            coeff_initial = self.solve_constrained_init(g_observed, noise_radius=lambda_eff, init_method=init_method)
-            info = dict(self.last_lambda_info or {})
-            info["mode"] = "morozov_constrained"
-            info["solver_stats"] = dict(getattr(self.time_operator, "last_split_admm_stats", None) or {})
-            self.last_lambda_info = info
-        else:
-            coeff_initial = self.solve_regularized_init(g_observed, lambda_reg=lambda_eff, init_method=init_method)
+        with self._using_init_operator():
+            lambda_eff = self._select_lambda(g_init_observed, lambda_reg=lambda_reg)
+            self.last_lambda = lambda_eff
+            if dict(self.last_lambda_info or {}).get("mode") == "morozov_constrained_radius":
+                coeff_initial = self.solve_constrained_init(g_init_observed, noise_radius=lambda_eff, init_method=init_method)
+                info = dict(self.last_lambda_info or {})
+                info["mode"] = "morozov_constrained"
+                info["solver_stats"] = dict(getattr(self.time_operator, "last_split_admm_stats", None) or {})
+                self.last_lambda_info = info
+            else:
+                coeff_initial = self.solve_regularized_init(g_init_observed, lambda_reg=lambda_eff, init_method=init_method)
         if progress_enabled:
             print(f"[init] coefficient init finished in {time.perf_counter() - coeff_init_started:.2f}s")
             print(f"[init] first batch ready in {time.perf_counter() - batch_started:.2f}s")

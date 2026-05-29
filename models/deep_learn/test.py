@@ -207,6 +207,7 @@ def _temporary_experiment_config(experiment_metadata: dict):
             "tv_pdhg_theta": float,
             "tv_pdhg_nonnegative": bool,
             "tv_pdhg_power_iters": int,
+            "data_fidelity_channel_mode": str,
         }
         for key, caster in data_restore_types.items():
             if key in experiment_metadata:

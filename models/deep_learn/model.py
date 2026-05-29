@@ -177,12 +177,27 @@ class LearnedGradientDescent(nn.Module):
         self.cnn_num_angles = self.raw_cnn_num_angles
         self.theoretical_gd = TheoreticalGradientDescent(height, width, regularizer_type, operator=self.learned_operator)
 
+        self.data_fidelity_channel_mode = str(
+            DATA_CONFIG.get("data_fidelity_channel_mode", "per_angle")
+        ).strip().lower()
+        if self.data_fidelity_channel_mode == "per_angle":
+            self.data_fidelity_channels = self.raw_cnn_num_angles
+        elif self.data_fidelity_channel_mode == "stacked_selected":
+            self.data_fidelity_channels = 1
+        elif self.data_fidelity_channel_mode == "both_selected":
+            self.data_fidelity_channels = self.raw_cnn_num_angles + 1
+        else:
+            raise ValueError(
+                f"data_fidelity_channel_mode={self.data_fidelity_channel_mode!r}; "
+                "expected 'per_angle', 'stacked_selected', or 'both_selected'."
+            )
+
         self.physics_residual_enabled = bool(TIME_DOMAIN_CONFIG.get("physics_residual_channel_enabled", False))
         self.physics_residual_mode = str(TIME_DOMAIN_CONFIG.get("physics_residual_mode", "per_angle_cg")).strip().lower()
-        if self.physics_residual_mode not in {"stacked_cg", "per_angle_cg"}:
+        if self.physics_residual_mode not in {"stacked_cg", "stacked_selected_cg", "per_angle_cg"}:
             raise ValueError(
                 f"physics_residual_mode={self.physics_residual_mode!r}; "
-                "expected 'per_angle_cg' or 'stacked_cg'."
+                "expected 'per_angle_cg', 'stacked_cg', or 'stacked_selected_cg'."
             )
         self.physics_residual_damping = float(TIME_DOMAIN_CONFIG.get("physics_residual_damping", 1.0e-2))
         self.physics_residual_cg_iters = int(TIME_DOMAIN_CONFIG.get("physics_residual_cg_iters", 8))
@@ -197,7 +212,7 @@ class LearnedGradientDescent(nn.Module):
         phys_alpha_init = max(float(TIME_DOMAIN_CONFIG.get("physics_explicit_update_alpha_init", 0.02)), 1.0e-8)
         self.physics_alpha_raw = nn.Parameter(torch.tensor(math.log(math.exp(phys_alpha_init) - 1.0), dtype=torch.float32))
 
-        self.input_channels = 2 + self.cnn_num_angles + self.physics_residual_channels + self.n_memory
+        self.input_channels = 1 + self.data_fidelity_channels + self.physics_residual_channels + 1 + self.n_memory
         self.detach_physical_grads = bool(DATA_CONFIG.get("detach_physical_grads", True))
         self.learned_correction_max = float(DATA_CONFIG.get("learned_correction_max", 0.0))
         self.update_max_norm = float(DATA_CONFIG.get("update_max_norm", 0.0))
@@ -264,12 +279,46 @@ class LearnedGradientDescent(nn.Module):
             nn.Conv2d(self.feature_channels, 1 + self.n_memory, kernel_size=3, padding=1),
         )
 
-    def _compose_cnn_input(self, coeff_current, g_observed, reg_grad, memory, data_grad_pa=None, physics_corr=None):
+    def _compose_data_fidelity_channels(self, data_grad=None, data_grad_pa=None):
         if data_grad_pa is None:
-            _, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(coeff_current, g_observed, return_per_angle=True)
-        if int(data_grad_pa.shape[1]) < int(self.raw_cnn_num_angles):
-            raise ValueError(f"Per-angle gradient only has {int(data_grad_pa.shape[1])} channels, but CNN expects at least {int(self.raw_cnn_num_angles)} raw channels.")
-        grad_channels = self._select_cnn_angle_channels(data_grad_pa).squeeze(2)
+            raise ValueError(f"data_grad_pa is required for data_fidelity_channel_mode={self.data_fidelity_channel_mode!r}.")
+        selected_pa = self._select_cnn_angle_channels(data_grad_pa).squeeze(2)
+        if self.data_fidelity_channel_mode == "per_angle":
+            return selected_pa
+        if self.data_fidelity_channel_mode == "stacked_selected":
+            return selected_pa.mean(dim=1, keepdim=True)
+        if self.data_fidelity_channel_mode == "both_selected":
+            return torch.cat([selected_pa, selected_pa.mean(dim=1, keepdim=True)], dim=1)
+        raise ValueError(f"Unsupported data_fidelity_channel_mode={self.data_fidelity_channel_mode!r}.")
+
+    def _compose_cnn_input(
+        self,
+        coeff_current,
+        g_observed,
+        reg_grad,
+        memory,
+        data_grad=None,
+        data_grad_pa=None,
+        physics_corr=None,
+    ):
+        if data_grad_pa is None:
+            computed_data_grad, computed_data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(
+                coeff_current,
+                g_observed,
+                return_per_angle=True,
+            )
+            if data_grad is None:
+                data_grad = computed_data_grad
+            data_grad_pa = computed_data_grad_pa
+        grad_channels = self._compose_data_fidelity_channels(
+            data_grad=data_grad,
+            data_grad_pa=data_grad_pa,
+        )
+        if int(grad_channels.shape[1]) != int(self.data_fidelity_channels):
+            raise ValueError(
+                f"data fidelity channels has {int(grad_channels.shape[1])} channels, "
+                f"expected {int(self.data_fidelity_channels)}."
+            )
         parts = [coeff_current, grad_channels]
         if self.physics_residual_enabled:
             if physics_corr is None:
@@ -337,7 +386,11 @@ class LearnedGradientDescent(nn.Module):
         for _ in range(self.n_iter):
             lambda_i = self.current_reg_lambda()
             reg_grad_base = self.theoretical_gd.compute_regularization_gradient(coeff_current)
-            data_grad, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(coeff_current, g_observed_learned, return_per_angle=True)
+            data_grad, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(
+                coeff_current,
+                g_observed_learned,
+                return_per_angle=True,
+            )
 
             physics_corr = None
             physics_update_corr = None
@@ -357,6 +410,19 @@ class LearnedGradientDescent(nn.Module):
                     selected_physics_corr_pa = self._select_cnn_angle_channels(physics_corr_pa)
                     physics_corr = selected_physics_corr_pa.squeeze(2)
                     physics_update_corr = selected_physics_corr_pa.mean(dim=1)
+                elif self.physics_residual_mode == "stacked_selected_cg":
+                    if not hasattr(op, "residual_inverse_correction_selected_angles"):
+                        raise ValueError("The active operator does not implement residual_inverse_correction_selected_angles().")
+                    physics_corr = op.residual_inverse_correction_selected_angles(
+                        coeff_current,
+                        g_observed_learned,
+                        angle_indices=self.cnn_channel_indices,
+                        damping=self.physics_residual_damping,
+                        cg_iters=self.physics_residual_cg_iters,
+                        detach=self.physics_residual_detach,
+                        normalize=self.physics_residual_normalize,
+                    )
+                    physics_update_corr = physics_corr
                 else:
                     if not hasattr(op, "residual_inverse_correction"):
                         raise ValueError("The active operator does not implement residual_inverse_correction().")
@@ -370,16 +436,23 @@ class LearnedGradientDescent(nn.Module):
                     )
                     physics_update_corr = physics_corr
             if self.detach_physical_grads:
-                data_grad = data_grad.detach()
                 reg_grad_base = reg_grad_base.detach()
-                if data_grad_pa is not None:
-                    data_grad_pa = data_grad_pa.detach()
+                data_grad = data_grad.detach()
+                data_grad_pa = data_grad_pa.detach()
             if self.physics_residual_detach and physics_corr is not None:
                 physics_corr = physics_corr.detach()
                 if physics_update_corr is not None:
                     physics_update_corr = physics_update_corr.detach()
             reg_grad = reg_grad_base * lambda_i
-            cnn_input = self._compose_cnn_input(coeff_current, g_observed_learned, reg_grad, memory, data_grad_pa=data_grad_pa, physics_corr=physics_corr)
+            cnn_input = self._compose_cnn_input(
+                coeff_current,
+                g_observed_learned,
+                reg_grad,
+                memory,
+                data_grad=data_grad,
+                data_grad_pa=data_grad_pa,
+                physics_corr=physics_corr,
+            )
             cnn_output = self.update_network(cnn_input)
             raw_update = cnn_output[:, 0:1, :, :]
             new_memory = cnn_output[:, 1:, :, :]
@@ -495,6 +568,13 @@ def initialize_model():
         "Physical angles / learned data angles / CNN angle channels: "
         f"{model.optimizer.num_angles} / {model.optimizer.learned_num_angles} / "
         f"{model.optimizer.cnn_num_angles}"
+    )
+    print(
+        "Data fidelity channel mode: %s channels=%d"
+        % (
+            str(getattr(model.optimizer, "data_fidelity_channel_mode", "per_angle")),
+            int(getattr(model.optimizer, "data_fidelity_channels", 0) or 0),
+        )
     )
     print(
         "Physics residual: enabled=%s mode=%s damping=%.3g cg_iters=%d channels=%d explicit_update=%s alpha=%.4f"

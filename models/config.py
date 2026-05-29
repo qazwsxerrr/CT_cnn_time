@@ -135,6 +135,14 @@ def _apply_bool_override(target: dict, key: str, env_name: str):
     target[key] = value in ("1", "true", "yes", "y")
 
 
+_apply_string_override(
+    THEORETICAL_CONFIG,
+    "regularizer_type",
+    "REGULARIZER_TYPE_OVERRIDE",
+    allowed_values={"tikhonov", "dirichlet", "tv"},
+)
+
+
 def _alpha_record_float(record: dict, *keys: str) -> float:
     for key in keys:
         if key in record:
@@ -209,6 +217,7 @@ DATA_CONFIG = {
     "implicit_eval_cg_iters": 80,
     "implicit_eval_cg_tol": 1.0e-4,
     "data_fidelity_mode": "standard",
+    "data_fidelity_channel_mode": "per_angle",
     "irls_eps_factor": 3.0e-03,
     "irls_detach_weights": True,
     "l1_init_admm_iters": 80,
@@ -227,6 +236,7 @@ DATA_CONFIG = {
     "validation_seed": 42,
     "val_batch_size": n_data,
     "val_reproducible": True,
+    "val_random_subsample": False,
     "intermediate_supervision_enabled": False,
     "intermediate_supervision_weight_start": 0.2,
     "intermediate_supervision_weight_end": 1.0,
@@ -250,12 +260,21 @@ _apply_string_override(DATA_CONFIG, "morozov_noise_radius_mode", "MOROZOV_NOISE_
 _apply_string_override(DATA_CONFIG, "morozov_cache_dir", "MOROZOV_CACHE_DIR_OVERRIDE")
 _apply_string_override(DATA_CONFIG, "alpha_gram_cache_dir", "ALPHA_GRAM_CACHE_DIR_OVERRIDE")
 _apply_string_override(DATA_CONFIG, "data_fidelity_mode", "DATA_FIDELITY_MODE_OVERRIDE", allowed_values={"standard", "irls"})
+_apply_string_override(
+    DATA_CONFIG,
+    "data_fidelity_channel_mode",
+    "DATA_FIDELITY_CHANNEL_MODE_OVERRIDE",
+    allowed_values={"per_angle", "stacked_selected", "stacked_all", "both_selected"},
+)
 _apply_bool_override(DATA_CONFIG, "detach_physical_grads", "DETACH_PHYSICAL_GRADS_OVERRIDE")
 _apply_int_override(DATA_CONFIG, "l1_init_admm_iters", "L1_INIT_ADMM_ITERS_OVERRIDE")
 _apply_int_override(DATA_CONFIG, "l1_init_admm_cg_iters", "L1_INIT_ADMM_CG_ITERS_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "l1_init_admm_cg_tol", "L1_INIT_ADMM_CG_TOL_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "l1_init_admm_rho_data", "L1_INIT_ADMM_RHO_DATA_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "l1_init_admm_rho_reg", "L1_INIT_ADMM_RHO_REG_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "val_batch_size", "VAL_BATCH_SIZE_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "val_batch_size", "VAL_SUBSAMPLE_SIZE_OVERRIDE")
+_apply_bool_override(DATA_CONFIG, "val_random_subsample", "VAL_RANDOM_SUBSAMPLE_OVERRIDE")
 _apply_bool_override(DATA_CONFIG, "intermediate_supervision_enabled", "INTERMEDIATE_SUPERVISION_ENABLED_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "intermediate_supervision_weight_start", "INTERMEDIATE_SUPERVISION_WEIGHT_START_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "intermediate_supervision_weight_end", "INTERMEDIATE_SUPERVISION_WEIGHT_END_OVERRIDE")
@@ -270,6 +289,8 @@ TIME_DOMAIN_CONFIG = {
     "alpha_tau_offsets": [],
     "alpha_condition_constrained_records": None,
     "alpha_condition_constrained_json": None,
+    "init_alpha_condition_constrained_records": None,
+    "init_alpha_condition_constrained_json": None,
     "theoretical_formula_mode": "alpha_continuous",
     "data_formula_mode": "auto_complete",
     "multi_angle_solver_mode": "stacked_tikhonov",
@@ -305,6 +326,8 @@ def _apply_alpha_condition_profile(json_path: str | None = None) -> None:
     TIME_DOMAIN_CONFIG["alpha_tau_offsets"] = tau_offsets
     TIME_DOMAIN_CONFIG["alpha_condition_constrained_records"] = records
     TIME_DOMAIN_CONFIG["alpha_condition_constrained_json"] = str(resolved_json)
+    TIME_DOMAIN_CONFIG["init_alpha_condition_constrained_records"] = None
+    TIME_DOMAIN_CONFIG["init_alpha_condition_constrained_json"] = None
     TIME_DOMAIN_CONFIG["num_angles_total"] = num_angles
     TIME_DOMAIN_CONFIG["num_angles"] = num_angles
     TIME_DOMAIN_CONFIG["theoretical_formula_mode"] = "alpha_continuous"
@@ -335,6 +358,8 @@ def _apply_runtime_alpha_profile() -> None:
     TIME_DOMAIN_CONFIG["alpha_tau_offsets"] = []
     TIME_DOMAIN_CONFIG["alpha_condition_constrained_records"] = None
     TIME_DOMAIN_CONFIG["alpha_condition_constrained_json"] = None
+    TIME_DOMAIN_CONFIG["init_alpha_condition_constrained_records"] = None
+    TIME_DOMAIN_CONFIG["init_alpha_condition_constrained_json"] = None
     TIME_DOMAIN_CONFIG["theoretical_formula_mode"] = "alpha_continuous"
     TIME_DOMAIN_CONFIG["data_formula_mode"] = "auto_complete"
     TIME_DOMAIN_CONFIG["multi_angle_solver_mode"] = "stacked_tikhonov"
@@ -381,6 +406,12 @@ if TIME_DOMAIN_CONFIG.get("alpha_values"):
     TIME_DOMAIN_CONFIG["num_angles"] = _alpha_k
     TIME_DOMAIN_CONFIG["cnn_num_angles_override"] = _alpha_k
 
+_init_alpha_json_override = _get_env_override("INIT_ALPHA_CONDITION_JSON_OVERRIDE")
+if _init_alpha_json_override is not None:
+    _init_records, _init_resolved_json = _load_alpha_condition_records(path=_init_alpha_json_override)
+    TIME_DOMAIN_CONFIG["init_alpha_condition_constrained_records"] = _init_records
+    TIME_DOMAIN_CONFIG["init_alpha_condition_constrained_json"] = str(_init_resolved_json)
+
 _m_override = os.environ.get("NUM_DETECTOR_SAMPLES_OVERRIDE", None)
 if _m_override is not None:
     _s = str(_m_override).strip()
@@ -402,7 +433,12 @@ _apply_bool_override(TIME_DOMAIN_CONFIG, "cnn_backbone_only", "CNN_BACKBONE_ONLY
 _apply_int_override(TIME_DOMAIN_CONFIG, "cnn_num_angles_override", "CNN_NUM_ANGLES_OVERRIDE")
 _apply_int_list_override(TIME_DOMAIN_CONFIG, "cnn_angle_indices_override", "CNN_ANGLE_INDICES_OVERRIDE")
 _apply_bool_override(TIME_DOMAIN_CONFIG, "physics_residual_channel_enabled", "PHYSICS_RESIDUAL_CHANNEL_ENABLED_OVERRIDE")
-_apply_string_override(TIME_DOMAIN_CONFIG, "physics_residual_mode", "PHYSICS_RESIDUAL_MODE_OVERRIDE", allowed_values={"stacked_cg", "per_angle_cg"})
+_apply_string_override(
+    TIME_DOMAIN_CONFIG,
+    "physics_residual_mode",
+    "PHYSICS_RESIDUAL_MODE_OVERRIDE",
+    allowed_values={"stacked_cg", "stacked_selected_cg", "per_angle_cg"},
+)
 _apply_float_override(TIME_DOMAIN_CONFIG, "physics_residual_damping", "PHYSICS_RESIDUAL_DAMPING_OVERRIDE")
 _apply_int_override(TIME_DOMAIN_CONFIG, "physics_residual_cg_iters", "PHYSICS_RESIDUAL_CG_ITERS_OVERRIDE")
 _apply_bool_override(TIME_DOMAIN_CONFIG, "physics_residual_detach", "PHYSICS_RESIDUAL_DETACH_OVERRIDE")
@@ -422,6 +458,8 @@ TRAINING_CONFIG = {
     "scalar_lr_ratio": 0.1,
     "use_mixed_precision": False,
 }
+_apply_int_override(TRAINING_CONFIG, "validation_interval", "VALIDATION_INTERVAL_OVERRIDE")
+_apply_int_override(TRAINING_CONFIG, "save_interval", "SAVE_INTERVAL_OVERRIDE")
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -475,6 +513,7 @@ def print_config():
     else:
         print(f"Noise Level (delta): {DATA_CONFIG['noise_level']}")
     print(f"Data fidelity mode: {DATA_CONFIG['data_fidelity_mode']}")
+    print(f"Data fidelity channel mode: {DATA_CONFIG['data_fidelity_channel_mode']}")
     print(f"Operator mode: {TIME_DOMAIN_CONFIG['operator_mode']}")
     print(f"Experiment profile: {TIME_DOMAIN_CONFIG.get('experiment_profile', 'default')}")
     print(f"Lambda mode: {DATA_CONFIG['lambda_select_mode']}")

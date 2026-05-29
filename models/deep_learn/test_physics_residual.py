@@ -11,23 +11,29 @@ for path in (THIS_DIR, MODELS_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from config import TIME_DOMAIN_CONFIG, device
+from config import DATA_CONFIG, TIME_DOMAIN_CONFIG, device
 from radon_transform import AlphaContinuousB1B1Operator2D
 
 
 class ConfigPatch:
-    def __init__(self, **updates):
+    def __init__(self, data_config_updates=None, **updates):
         self.updates = updates
+        self.data_config_updates = dict(data_config_updates or {})
         self.original = None
+        self.data_original = None
 
     def __enter__(self):
         self.original = dict(TIME_DOMAIN_CONFIG)
+        self.data_original = dict(DATA_CONFIG)
         TIME_DOMAIN_CONFIG.update(self.updates)
+        DATA_CONFIG.update(self.data_config_updates)
         return TIME_DOMAIN_CONFIG
 
     def __exit__(self, exc_type, exc, tb):
         TIME_DOMAIN_CONFIG.clear()
         TIME_DOMAIN_CONFIG.update(self.original)
+        DATA_CONFIG.clear()
+        DATA_CONFIG.update(self.data_original)
 
 
 class ZeroUpdateNetwork(nn.Module):
@@ -47,6 +53,189 @@ class ZeroUpdateNetwork(nn.Module):
 
 
 class PhysicsResidualChannelTests(unittest.TestCase):
+    def test_lgd_stacked_selected_data_fidelity_averages_selected_angle_channels(self):
+        with ConfigPatch(
+            data_config_updates={"data_fidelity_channel_mode": "stacked_selected"},
+            operator_mode="theoretical_b1b1",
+            use_multi_angle=True,
+            alpha_values=[0.23, 0.57, 1.11, 1.43],
+            alpha_tau_offsets=[0.15, 0.25, 0.35, 0.45],
+            num_angles_total=4,
+            num_angles=4,
+            cnn_backbone_only=False,
+            cnn_num_angles_override=None,
+            cnn_angle_indices_override=[0, 2],
+            theoretical_formula_mode="alpha_continuous",
+            multi_angle_solver_mode="stacked_tikhonov",
+            physics_residual_channel_enabled=False,
+            physics_explicit_update_enabled=False,
+        ):
+            from model import LearnedGradientDescent
+
+            lgd = LearnedGradientDescent(height=4, width=4, n_iter=1, n_memory=1).to(device)
+            self.assertEqual(lgd.data_fidelity_channel_mode, "stacked_selected")
+            self.assertEqual(lgd.data_fidelity_channels, 1)
+            self.assertEqual(lgd.input_channels, 1 + 1 + 0 + 1 + 1)
+
+            coeff = torch.zeros(1, 1, 4, 4, device=device)
+            reg_grad = torch.full_like(coeff, 70.0)
+            memory = torch.full((1, 1, 4, 4), 80.0, device=device)
+            data_grad_pa = torch.stack(
+                [torch.full_like(coeff, float(10 * (idx + 1))) for idx in range(4)],
+                dim=1,
+            )
+
+            cnn_input = lgd._compose_cnn_input(
+                coeff,
+                torch.zeros(1, lgd.operator.M, device=device),
+                reg_grad,
+                memory,
+                data_grad_pa=data_grad_pa,
+                physics_corr=None,
+            )
+
+            self.assertEqual(tuple(cnn_input.shape), (1, 4, 4, 4))
+            self.assertTrue(torch.allclose(cnn_input[:, 1], torch.full((1, 4, 4), 20.0, device=device)))
+            self.assertTrue(torch.allclose(cnn_input[:, 2], torch.full((1, 4, 4), 70.0, device=device)))
+            self.assertTrue(torch.allclose(cnn_input[:, 3], torch.full((1, 4, 4), 80.0, device=device)))
+
+    def test_alpha_operator_selected_stacked_residual_inverse_correction_solves_selected_system(self):
+        torch.manual_seed(0)
+        op = AlphaContinuousB1B1Operator2D(
+            alpha_values=[0.23, 0.57, 1.11, 1.43],
+            height=4,
+            width=4,
+            tau_offsets=[0.15, 0.25, 0.35, 0.45],
+        ).to(device)
+
+        coeff_true = torch.randn(1, 1, 4, 4, device=device)
+        coeff_current = torch.randn(1, 1, 4, 4, device=device)
+        observed = op(coeff_true)
+        selected = [0, 2]
+
+        correction = op.residual_inverse_correction_selected_angles(
+            coeff_current,
+            observed,
+            angle_indices=selected,
+            damping=1.0e-2,
+            cg_iters=16,
+            detach=True,
+            normalize=False,
+        )
+
+        self.assertEqual(tuple(correction.shape), tuple(coeff_current.shape))
+        residual_pa = op.split_measurements(observed - op(coeff_current))
+        rhs_pa = op.adjoint_per_angle(residual_pa)
+        rhs_selected = torch.index_select(
+            rhs_pa,
+            dim=1,
+            index=torch.as_tensor(selected, device=device, dtype=torch.long),
+        ).sum(dim=1)
+        normal_residual = op.apply_normal_selected_angles(correction, selected) + 1.0e-2 * correction - rhs_selected
+        self.assertLess(
+            torch.norm(normal_residual).item(),
+            1.0e-3 * torch.norm(rhs_selected).item(),
+        )
+
+    def test_lgd_stacked_selected_residual_mode_uses_one_physics_channel(self):
+        with ConfigPatch(
+            data_config_updates={"data_fidelity_channel_mode": "stacked_selected"},
+            operator_mode="theoretical_b1b1",
+            use_multi_angle=True,
+            alpha_values=[0.23, 0.57, 1.11, 1.43],
+            alpha_tau_offsets=[0.15, 0.25, 0.35, 0.45],
+            num_angles_total=4,
+            num_angles=4,
+            cnn_backbone_only=False,
+            cnn_num_angles_override=None,
+            cnn_angle_indices_override=[0, 2],
+            theoretical_formula_mode="alpha_continuous",
+            multi_angle_solver_mode="stacked_tikhonov",
+            physics_residual_channel_enabled=True,
+            physics_residual_mode="stacked_selected_cg",
+            physics_residual_damping=1.0e-2,
+            physics_residual_cg_iters=1,
+            physics_residual_detach=True,
+            physics_residual_normalize=False,
+            physics_explicit_update_enabled=False,
+        ):
+            from model import LearnedGradientDescent
+
+            lgd = LearnedGradientDescent(height=4, width=4, n_iter=1, n_memory=1).to(device)
+            self.assertEqual(lgd.physics_residual_channels, 1)
+            self.assertEqual(lgd.input_channels, 1 + 1 + 1 + 1 + 1)
+
+            coeff = torch.zeros(1, 1, 4, 4, device=device)
+            reg_grad = torch.full_like(coeff, 70.0)
+            memory = torch.full((1, 1, 4, 4), 80.0, device=device)
+            data_grad_pa = torch.stack(
+                [torch.full_like(coeff, float(10 * (idx + 1))) for idx in range(4)],
+                dim=1,
+            )
+            physics_corr = torch.full_like(coeff, 90.0)
+
+            cnn_input = lgd._compose_cnn_input(
+                coeff,
+                torch.zeros(1, lgd.operator.M, device=device),
+                reg_grad,
+                memory,
+                data_grad_pa=data_grad_pa,
+                physics_corr=physics_corr,
+            )
+
+            self.assertEqual(tuple(cnn_input.shape), (1, 5, 4, 4))
+            self.assertTrue(torch.allclose(cnn_input[:, 1], torch.full((1, 4, 4), 20.0, device=device)))
+            self.assertTrue(torch.allclose(cnn_input[:, 2], torch.full((1, 4, 4), 90.0, device=device)))
+
+    def test_lgd_stacked_selected_explicit_update_uses_selected_stacked_correction(self):
+        with ConfigPatch(
+            data_config_updates={"data_fidelity_channel_mode": "stacked_selected"},
+            operator_mode="theoretical_b1b1",
+            use_multi_angle=True,
+            alpha_values=[0.23, 0.57, 1.11, 1.43],
+            alpha_tau_offsets=[0.15, 0.25, 0.35, 0.45],
+            num_angles_total=4,
+            num_angles=4,
+            cnn_backbone_only=False,
+            cnn_num_angles_override=None,
+            cnn_angle_indices_override=[0, 2],
+            theoretical_formula_mode="alpha_continuous",
+            multi_angle_solver_mode="stacked_tikhonov",
+            physics_residual_channel_enabled=True,
+            physics_residual_mode="stacked_selected_cg",
+            physics_residual_damping=1.0e-2,
+            physics_residual_cg_iters=4,
+            physics_residual_detach=True,
+            physics_residual_normalize=False,
+            physics_explicit_update_enabled=True,
+            physics_explicit_update_alpha_init=0.02,
+            physics_explicit_update_max=0.10,
+        ):
+            from model import LearnedGradientDescent
+
+            torch.manual_seed(2)
+            lgd = LearnedGradientDescent(height=4, width=4, n_iter=1, n_memory=1).to(device)
+            lgd.update_network = ZeroUpdateNetwork(n_memory=1).to(device)
+
+            coeff_initial = torch.zeros(1, 1, 4, 4, device=device)
+            coeff_true = torch.randn(1, 1, 4, 4, device=device)
+            observed = lgd.operator(coeff_true)
+            expected_corr = lgd.operator.residual_inverse_correction_selected_angles(
+                coeff_initial,
+                observed,
+                angle_indices=[0, 2],
+                damping=lgd.physics_residual_damping,
+                cg_iters=lgd.physics_residual_cg_iters,
+                detach=lgd.physics_residual_detach,
+                normalize=lgd.physics_residual_normalize,
+            )
+            expected = coeff_initial + lgd.current_physics_alpha() * expected_corr
+
+            coeff_final, history = lgd(coeff_initial, observed)
+
+            self.assertEqual(len(history), 2)
+            self.assertTrue(torch.allclose(coeff_final, expected, atol=1.0e-5, rtol=1.0e-5))
+
     def test_lgd_selects_matching_data_gradient_and_physics_residual_angle_channels(self):
         with ConfigPatch(
             operator_mode="theoretical_b1b1",
