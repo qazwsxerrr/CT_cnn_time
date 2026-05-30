@@ -30,7 +30,7 @@ from data_genoration import OfflineBatchProvider
 from config import (
     n_data, n_train,
     device, MODEL_PATH, BEST_MODEL_PATH, CHECKPOINT_DIR,
-    TRAINING_CONFIG, DATA_CONFIG, LOGGING_CONFIG, TIME_DOMAIN_CONFIG, EXPERIMENT_OUTPUT_TAG
+    TRAINING_CONFIG, DATA_CONFIG, LOGGING_CONFIG, TIME_DOMAIN_CONFIG, THEORETICAL_CONFIG, EXPERIMENT_OUTPUT_TAG
 )
 
 # Optional quick overrides for debugging (do not affect config.py).
@@ -198,6 +198,13 @@ class TheoreticalTrainer:
             self.experiment_metadata["physics_explicit_update_enabled"],
         )
         self.logger.info(
+            "Model architecture: %s refiner_input=%s unet_base=%s unet_depth=%s",
+            self.experiment_metadata.get("model_arch"),
+            self.experiment_metadata.get("refiner_input_mode"),
+            self.experiment_metadata.get("unet_base_channels"),
+            self.experiment_metadata.get("unet_depth"),
+        )
+        self.logger.info(
             "Active alpha JSON: %s",
             self.experiment_metadata.get("alpha_condition_constrained_json"),
         )
@@ -256,10 +263,14 @@ class TheoreticalTrainer:
             TRAINING_CONFIG["optimizer_learning_rate"],
         ))
         scalar_lr = base_lr * float(TRAINING_CONFIG.get("scalar_lr_ratio", 0.1))
-        self.optimizer = optim.AdamW([
-            {'params': other_params, 'weight_decay': 1e-4},
-            {'params': scalar_params, 'weight_decay': 0.0, 'lr': scalar_lr},
-        ], lr=base_lr)
+        param_groups = []
+        if other_params:
+            param_groups.append({'params': other_params, 'weight_decay': 1e-4})
+        if scalar_params:
+            param_groups.append({'params': scalar_params, 'weight_decay': 0.0, 'lr': scalar_lr})
+        if not param_groups:
+            raise RuntimeError("Model has no trainable parameters.")
+        self.optimizer = optim.AdamW(param_groups, lr=base_lr)
 
         # Match the reference project: mild inverse decay is less aggressive than cosine here.
         def lr_lambda(step):
@@ -305,6 +316,11 @@ class TheoreticalTrainer:
         )
         return {
             "output_tag": EXPERIMENT_OUTPUT_TAG or "default",
+            "model_arch": str(THEORETICAL_CONFIG.get("model_arch", "unrolled_cnn")),
+            "refiner_input_mode": str(THEORETICAL_CONFIG.get("refiner_input_mode", "u2_stacked")),
+            "unet_base_channels": int(THEORETICAL_CONFIG.get("unet_base_channels", 32)),
+            "unet_depth": int(THEORETICAL_CONFIG.get("unet_depth", 4)),
+            "unet_residual_max": float(THEORETICAL_CONFIG.get("unet_residual_max", 0.0)),
             "regularizer_type": str(getattr(self.model.optimizer.theoretical_gd, "regularizer_type", "")),
             "init_method": str(TIME_DOMAIN_CONFIG.get("init_method", "")),
             "lambda_select_mode": str(DATA_CONFIG.get("lambda_select_mode", "")),
@@ -341,6 +357,7 @@ class TheoreticalTrainer:
             "physics_residual_detach": bool(getattr(self.model.optimizer, "physics_residual_detach", TIME_DOMAIN_CONFIG.get("physics_residual_detach", True))),
             "physics_residual_normalize": bool(getattr(self.model.optimizer, "physics_residual_normalize", TIME_DOMAIN_CONFIG.get("physics_residual_normalize", True))),
             "physics_explicit_update_enabled": bool(getattr(self.model.optimizer, "physics_explicit_update_enabled", False)),
+            "physics_explicit_update_max": float(getattr(self.model.optimizer, "physics_explicit_update_max", TIME_DOMAIN_CONFIG.get("physics_explicit_update_max", 0.10))),
             "alpha_values": list(TIME_DOMAIN_CONFIG.get("alpha_values") or []),
             "alpha_tau_offsets": list(TIME_DOMAIN_CONFIG.get("alpha_tau_offsets") or []),
             "alpha_condition_constrained_json": TIME_DOMAIN_CONFIG.get("alpha_condition_constrained_json", None),
@@ -491,11 +508,17 @@ class TheoreticalTrainer:
             # Diagnostic logging for learnable optimization scalars
             if self.current_iter % 500 == 0 and self.current_iter > 0:
                 lgd = self.model.optimizer
-                self.logger.info(
-                    "  Learned scalars: step=%.6f lambda=%.6f",
-                    float(lgd.current_step_size().item()),
-                    float(lgd.current_reg_lambda().item()),
-                )
+                if hasattr(lgd, "current_step_size") and hasattr(lgd, "current_reg_lambda"):
+                    self.logger.info(
+                        "  Learned scalars: step=%.6f lambda=%.6f",
+                        float(lgd.current_step_size().item()),
+                        float(lgd.current_reg_lambda().item()),
+                    )
+                elif hasattr(lgd, "current_physics_alpha"):
+                    self.logger.info(
+                        "  Refiner physics alpha=%.6f",
+                        float(lgd.current_physics_alpha().item()),
+                    )
             # 记录训练指标用于画图
             self.training_history['train_loss'].append(loss.item())
             self.training_history['train_res'].append(float(train_res_tensor.item()))

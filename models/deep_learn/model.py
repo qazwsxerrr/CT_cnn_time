@@ -148,7 +148,103 @@ class TheoreticalGradientDescent(nn.Module):
 
 
 # ============================================================================
-# 3. Learned gradient descent (CNN updates)
+# 3. Non-iterative residual U-Net refiner blocks
+# ============================================================================
+def _group_norm(num_channels):
+    groups = min(8, int(num_channels))
+    while groups > 1 and int(num_channels) % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, int(num_channels))
+
+
+class ConvNormAct(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            _group_norm(out_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            _group_norm(out_channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class DownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.MaxPool2d(2),
+            ConvNormAct(in_channels, out_channels),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.conv = ConvNormAct(in_channels + skip_channels, out_channels)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        diff_y = int(skip.shape[-2]) - int(x.shape[-2])
+        diff_x = int(skip.shape[-1]) - int(x.shape[-1])
+        if diff_x != 0 or diff_y != 0:
+            x = F.pad(x, [diff_x // 2, diff_x - diff_x // 2, diff_y // 2, diff_y - diff_y // 2])
+        return self.conv(torch.cat([skip, x], dim=1))
+
+
+class ResidualUNet(nn.Module):
+    def __init__(self, input_channels, base_channels=32, depth=4, residual_max=0.0):
+        super().__init__()
+        self.input_channels = int(input_channels)
+        self.base_channels = int(base_channels)
+        self.depth = int(depth)
+        self.residual_max = float(residual_max)
+        if self.input_channels <= 0:
+            raise ValueError("input_channels must be positive.")
+        if self.base_channels <= 0:
+            raise ValueError("base_channels must be positive.")
+        if self.depth <= 0:
+            raise ValueError("depth must be positive.")
+
+        channels = [self.base_channels * (2 ** i) for i in range(self.depth + 1)]
+        self.input_norm = nn.InstanceNorm2d(self.input_channels, affine=True)
+        self.inc = ConvNormAct(self.input_channels, channels[0])
+        self.downs = nn.ModuleList(
+            DownBlock(channels[i], channels[i + 1]) for i in range(self.depth)
+        )
+        self.ups = nn.ModuleList(
+            UpBlock(channels[i + 1], channels[i], channels[i]) for i in range(self.depth - 1, -1, -1)
+        )
+        self.out_conv = nn.Conv2d(channels[0], 1, kernel_size=1)
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, x):
+        x = self.input_norm(x)
+        skips = []
+        x = self.inc(x)
+        skips.append(x)
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)
+        for up, skip in zip(self.ups, reversed(skips[:-1])):
+            x = up(x, skip)
+        residual = self.out_conv(x)
+        if self.residual_max > 0:
+            residual = self.residual_max * torch.tanh(residual / self.residual_max)
+        return residual
+
+
+# ============================================================================
+# 4. Learned gradient descent (CNN updates)
 # ============================================================================
 class LearnedGradientDescent(nn.Module):
     def __init__(self, height=IMAGE_SIZE, width=IMAGE_SIZE, regularizer_type="tikhonov", n_iter=10, n_memory=5):
@@ -468,14 +564,244 @@ class LearnedGradientDescent(nn.Module):
 
 
 # ============================================================================
-# 5. Full CT network
+# 5. TV-init physics-conditioned non-iterative U-Net refiner
+# ============================================================================
+class TVPCUNetRefiner(nn.Module):
+    """One-shot residual U-Net conditioned on TV-init physics features.
+
+    B variant: x_pred = x_tv + U-Net(features).
+    C variant: x_pred = x_tv + alpha * physics_corr0 + U-Net(features), enabled
+    by PHYSICS_EXPLICIT_UPDATE_ENABLED_OVERRIDE=1.
+    """
+
+    def __init__(self, height=IMAGE_SIZE, width=IMAGE_SIZE, regularizer_type="tikhonov"):
+        super().__init__()
+        self.height = int(height)
+        self.width = int(width)
+        self.n_iter = 1
+        self.n_memory = 0
+        self.model_arch = "tv_pc_unet"
+        self.refiner_input_mode = str(THEORETICAL_CONFIG.get("refiner_input_mode", "u2_stacked")).strip().lower()
+        if self.refiner_input_mode not in {"u2", "u2_stacked", "physics_conditioned_u2", "u2_alpha_stack"}:
+            raise ValueError(
+                f"refiner_input_mode={self.refiner_input_mode!r}; "
+                "expected 'u2_stacked' or 'u2_alpha_stack' for TV-PC U-Net."
+            )
+
+        self.operator = build_time_domain_operator(height=height, width=width)
+        self.num_angles = int(getattr(self.operator, "num_angles", 1) or 1)
+        if not hasattr(self.operator, "split_measurements") or not hasattr(self.operator, "adjoint_per_angle"):
+            raise ValueError("TV-PC U-Net requires per-angle operator support for U2 stacked features.")
+
+        self.requested_cnn_num_angles = TIME_DOMAIN_CONFIG.get("cnn_num_angles_override", None)
+        if self.requested_cnn_num_angles is not None:
+            self.requested_cnn_num_angles = int(self.requested_cnn_num_angles)
+            if self.requested_cnn_num_angles <= 0:
+                raise ValueError("cnn_num_angles_override must be positive when provided.")
+            if self.requested_cnn_num_angles > self.num_angles:
+                raise ValueError(f"cnn_num_angles_override={self.requested_cnn_num_angles} exceeds num_angles={self.num_angles}.")
+        self.requested_cnn_angle_indices = TIME_DOMAIN_CONFIG.get("cnn_angle_indices_override", None)
+        self.learned_operator = self.operator
+        self.learned_num_angles = self.num_angles
+        self.cnn_channel_indices = self._resolve_cnn_channel_indices()
+        self.raw_cnn_num_angles = len(self.cnn_channel_indices)
+        self.cnn_num_angles = self.raw_cnn_num_angles
+        self.theoretical_gd = TheoreticalGradientDescent(height, width, regularizer_type, operator=self.learned_operator)
+
+        self.data_fidelity_channel_mode = str(
+            DATA_CONFIG.get("data_fidelity_channel_mode", "stacked_selected")
+        ).strip().lower()
+        if self.refiner_input_mode == "u2_alpha_stack":
+            if self.data_fidelity_channel_mode not in {"per_angle", "stacked_selected"}:
+                raise ValueError(
+                    f"TV-PC U-Net u2_alpha_stack expects data_fidelity_channel_mode='per_angle' "
+                    f"or 'stacked_selected', got {self.data_fidelity_channel_mode!r}."
+                )
+            self.data_fidelity_channels = self.raw_cnn_num_angles
+        elif self.data_fidelity_channel_mode != "stacked_selected":
+            raise ValueError(
+                f"TV-PC U-Net U2 expects data_fidelity_channel_mode='stacked_selected', "
+                f"got {self.data_fidelity_channel_mode!r}."
+            )
+        else:
+            self.data_fidelity_channels = 1
+
+        self.physics_residual_enabled = bool(TIME_DOMAIN_CONFIG.get("physics_residual_channel_enabled", True))
+        if not self.physics_residual_enabled:
+            raise ValueError("TV-PC U-Net U2 requires physics_residual_channel_enabled=True.")
+        self.physics_residual_mode = str(TIME_DOMAIN_CONFIG.get("physics_residual_mode", "stacked_selected_cg")).strip().lower()
+        if self.physics_residual_mode not in {"stacked_cg", "stacked_selected_cg", "per_angle_cg"}:
+            raise ValueError(
+                f"physics_residual_mode={self.physics_residual_mode!r}; "
+                "expected 'per_angle_cg', 'stacked_cg', or 'stacked_selected_cg'."
+            )
+        self.physics_residual_damping = float(TIME_DOMAIN_CONFIG.get("physics_residual_damping", 1.0e-2))
+        self.physics_residual_cg_iters = int(TIME_DOMAIN_CONFIG.get("physics_residual_cg_iters", 8))
+        self.physics_residual_detach = bool(TIME_DOMAIN_CONFIG.get("physics_residual_detach", True))
+        self.physics_residual_normalize = bool(TIME_DOMAIN_CONFIG.get("physics_residual_normalize", True))
+        self.physics_residual_channels = 1
+
+        self.physics_explicit_update_enabled = bool(TIME_DOMAIN_CONFIG.get("physics_explicit_update_enabled", False))
+        self.physics_explicit_update_max = float(TIME_DOMAIN_CONFIG.get("physics_explicit_update_max", 0.10))
+        phys_alpha_init = max(float(TIME_DOMAIN_CONFIG.get("physics_explicit_update_alpha_init", 0.02)), 1.0e-8)
+        self.physics_alpha_raw = nn.Parameter(torch.tensor(math.log(math.exp(phys_alpha_init) - 1.0), dtype=torch.float32))
+
+        self.detach_physical_grads = bool(DATA_CONFIG.get("detach_physical_grads", True))
+        self.input_channels = 1 + self.data_fidelity_channels + self.physics_residual_channels + 1
+        base_channels = int(THEORETICAL_CONFIG.get("unet_base_channels", 32))
+        depth = int(THEORETICAL_CONFIG.get("unet_depth", 4))
+        residual_max = float(THEORETICAL_CONFIG.get("unet_residual_max", 0.0))
+        self.update_network = ResidualUNet(
+            input_channels=self.input_channels,
+            base_channels=base_channels,
+            depth=depth,
+            residual_max=residual_max,
+        )
+
+    def _resolve_cnn_channel_indices(self):
+        if self.requested_cnn_angle_indices is not None:
+            indices = [int(idx) for idx in list(self.requested_cnn_angle_indices)]
+            if not indices:
+                raise ValueError("cnn_angle_indices_override must not be empty when provided.")
+            if len(set(indices)) != len(indices):
+                raise ValueError(f"cnn_angle_indices_override contains duplicates: {indices!r}.")
+            invalid = [idx for idx in indices if idx < 0 or idx >= self.learned_num_angles]
+            if invalid:
+                raise ValueError(f"cnn_angle_indices_override contains out-of-range indices {invalid!r} for learned_num_angles={self.learned_num_angles}.")
+            return indices
+        if self.requested_cnn_num_angles is not None:
+            return list(range(int(self.requested_cnn_num_angles)))
+        return list(range(self.learned_num_angles))
+
+    def _cnn_angle_index_tensor(self, target_device):
+        return torch.as_tensor(self.cnn_channel_indices, device=target_device, dtype=torch.long)
+
+    def _select_cnn_angle_channels(self, per_angle_tensor: torch.Tensor) -> torch.Tensor:
+        if int(per_angle_tensor.shape[1]) < int(max(self.cnn_channel_indices) + 1):
+            raise ValueError(
+                f"Per-angle tensor has {int(per_angle_tensor.shape[1])} channels, "
+                f"but requested indices are {self.cnn_channel_indices!r}."
+            )
+        return torch.index_select(
+            per_angle_tensor,
+            dim=1,
+            index=self._cnn_angle_index_tensor(per_angle_tensor.device),
+        )
+
+    def _select_learned_measurements(self, g_observed):
+        if g_observed.dim() == 3 and g_observed.shape[1] == 1:
+            g_observed = g_observed.squeeze(1)
+        return g_observed
+
+    def _split_observations(self, g_observed):
+        if g_observed.dim() == 3 and g_observed.shape[1] == 1:
+            g_observed = g_observed.squeeze(1)
+        return g_observed, None
+
+    def current_physics_alpha(self):
+        alpha = F.softplus(self.physics_alpha_raw)
+        if self.physics_explicit_update_max > 0:
+            alpha = torch.clamp(alpha, max=self.physics_explicit_update_max)
+        return alpha
+
+    def _compose_data_fidelity_channels(self, data_grad_pa):
+        selected_pa = self._select_cnn_angle_channels(data_grad_pa).squeeze(2)
+        if self.refiner_input_mode == "u2_alpha_stack":
+            return selected_pa
+        return selected_pa.mean(dim=1, keepdim=True)
+
+    def _compute_physics_correction(self, coeff_initial, g_observed_learned):
+        op = self.theoretical_gd.operator
+        if self.physics_residual_mode == "per_angle_cg":
+            if not hasattr(op, "residual_inverse_correction_per_angle"):
+                raise ValueError("The active operator does not implement residual_inverse_correction_per_angle().")
+            physics_corr_pa = op.residual_inverse_correction_per_angle(
+                coeff_initial,
+                g_observed_learned,
+                damping=self.physics_residual_damping,
+                cg_iters=self.physics_residual_cg_iters,
+                detach=self.physics_residual_detach,
+                normalize=self.physics_residual_normalize,
+            )
+            selected = self._select_cnn_angle_channels(physics_corr_pa)
+            return selected.mean(dim=1)
+        if self.physics_residual_mode == "stacked_selected_cg":
+            if not hasattr(op, "residual_inverse_correction_selected_angles"):
+                raise ValueError("The active operator does not implement residual_inverse_correction_selected_angles().")
+            return op.residual_inverse_correction_selected_angles(
+                coeff_initial,
+                g_observed_learned,
+                angle_indices=self.cnn_channel_indices,
+                damping=self.physics_residual_damping,
+                cg_iters=self.physics_residual_cg_iters,
+                detach=self.physics_residual_detach,
+                normalize=self.physics_residual_normalize,
+            )
+        if not hasattr(op, "residual_inverse_correction"):
+            raise ValueError("The active operator does not implement residual_inverse_correction().")
+        return op.residual_inverse_correction(
+            coeff_initial,
+            g_observed_learned,
+            damping=self.physics_residual_damping,
+            cg_iters=self.physics_residual_cg_iters,
+            detach=self.physics_residual_detach,
+            normalize=self.physics_residual_normalize,
+        )
+
+    def _compose_features(self, coeff_initial, g_observed_learned):
+        reg_grad = self.theoretical_gd.compute_regularization_gradient(coeff_initial)
+        _data_grad, data_grad_pa = self.theoretical_gd.compute_data_fidelity_gradient(
+            coeff_initial,
+            g_observed_learned,
+            return_per_angle=True,
+        )
+        grad_channels = self._compose_data_fidelity_channels(data_grad_pa)
+        physics_corr = self._compute_physics_correction(coeff_initial, g_observed_learned)
+        if self.detach_physical_grads:
+            reg_grad = reg_grad.detach()
+            grad_channels = grad_channels.detach()
+        if self.physics_residual_detach:
+            physics_corr = physics_corr.detach()
+        if int(physics_corr.shape[1]) != 1:
+            raise ValueError(f"TV-PC U-Net expects one physics residual channel, got {int(physics_corr.shape[1])}.")
+        features = torch.cat([coeff_initial, grad_channels, physics_corr, reg_grad], dim=1)
+        if int(features.shape[1]) != int(self.input_channels):
+            raise ValueError(f"TV-PC U-Net features have {int(features.shape[1])} channels, expected {int(self.input_channels)}.")
+        return features, physics_corr
+
+    def forward(self, coeff_initial, g_observed):
+        if g_observed.dim() == 3 and g_observed.shape[1] == 1:
+            g_observed = g_observed.squeeze(1)
+        x_tv = coeff_initial.clone()
+        g_observed_learned = self._select_learned_measurements(g_observed)
+        features, physics_corr = self._compose_features(x_tv, g_observed_learned)
+        residual = self.update_network(features)
+        if self.physics_explicit_update_enabled:
+            coeff_pred = x_tv + self.current_physics_alpha() * physics_corr + residual
+        else:
+            coeff_pred = x_tv + residual
+        history = [x_tv.clone(), coeff_pred.clone()]
+        return coeff_pred, history
+
+
+# ============================================================================
+# 6. Full CT network
 # ============================================================================
 class TheoreticalCTNet(nn.Module):
     def __init__(self, height=IMAGE_SIZE, width=IMAGE_SIZE, regularizer_type="tikhonov", n_iter=10, n_memory=5):
         super().__init__()
         self.height = int(height)
         self.width = int(width)
-        self.optimizer = LearnedGradientDescent(height, width, regularizer_type, n_iter, n_memory)
+        self.model_arch = str(THEORETICAL_CONFIG.get("model_arch", "unrolled_cnn")).strip().lower()
+        if self.model_arch in {"unrolled_cnn", "learned_gradient_descent", "lgd"}:
+            self.optimizer = LearnedGradientDescent(height, width, regularizer_type, n_iter, n_memory)
+        elif self.model_arch in {"tv_pc_unet", "tv_pc_refiner", "physics_unet"}:
+            self.optimizer = TVPCUNetRefiner(height, width, regularizer_type)
+        else:
+            raise ValueError(
+                f"Unsupported model_arch={self.model_arch!r}; "
+                "expected 'unrolled_cnn' or 'tv_pc_unet'."
+            )
         self.mapping = CoefficientMapping((height, width))
 
     def forward(self, coeff_initial, g_observed):
@@ -557,13 +883,27 @@ def initialize_model():
     regularizer_type = THEORETICAL_CONFIG["regularizer_type"]
     n_iter = THEORETICAL_CONFIG["n_iter"]
     n_memory = THEORETICAL_CONFIG["n_memory_units"]
+    model_arch = str(THEORETICAL_CONFIG.get("model_arch", "unrolled_cnn")).strip().lower()
     model = TheoreticalCTNet(height=IMAGE_SIZE, width=IMAGE_SIZE, regularizer_type=regularizer_type, n_iter=n_iter, n_memory=n_memory).to(device)
     print(f"Model initialized on device: {device}")
     print(f"Trainable parameters: {count_parameters(model):,}")
     print("Using alpha-continuous theoretical GD block")
     print(f"Regularizer type: {regularizer_type}")
-    print(f"Optimization iterations: {n_iter}")
-    print(f"Memory units: {n_memory}")
+    print(f"Model architecture: {model_arch}")
+    if model_arch in {"unrolled_cnn", "learned_gradient_descent", "lgd"}:
+        print(f"Optimization iterations: {n_iter}")
+        print(f"Memory units: {n_memory}")
+    else:
+        print("Optimization iterations: non-iterative refiner")
+        print(
+            "U-Net refiner: input_mode=%s base_channels=%d depth=%d residual_max=%.3g"
+            % (
+                str(THEORETICAL_CONFIG.get("refiner_input_mode", "u2_stacked")),
+                int(THEORETICAL_CONFIG.get("unet_base_channels", 32)),
+                int(THEORETICAL_CONFIG.get("unet_depth", 4)),
+                float(THEORETICAL_CONFIG.get("unet_residual_max", 0.0)),
+            )
+        )
     print(
         "Physical angles / learned data angles / CNN angle channels: "
         f"{model.optimizer.num_angles} / {model.optimizer.learned_num_angles} / "
@@ -608,4 +948,4 @@ if __name__ == "__main__":
         print(f"update difference: {metrics['update_difference']:.6f}")
         mapping_error = mapping.verify_mapping_consistency()
         print(f"mapping error: {mapping_error:.6f} (should be ~0)")
-    print("Alpha-only LGD model test successful!")
+    print("Alpha-only CT model smoke test successful!")

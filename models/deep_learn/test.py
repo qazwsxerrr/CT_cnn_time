@@ -1,4 +1,4 @@
-﻿import copy
+import copy
 import os
 import re
 import argparse
@@ -187,6 +187,16 @@ def _temporary_experiment_config(experiment_metadata: dict):
                     f"expected one of {sorted(allowed_regularizers)!r}."
                 )
             THEORETICAL_CONFIG["regularizer_type"] = regularizer_type
+        theoretical_restore_types = {
+            "model_arch": str,
+            "refiner_input_mode": str,
+            "unet_base_channels": int,
+            "unet_depth": int,
+            "unet_residual_max": float,
+        }
+        for key, caster in theoretical_restore_types.items():
+            if key in experiment_metadata:
+                THEORETICAL_CONFIG[key] = caster(experiment_metadata[key])
         profile_name = str(experiment_metadata.get("experiment_profile", "") or "").strip()
         if profile_name:
             try:
@@ -278,6 +288,8 @@ def _temporary_experiment_config(experiment_metadata: dict):
             TIME_DOMAIN_CONFIG["physics_residual_normalize"] = bool(experiment_metadata["physics_residual_normalize"])
         if "physics_explicit_update_enabled" in experiment_metadata:
             TIME_DOMAIN_CONFIG["physics_explicit_update_enabled"] = bool(experiment_metadata["physics_explicit_update_enabled"])
+        if "physics_explicit_update_max" in experiment_metadata:
+            TIME_DOMAIN_CONFIG["physics_explicit_update_max"] = float(experiment_metadata["physics_explicit_update_max"])
         yield
     finally:
         TIME_DOMAIN_CONFIG.clear()
