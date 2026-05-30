@@ -33,6 +33,11 @@ THEORETICAL_CONFIG = {
     "regularizer_type": "tikhonov",
     "n_iter": 15,
     "n_memory_units": 16,
+    "model_arch": "unrolled_cnn",
+    "refiner_input_mode": "u2_stacked",
+    "unet_base_channels": 32,
+    "unet_depth": 4,
+    "unet_residual_max": 0.0,
 }
 
 _n_iter_override = os.environ.get("N_ITER_OVERRIDE", None)
@@ -141,6 +146,21 @@ _apply_string_override(
     "REGULARIZER_TYPE_OVERRIDE",
     allowed_values={"tikhonov", "dirichlet", "tv"},
 )
+_apply_string_override(
+    THEORETICAL_CONFIG,
+    "model_arch",
+    "MODEL_ARCH_OVERRIDE",
+    allowed_values={"unrolled_cnn", "learned_gradient_descent", "lgd", "tv_pc_unet", "tv_pc_refiner", "physics_unet"},
+)
+_apply_string_override(
+    THEORETICAL_CONFIG,
+    "refiner_input_mode",
+    "REFINER_INPUT_MODE_OVERRIDE",
+    allowed_values={"u2", "u2_stacked", "physics_conditioned_u2", "u2_alpha_stack"},
+)
+_apply_int_override(THEORETICAL_CONFIG, "unet_base_channels", "UNET_BASE_CHANNELS_OVERRIDE")
+_apply_int_override(THEORETICAL_CONFIG, "unet_depth", "UNET_DEPTH_OVERRIDE")
+_apply_float_override(THEORETICAL_CONFIG, "unet_residual_max", "UNET_RESIDUAL_MAX_OVERRIDE")
 
 
 def _alpha_record_float(record: dict, *keys: str) -> float:
@@ -497,12 +517,21 @@ LOGGING_CONFIG = {
 
 def print_config():
     """Print the current alpha-only configuration for quick inspection."""
+    model_arch = str(THEORETICAL_CONFIG.get("model_arch", "unrolled_cnn")).strip().lower()
     print("=" * 60)
     print("ALPHA-ONLY CT RECONSTRUCTION CONFIGURATION")
     print("=" * 60)
     print(f"Image size: {IMAGE_SIZE}x{IMAGE_SIZE}")
     print(f"Regularizer type: {THEORETICAL_CONFIG['regularizer_type']}")
-    print(f"Optimization iterations: {THEORETICAL_CONFIG['n_iter']}")
+    print(f"Model architecture: {model_arch}")
+    if model_arch in {"tv_pc_unet", "tv_pc_refiner", "physics_unet"}:
+        print("Optimization iterations: non-iterative refiner")
+        print(f"U-Net refiner input mode: {THEORETICAL_CONFIG.get('refiner_input_mode', 'u2_stacked')}")
+        print(f"U-Net base channels: {THEORETICAL_CONFIG.get('unet_base_channels', 32)}")
+        print(f"U-Net depth: {THEORETICAL_CONFIG.get('unet_depth', 4)}")
+        print(f"U-Net residual max: {THEORETICAL_CONFIG.get('unet_residual_max', 0.0)}")
+    else:
+        print(f"Optimization iterations: {THEORETICAL_CONFIG['n_iter']}")
     print(f"Memory units: {THEORETICAL_CONFIG['n_memory_units']}")
     print(f"Device: {device}")
     print(f"Train data source: {DATA_CONFIG['train_data_source']}")
