@@ -190,9 +190,26 @@ def _temporary_experiment_config(experiment_metadata: dict):
         theoretical_restore_types = {
             "model_arch": str,
             "refiner_input_mode": str,
+            "unet_backbone": str,
             "unet_base_channels": int,
             "unet_depth": int,
             "unet_residual_max": float,
+            "physics_gate_mode": str,
+            "refiner_stages": int,
+            "refiner_share_weights": bool,
+            "refiner_stage_dc_enabled": bool,
+            "refiner_stage_dc_cg_iters": int,
+            "refiner_stage_dc_damping": float,
+            "refiner_stage_dc_detach": bool,
+            "refiner_stage_dc_normalize": bool,
+            "detail_head_enabled": bool,
+            "detail_head_input_mode": str,
+            "detail_head_hidden_channels": int,
+            "detail_head_depth": int,
+            "detail_head_residual_max": float,
+            "detail_head_stage_policy": str,
+            "detail_head_share_weights": bool,
+            "detail_head_zero_init": bool,
         }
         for key, caster in theoretical_restore_types.items():
             if key in experiment_metadata:

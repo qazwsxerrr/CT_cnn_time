@@ -1,11 +1,13 @@
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 import time
 import os
 import sys
 import logging
 import random
+import math
 from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
@@ -40,7 +42,25 @@ N_DATA = int(os.environ.get("N_DATA_OVERRIDE", n_data))
 
 def _resolve_resume_checkpoint_path():
     resume_path = str(os.environ.get("RESUME_CHECKPOINT_OVERRIDE", "") or "").strip()
-    return resume_path or None
+    if resume_path:
+        return resume_path
+    auto_resume = str(os.environ.get("AUTO_RESUME_OVERRIDE", "") or "").strip().lower()
+    if auto_resume not in {"1", "true", "yes", "y", "on"}:
+        return None
+    checkpoint_dir = Path(CHECKPOINT_DIR)
+    if not checkpoint_dir.is_dir():
+        return None
+    candidates = []
+    for checkpoint_path in checkpoint_dir.glob("checkpoint_iter_*.pth"):
+        raw_iter = checkpoint_path.stem.replace("checkpoint_iter_", "", 1)
+        try:
+            iter_idx = int(raw_iter)
+        except ValueError:
+            continue
+        candidates.append((iter_idx, checkpoint_path))
+    if not candidates:
+        return None
+    return str(max(candidates, key=lambda item: item[0])[1])
 
 
 def _build_train_or_val_generator(*, data_source, shared_time_operator, offline_env_name, shuffle_offline):
@@ -59,6 +79,94 @@ def _build_train_or_val_generator(*, data_source, shared_time_operator, offline_
 
 def _next_training_start_iter(current_iter):
     return max(int(current_iter) + 1, 0)
+
+
+def _relative_l2_loss(pred, target, eps=None):
+    if eps is None:
+        eps = float(TRAINING_CONFIG.get("loss_eps", 1.0e-12))
+    diff_sq_sum = torch.sum(torch.abs(pred - target) ** 2)
+    true_sq_sum = torch.sum(torch.abs(target) ** 2).clamp_min(float(eps))
+    return torch.sqrt(diff_sq_sum / true_sq_sum)
+
+
+def _forward_gradient_pair(x):
+    grad_y = x[:, :, 1:, :] - x[:, :, :-1, :]
+    grad_x = x[:, :, :, 1:] - x[:, :, :, :-1]
+    return grad_y, grad_x
+
+
+def _gradient_relative_l2_loss(pred, target, eps=None):
+    if eps is None:
+        eps = float(TRAINING_CONFIG.get("loss_eps", 1.0e-12))
+    err_y, err_x = _forward_gradient_pair(pred - target)
+    true_y, true_x = _forward_gradient_pair(target)
+    diff_sq_sum = torch.sum(err_y.pow(2)) + torch.sum(err_x.pow(2))
+    true_sq_sum = (torch.sum(true_y.pow(2)) + torch.sum(true_x.pow(2))).clamp_min(float(eps))
+    return torch.sqrt(diff_sq_sum / true_sq_sum)
+
+
+def _laplacian(x):
+    base_kernel = x.new_tensor(
+        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]]
+    ).view(1, 1, 3, 3)
+    channels = int(x.shape[1])
+    kernel = base_kernel.repeat(channels, 1, 1, 1)
+    padded = F.pad(x, (1, 1, 1, 1), mode="replicate")
+    return F.conv2d(padded, kernel, groups=channels)
+
+
+def _laplacian_relative_l2_loss(pred, target, eps=None):
+    if eps is None:
+        eps = float(TRAINING_CONFIG.get("loss_eps", 1.0e-12))
+    err_lap = _laplacian(pred - target)
+    true_lap = _laplacian(target)
+    diff_sq_sum = torch.sum(err_lap.pow(2))
+    true_sq_sum = torch.sum(true_lap.pow(2)).clamp_min(float(eps))
+    return torch.sqrt(diff_sq_sum / true_sq_sum)
+
+
+def _aux_loss_decay_factor(iter_idx):
+    start_fraction = float(TRAINING_CONFIG.get("aux_loss_decay_start_fraction", 1.0))
+    end_fraction = float(TRAINING_CONFIG.get("aux_loss_decay_end_fraction", 1.0))
+    start_fraction = min(max(start_fraction, 0.0), 1.0)
+    end_fraction = min(max(end_fraction, 0.0), 1.0)
+    if end_fraction <= start_fraction:
+        return 1.0
+    start_step = int(round(float(N_TRAIN) * start_fraction))
+    end_step = int(round(float(N_TRAIN) * end_fraction))
+    iter_idx = int(iter_idx)
+    if iter_idx <= start_step:
+        return 1.0
+    if iter_idx >= end_step:
+        return 0.0
+    progress = float(iter_idx - start_step) / float(max(end_step - start_step, 1))
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _reconstruction_objective(pred, target, *, aux_factor=1.0):
+    res = _relative_l2_loss(pred, target)
+    res_weight = float(TRAINING_CONFIG.get("res_loss_weight", 1.0))
+    grad_weight = float(TRAINING_CONFIG.get("gradres_loss_weight", 0.0)) * float(aux_factor)
+    lap_weight = float(TRAINING_CONFIG.get("lapres_loss_weight", 0.0)) * float(aux_factor)
+    loss = pred.new_zeros(())
+    if res_weight != 0.0:
+        loss = loss + res_weight * res
+    if grad_weight != 0.0:
+        loss = loss + grad_weight * _gradient_relative_l2_loss(pred, target)
+    if lap_weight != 0.0:
+        loss = loss + lap_weight * _laplacian_relative_l2_loss(pred, target)
+    return loss, res
+
+
+def _objective_description():
+    return (
+        "RES+aux "
+        f"res={float(TRAINING_CONFIG.get('res_loss_weight', 1.0)):.3g} "
+        f"gradres={float(TRAINING_CONFIG.get('gradres_loss_weight', 0.0)):.3g} "
+        f"lapres={float(TRAINING_CONFIG.get('lapres_loss_weight', 0.0)):.3g} "
+        f"aux_decay=({float(TRAINING_CONFIG.get('aux_loss_decay_start_fraction', 1.0)):.3g},"
+        f"{float(TRAINING_CONFIG.get('aux_loss_decay_end_fraction', 1.0)):.3g})"
+    )
 
 
 def _select_by_indices(values, indices):
@@ -198,12 +306,27 @@ class TheoreticalTrainer:
             self.experiment_metadata["physics_explicit_update_enabled"],
         )
         self.logger.info(
-            "Model architecture: %s refiner_input=%s unet_base=%s unet_depth=%s",
+            "Model architecture: %s refiner_input=%s unet_backbone=%s unet_base=%s unet_depth=%s stages=%s gate=%s stage_dc=%s",
             self.experiment_metadata.get("model_arch"),
             self.experiment_metadata.get("refiner_input_mode"),
+            self.experiment_metadata.get("unet_backbone"),
             self.experiment_metadata.get("unet_base_channels"),
             self.experiment_metadata.get("unet_depth"),
+            self.experiment_metadata.get("refiner_stages"),
+            self.experiment_metadata.get("physics_gate_mode"),
+            self.experiment_metadata.get("refiner_stage_dc_enabled"),
         )
+        self.logger.info(
+            "Detail head: enabled=%s input=%s hidden=%s depth=%s residual_max=%s stage_policy=%s share_weights=%s",
+            self.experiment_metadata.get("detail_head_enabled"),
+            self.experiment_metadata.get("detail_head_input_mode"),
+            self.experiment_metadata.get("detail_head_hidden_channels"),
+            self.experiment_metadata.get("detail_head_depth"),
+            self.experiment_metadata.get("detail_head_residual_max"),
+            self.experiment_metadata.get("detail_head_stage_policy"),
+            self.experiment_metadata.get("detail_head_share_weights"),
+        )
+        self.logger.info("Training objective: %s", _objective_description())
         self.logger.info(
             "Active alpha JSON: %s",
             self.experiment_metadata.get("alpha_condition_constrained_json"),
@@ -251,6 +374,7 @@ class TheoreticalTrainer:
             "step_size_raw",
             "reg_lambda_raw",
             "physics_alpha_raw",
+            "stage_dc_alpha_raw",
         )
         for name, param in self.model.named_parameters():
             if any(key in name for key in scalar_names):
@@ -272,9 +396,33 @@ class TheoreticalTrainer:
             raise RuntimeError("Model has no trainable parameters.")
         self.optimizer = optim.AdamW(param_groups, lr=base_lr)
 
-        # Match the reference project: mild inverse decay is less aggressive than cosine here.
+        schedule_mode = str(TRAINING_CONFIG.get("lr_schedule", "inverse")).strip().lower()
+        inverse_decay_steps = max(float(TRAINING_CONFIG.get("lr_inverse_decay_steps", 500.0)), 1.0)
+        constant_steps = max(int(TRAINING_CONFIG.get("lr_constant_steps", 0)), 0)
+        min_factor = min(max(float(TRAINING_CONFIG.get("lr_min_factor", 0.1)), 0.0), 1.0)
+        warmup_steps = max(int(TRAINING_CONFIG.get("lr_warmup_steps", 0)), 0)
+
         def lr_lambda(step):
-            return 1.0 / (1.0 + step / 500.0)
+            step = int(step)
+            if warmup_steps > 0 and step < warmup_steps:
+                return max(float(step + 1) / float(warmup_steps), 1.0e-8)
+            adjusted_step = max(step - warmup_steps, 0)
+            if schedule_mode == "constant":
+                return 1.0
+            if schedule_mode == "inverse":
+                return 1.0 / (1.0 + adjusted_step / inverse_decay_steps)
+            if schedule_mode == "constant_cosine":
+                if adjusted_step <= constant_steps:
+                    return 1.0
+                cosine_step = adjusted_step - constant_steps
+                cosine_total = max(int(N_TRAIN) - warmup_steps - constant_steps, 1)
+            elif schedule_mode == "cosine":
+                cosine_step = adjusted_step
+                cosine_total = max(int(N_TRAIN) - warmup_steps, 1)
+            else:
+                raise ValueError(f"Unsupported lr_schedule={schedule_mode!r}.")
+            progress = min(max(float(cosine_step) / float(cosine_total), 0.0), 1.0)
+            return min_factor + (1.0 - min_factor) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
         self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
         self.current_iter = -1
@@ -289,7 +437,65 @@ class TheoreticalTrainer:
             'data_fidelity_error': [],
             'update_difference': []
         }
+        resume_checkpoint_path = _resolve_resume_checkpoint_path()
+        if resume_checkpoint_path is not None:
+            self._load_resume_checkpoint(resume_checkpoint_path)
         self.logger.info("Theoretical trainer initialized successfully")
+
+    def _load_resume_checkpoint(self, checkpoint_path):
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+        if not isinstance(checkpoint, dict):
+            raise TypeError(f"Resume checkpoint must be a dict, got {type(checkpoint).__name__}.")
+
+        model_state = checkpoint.get('model_state_dict', None)
+        if model_state is None:
+            raise KeyError(f"Resume checkpoint {checkpoint_path} does not contain 'model_state_dict'.")
+        load_info = load_trainable_state_dict(self.model, model_state)
+
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except (RuntimeError, ValueError) as e:
+                self.logger.warning(
+                    "Could not load optimizer_state_dict from resume checkpoint; optimizer state starts fresh. Error: %s",
+                    e,
+                )
+        else:
+            self.logger.warning("Resume checkpoint has no optimizer_state_dict; optimizer state starts fresh.")
+        if 'scheduler_state_dict' in checkpoint:
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except (RuntimeError, ValueError) as e:
+                self.logger.warning(
+                    "Could not load scheduler_state_dict from resume checkpoint; scheduler state starts fresh. Error: %s",
+                    e,
+                )
+        else:
+            self.logger.warning("Resume checkpoint has no scheduler_state_dict; scheduler state starts fresh.")
+
+        self.current_iter = int(checkpoint.get('iter', -1))
+        self.best_val_loss = float(checkpoint.get('best_val_loss', self.best_val_loss))
+        saved_history = checkpoint.get('training_history', None)
+        if isinstance(saved_history, dict):
+            for key in self.training_history:
+                self.training_history[key] = list(saved_history.get(key, self.training_history[key]))
+        ignored_count = len(load_info.get('ignored_non_parameter_keys', [])) if isinstance(load_info, dict) else 0
+        initialized_count = len(load_info.get('initialized_missing_parameter_keys', [])) if isinstance(load_info, dict) else 0
+        self.logger.info(
+            "Resumed training from %s at iter=%d best_val_loss=%.6f loaded_params=%s ignored_non_params=%d initialized_missing_params=%d",
+            str(checkpoint_path),
+            int(self.current_iter),
+            float(self.best_val_loss),
+            load_info.get('loaded_parameter_count', 'unknown') if isinstance(load_info, dict) else 'unknown',
+            int(ignored_count),
+            int(initialized_count),
+        )
 
     def _build_experiment_metadata(self):
         operator = self.model.optimizer.operator
@@ -318,9 +524,38 @@ class TheoreticalTrainer:
             "output_tag": EXPERIMENT_OUTPUT_TAG or "default",
             "model_arch": str(THEORETICAL_CONFIG.get("model_arch", "unrolled_cnn")),
             "refiner_input_mode": str(THEORETICAL_CONFIG.get("refiner_input_mode", "u2_stacked")),
+            "unet_backbone": str(THEORETICAL_CONFIG.get("unet_backbone", "plain")),
             "unet_base_channels": int(THEORETICAL_CONFIG.get("unet_base_channels", 32)),
             "unet_depth": int(THEORETICAL_CONFIG.get("unet_depth", 4)),
             "unet_residual_max": float(THEORETICAL_CONFIG.get("unet_residual_max", 0.0)),
+            "physics_gate_mode": str(THEORETICAL_CONFIG.get("physics_gate_mode", "scalar")),
+            "refiner_stages": int(THEORETICAL_CONFIG.get("refiner_stages", 1)),
+            "refiner_share_weights": bool(THEORETICAL_CONFIG.get("refiner_share_weights", True)),
+            "refiner_stage_dc_enabled": bool(THEORETICAL_CONFIG.get("refiner_stage_dc_enabled", False)),
+            "refiner_stage_dc_cg_iters": int(THEORETICAL_CONFIG.get("refiner_stage_dc_cg_iters", 4)),
+            "refiner_stage_dc_damping": float(THEORETICAL_CONFIG.get("refiner_stage_dc_damping", 1.0e-2)),
+            "refiner_stage_dc_detach": bool(THEORETICAL_CONFIG.get("refiner_stage_dc_detach", True)),
+            "refiner_stage_dc_normalize": bool(THEORETICAL_CONFIG.get("refiner_stage_dc_normalize", True)),
+            "detail_head_enabled": bool(THEORETICAL_CONFIG.get("detail_head_enabled", False)),
+            "detail_head_input_mode": str(THEORETICAL_CONFIG.get("detail_head_input_mode", "features")),
+            "detail_head_hidden_channels": int(THEORETICAL_CONFIG.get("detail_head_hidden_channels", 16)),
+            "detail_head_depth": int(THEORETICAL_CONFIG.get("detail_head_depth", 2)),
+            "detail_head_residual_max": float(THEORETICAL_CONFIG.get("detail_head_residual_max", 0.0)),
+            "detail_head_stage_policy": str(THEORETICAL_CONFIG.get("detail_head_stage_policy", "last")),
+            "detail_head_share_weights": bool(THEORETICAL_CONFIG.get("detail_head_share_weights", True)),
+            "detail_head_zero_init": bool(THEORETICAL_CONFIG.get("detail_head_zero_init", True)),
+            "lr_schedule": str(TRAINING_CONFIG.get("lr_schedule", "inverse")),
+            "lr_inverse_decay_steps": float(TRAINING_CONFIG.get("lr_inverse_decay_steps", 500.0)),
+            "lr_constant_steps": int(TRAINING_CONFIG.get("lr_constant_steps", 0)),
+            "lr_min_factor": float(TRAINING_CONFIG.get("lr_min_factor", 0.1)),
+            "lr_warmup_steps": int(TRAINING_CONFIG.get("lr_warmup_steps", 0)),
+            "scalar_lr_ratio": float(TRAINING_CONFIG.get("scalar_lr_ratio", 0.1)),
+            "res_loss_weight": float(TRAINING_CONFIG.get("res_loss_weight", 1.0)),
+            "gradres_loss_weight": float(TRAINING_CONFIG.get("gradres_loss_weight", 0.0)),
+            "lapres_loss_weight": float(TRAINING_CONFIG.get("lapres_loss_weight", 0.0)),
+            "loss_eps": float(TRAINING_CONFIG.get("loss_eps", 1.0e-12)),
+            "aux_loss_decay_start_fraction": float(TRAINING_CONFIG.get("aux_loss_decay_start_fraction", 1.0)),
+            "aux_loss_decay_end_fraction": float(TRAINING_CONFIG.get("aux_loss_decay_end_fraction", 1.0)),
             "regularizer_type": str(getattr(self.model.optimizer.theoretical_gd, "regularizer_type", "")),
             "init_method": str(TIME_DOMAIN_CONFIG.get("init_method", "")),
             "lambda_select_mode": str(DATA_CONFIG.get("lambda_select_mode", "")),
@@ -451,7 +686,7 @@ class TheoreticalTrainer:
         self.logger.info(f"Total iterations: {N_TRAIN}")
         self.logger.info(f"Batch size: {N_DATA}")
         self.logger.info(f"Model parameters: {count_parameters(self.model):,}")
-        self.logger.info("Objective mode: RES")
+        self.logger.info("Objective mode: %s", _objective_description())
         total_start_time = time.time()
         start_iter = _next_training_start_iter(self.current_iter)
         self.logger.info(f"Starting iteration: {start_iter}")
@@ -470,19 +705,18 @@ class TheoreticalTrainer:
             self.optimizer.zero_grad()
             coeff_pred, history, metrics = self.model(coeff_initial, g_observed)
 
-            true_sq_sum = torch.sum(torch.abs(coeff_true) ** 2).clamp_min(1e-12)
-
-            def _res_loss(x):
-                return torch.sqrt(torch.sum(torch.abs(x - coeff_true) ** 2) / true_sq_sum)
-
-            train_res_tensor = _res_loss(coeff_pred)
+            aux_factor = _aux_loss_decay_factor(self.current_iter)
+            loss, train_res_tensor = _reconstruction_objective(coeff_pred, coeff_true, aux_factor=aux_factor)
             if bool(DATA_CONFIG.get("intermediate_supervision_enabled", False)):
                 # history[0] is the initialization. Supervise only actual unrolled updates.
                 hist = history[1:]
                 if len(hist) == 0:
-                    loss = train_res_tensor
+                    pass
                 else:
-                    step_losses = torch.stack([_res_loss(x) for x in hist])
+                    step_losses = torch.stack([
+                        _reconstruction_objective(x, coeff_true, aux_factor=aux_factor)[0]
+                        for x in hist
+                    ])
                     w_start = float(DATA_CONFIG.get("intermediate_supervision_weight_start", 0.2))
                     w_end = float(DATA_CONFIG.get("intermediate_supervision_weight_end", 1.0))
                     weights = torch.linspace(
@@ -494,8 +728,6 @@ class TheoreticalTrainer:
                     )
                     weights = weights / weights.sum().clamp_min(1.0e-12)
                     loss = torch.sum(weights * step_losses)
-            else:
-                loss = train_res_tensor
             loss.backward()
             if TRAINING_CONFIG.get('gradient_clip_value', 0) > 0:
                 torch.nn.utils.clip_grad_norm_(
@@ -515,10 +747,30 @@ class TheoreticalTrainer:
                         float(lgd.current_reg_lambda().item()),
                     )
                 elif hasattr(lgd, "current_physics_alpha"):
-                    self.logger.info(
-                        "  Refiner physics alpha=%.6f",
-                        float(lgd.current_physics_alpha().item()),
-                    )
+                    diagnostics = None
+                    if hasattr(lgd, "physics_gate_diagnostics"):
+                        diagnostics = lgd.physics_gate_diagnostics(coeff_initial, g_observed)
+                    if diagnostics and diagnostics.get("gate_mode") == "spatial" and "gate_mean" in diagnostics:
+                        self.logger.info(
+                            "  Refiner spatial gate: mean=%.6f std=%.6f min=%.6f max=%.6f legacy_alpha=%.6f physics_update_norm=%.3e physics_corr_norm=%.3e",
+                            float(diagnostics["gate_mean"]),
+                            float(diagnostics["gate_std"]),
+                            float(diagnostics["gate_min"]),
+                            float(diagnostics["gate_max"]),
+                            float(diagnostics["legacy_alpha"]),
+                            float(diagnostics["physics_update_norm"]),
+                            float(diagnostics["physics_corr_norm"]),
+                        )
+                    else:
+                        alpha = float(
+                            diagnostics.get("legacy_alpha", lgd.current_physics_alpha().item())
+                            if diagnostics
+                            else lgd.current_physics_alpha().item()
+                        )
+                        self.logger.info("  Refiner physics alpha=%.6f", alpha)
+                    if diagnostics and "stage_dc_alpha" in diagnostics:
+                        stage_dc_alpha = ", ".join(f"{float(value):.6f}" for value in diagnostics["stage_dc_alpha"])
+                        self.logger.info("  Refiner stage DC alpha=[%s]", stage_dc_alpha)
             # 记录训练指标用于画图
             self.training_history['train_loss'].append(loss.item())
             self.training_history['train_res'].append(float(train_res_tensor.item()))
@@ -537,8 +789,7 @@ class TheoreticalTrainer:
                 self.model.eval()
                 with torch.no_grad():
                     coeff_pred_post, _, _ = self.model(coeff_initial, g_observed)
-                    diff_sq_sum_post = torch.sum(torch.abs(coeff_pred_post - coeff_true) ** 2)
-                    train_res_post = torch.sqrt(diff_sq_sum_post / true_sq_sum).item()
+                    train_res_post = _relative_l2_loss(coeff_pred_post, coeff_true).item()
                 self.model.train()
 
                 data_err = float('nan')
@@ -549,7 +800,7 @@ class TheoreticalTrainer:
                 self.logger.info(
                     f"Iter: {self.current_iter:4d} | "
                     f"Train RES: {train_res_post:.6f} | Val RES: {val_loss:.6f} | "
-                    f"Loss(RES): {loss.item():.6f} | "
+                    f"Loss(obj): {loss.item():.6f} | "
                     f"LR: {self.optimizer.param_groups[0]['lr']:.8f} | "
                     f"Time: {iter_time:.3f}s | "
                     f"Data Fidelity Error: {data_err:.6f} | "

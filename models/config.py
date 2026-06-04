@@ -35,9 +35,26 @@ THEORETICAL_CONFIG = {
     "n_memory_units": 16,
     "model_arch": "unrolled_cnn",
     "refiner_input_mode": "u2_stacked",
+    "unet_backbone": "plain",
     "unet_base_channels": 32,
     "unet_depth": 4,
     "unet_residual_max": 0.0,
+    "physics_gate_mode": "scalar",
+    "refiner_stages": 1,
+    "refiner_share_weights": True,
+    "refiner_stage_dc_enabled": False,
+    "refiner_stage_dc_cg_iters": 4,
+    "refiner_stage_dc_damping": 1.0e-2,
+    "refiner_stage_dc_detach": True,
+    "refiner_stage_dc_normalize": True,
+    "detail_head_enabled": False,
+    "detail_head_input_mode": "features",
+    "detail_head_hidden_channels": 16,
+    "detail_head_depth": 2,
+    "detail_head_residual_max": 0.0,
+    "detail_head_stage_policy": "last",
+    "detail_head_share_weights": True,
+    "detail_head_zero_init": True,
 }
 
 _n_iter_override = os.environ.get("N_ITER_OVERRIDE", None)
@@ -150,7 +167,15 @@ _apply_string_override(
     THEORETICAL_CONFIG,
     "model_arch",
     "MODEL_ARCH_OVERRIDE",
-    allowed_values={"unrolled_cnn", "learned_gradient_descent", "lgd", "tv_pc_unet", "tv_pc_refiner", "physics_unet"},
+    allowed_values={
+        "unrolled_cnn",
+        "learned_gradient_descent",
+        "lgd",
+        "tv_pc_unet",
+        "tv_pc_refiner",
+        "physics_unet",
+        "tv_pc_cascade_unet",
+    },
 )
 _apply_string_override(
     THEORETICAL_CONFIG,
@@ -158,9 +183,46 @@ _apply_string_override(
     "REFINER_INPUT_MODE_OVERRIDE",
     allowed_values={"u2", "u2_stacked", "physics_conditioned_u2", "u2_alpha_stack"},
 )
+_apply_string_override(
+    THEORETICAL_CONFIG,
+    "unet_backbone",
+    "UNET_BACKBONE_OVERRIDE",
+    allowed_values={"plain", "residual_unet", "rad_unet"},
+)
 _apply_int_override(THEORETICAL_CONFIG, "unet_base_channels", "UNET_BASE_CHANNELS_OVERRIDE")
 _apply_int_override(THEORETICAL_CONFIG, "unet_depth", "UNET_DEPTH_OVERRIDE")
 _apply_float_override(THEORETICAL_CONFIG, "unet_residual_max", "UNET_RESIDUAL_MAX_OVERRIDE")
+_apply_string_override(
+    THEORETICAL_CONFIG,
+    "physics_gate_mode",
+    "PHYSICS_GATE_MODE_OVERRIDE",
+    allowed_values={"scalar", "spatial"},
+)
+_apply_int_override(THEORETICAL_CONFIG, "refiner_stages", "REFINER_STAGES_OVERRIDE")
+_apply_bool_override(THEORETICAL_CONFIG, "refiner_share_weights", "REFINER_SHARE_WEIGHTS_OVERRIDE")
+_apply_bool_override(THEORETICAL_CONFIG, "refiner_stage_dc_enabled", "REFINER_STAGE_DC_ENABLED_OVERRIDE")
+_apply_int_override(THEORETICAL_CONFIG, "refiner_stage_dc_cg_iters", "REFINER_STAGE_DC_CG_ITERS_OVERRIDE")
+_apply_float_override(THEORETICAL_CONFIG, "refiner_stage_dc_damping", "REFINER_STAGE_DC_DAMPING_OVERRIDE")
+_apply_bool_override(THEORETICAL_CONFIG, "refiner_stage_dc_detach", "REFINER_STAGE_DC_DETACH_OVERRIDE")
+_apply_bool_override(THEORETICAL_CONFIG, "refiner_stage_dc_normalize", "REFINER_STAGE_DC_NORMALIZE_OVERRIDE")
+_apply_bool_override(THEORETICAL_CONFIG, "detail_head_enabled", "DETAIL_HEAD_ENABLED_OVERRIDE")
+_apply_string_override(
+    THEORETICAL_CONFIG,
+    "detail_head_input_mode",
+    "DETAIL_HEAD_INPUT_MODE_OVERRIDE",
+    allowed_values={"features", "features_residual", "features_residual_coeff"},
+)
+_apply_int_override(THEORETICAL_CONFIG, "detail_head_hidden_channels", "DETAIL_HEAD_HIDDEN_CHANNELS_OVERRIDE")
+_apply_int_override(THEORETICAL_CONFIG, "detail_head_depth", "DETAIL_HEAD_DEPTH_OVERRIDE")
+_apply_float_override(THEORETICAL_CONFIG, "detail_head_residual_max", "DETAIL_HEAD_RESIDUAL_MAX_OVERRIDE")
+_apply_string_override(
+    THEORETICAL_CONFIG,
+    "detail_head_stage_policy",
+    "DETAIL_HEAD_STAGE_POLICY_OVERRIDE",
+    allowed_values={"last", "all"},
+)
+_apply_bool_override(THEORETICAL_CONFIG, "detail_head_share_weights", "DETAIL_HEAD_SHARE_WEIGHTS_OVERRIDE")
+_apply_bool_override(THEORETICAL_CONFIG, "detail_head_zero_init", "DETAIL_HEAD_ZERO_INIT_OVERRIDE")
 
 
 def _alpha_record_float(record: dict, *keys: str) -> float:
@@ -476,10 +538,33 @@ TRAINING_CONFIG = {
     "gradient_clip_value": 5.0,
     "optimizer_learning_rate": 1.0e-02,
     "scalar_lr_ratio": 0.1,
+    "lr_schedule": "inverse",
+    "lr_inverse_decay_steps": 500.0,
+    "lr_constant_steps": 0,
+    "lr_min_factor": 0.1,
+    "lr_warmup_steps": 0,
+    "res_loss_weight": 1.0,
+    "gradres_loss_weight": 0.0,
+    "lapres_loss_weight": 0.0,
+    "loss_eps": 1.0e-12,
+    "aux_loss_decay_start_fraction": 1.0,
+    "aux_loss_decay_end_fraction": 1.0,
     "use_mixed_precision": False,
 }
 _apply_int_override(TRAINING_CONFIG, "validation_interval", "VALIDATION_INTERVAL_OVERRIDE")
 _apply_int_override(TRAINING_CONFIG, "save_interval", "SAVE_INTERVAL_OVERRIDE")
+_apply_float_override(TRAINING_CONFIG, "scalar_lr_ratio", "SCALAR_LR_RATIO_OVERRIDE")
+_apply_string_override(TRAINING_CONFIG, "lr_schedule", "LR_SCHEDULE_OVERRIDE", allowed_values={"inverse", "constant", "constant_cosine", "cosine"})
+_apply_float_override(TRAINING_CONFIG, "lr_inverse_decay_steps", "LR_INVERSE_DECAY_STEPS_OVERRIDE")
+_apply_int_override(TRAINING_CONFIG, "lr_constant_steps", "LR_CONSTANT_STEPS_OVERRIDE")
+_apply_float_override(TRAINING_CONFIG, "lr_min_factor", "LR_MIN_FACTOR_OVERRIDE")
+_apply_int_override(TRAINING_CONFIG, "lr_warmup_steps", "LR_WARMUP_STEPS_OVERRIDE")
+_apply_float_override(TRAINING_CONFIG, "res_loss_weight", "RES_LOSS_WEIGHT_OVERRIDE")
+_apply_float_override(TRAINING_CONFIG, "gradres_loss_weight", "GRADRES_LOSS_WEIGHT_OVERRIDE")
+_apply_float_override(TRAINING_CONFIG, "lapres_loss_weight", "LAPRES_LOSS_WEIGHT_OVERRIDE")
+_apply_float_override(TRAINING_CONFIG, "loss_eps", "LOSS_EPS_OVERRIDE")
+_apply_float_override(TRAINING_CONFIG, "aux_loss_decay_start_fraction", "AUX_LOSS_DECAY_START_FRACTION_OVERRIDE")
+_apply_float_override(TRAINING_CONFIG, "aux_loss_decay_end_fraction", "AUX_LOSS_DECAY_END_FRACTION_OVERRIDE")
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -499,7 +584,8 @@ if EXPERIMENT_OUTPUT_TAG:
 MODEL_PATH = os.path.join(MODEL_DIR, f"{_model_stem}_model.pth")
 BEST_MODEL_PATH = os.path.join(MODEL_DIR, f"{_model_stem}_best_model.pth")
 CHECKPOINT_DIR = os.path.join(MODEL_DIR, f"checkpoints_{EXPERIMENT_OUTPUT_TAG}") if EXPERIMENT_OUTPUT_TAG else os.path.join(MODEL_DIR, "checkpoints")
-LOG_DIR = os.path.join(PROJECT_ROOT, "logs", EXPERIMENT_OUTPUT_TAG) if EXPERIMENT_OUTPUT_TAG else os.path.join(PROJECT_ROOT, "logs")
+_log_dir_override = str(os.environ.get("LOG_DIR_OVERRIDE", "") or "").strip()
+LOG_DIR = _log_dir_override or (os.path.join(PROJECT_ROOT, "logs", EXPERIMENT_OUTPUT_TAG) if EXPERIMENT_OUTPUT_TAG else os.path.join(PROJECT_ROOT, "logs"))
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -517,22 +603,32 @@ LOGGING_CONFIG = {
 
 def print_config():
     """Print the current alpha-only configuration for quick inspection."""
-    model_arch = str(THEORETICAL_CONFIG.get("model_arch", "unrolled_cnn")).strip().lower()
     print("=" * 60)
     print("ALPHA-ONLY CT RECONSTRUCTION CONFIGURATION")
     print("=" * 60)
     print(f"Image size: {IMAGE_SIZE}x{IMAGE_SIZE}")
     print(f"Regularizer type: {THEORETICAL_CONFIG['regularizer_type']}")
-    print(f"Model architecture: {model_arch}")
-    if model_arch in {"tv_pc_unet", "tv_pc_refiner", "physics_unet"}:
-        print("Optimization iterations: non-iterative refiner")
-        print(f"U-Net refiner input mode: {THEORETICAL_CONFIG.get('refiner_input_mode', 'u2_stacked')}")
-        print(f"U-Net base channels: {THEORETICAL_CONFIG.get('unet_base_channels', 32)}")
-        print(f"U-Net depth: {THEORETICAL_CONFIG.get('unet_depth', 4)}")
-        print(f"U-Net residual max: {THEORETICAL_CONFIG.get('unet_residual_max', 0.0)}")
+    print(f"Model architecture: {THEORETICAL_CONFIG['model_arch']}")
+    if str(THEORETICAL_CONFIG['model_arch']).strip().lower() in {"tv_pc_unet", "tv_pc_refiner", "physics_unet", "tv_pc_cascade_unet"}:
+        print(f"Refiner input mode: {THEORETICAL_CONFIG['refiner_input_mode']}")
+        print(f"U-Net backbone: {THEORETICAL_CONFIG['unet_backbone']}")
+        print(f"U-Net base channels: {THEORETICAL_CONFIG['unet_base_channels']}")
+        print(f"U-Net depth: {THEORETICAL_CONFIG['unet_depth']}")
+        print(f"U-Net residual max: {THEORETICAL_CONFIG['unet_residual_max']}")
+        print(f"Refiner stages: {THEORETICAL_CONFIG['refiner_stages']}")
+        print(f"Refiner share weights: {THEORETICAL_CONFIG['refiner_share_weights']}")
+        print(f"Refiner stage DC: {THEORETICAL_CONFIG['refiner_stage_dc_enabled']}")
+        print(f"Refiner stage DC CG iters: {THEORETICAL_CONFIG['refiner_stage_dc_cg_iters']}")
+        print(f"Detail head enabled: {THEORETICAL_CONFIG['detail_head_enabled']}")
+        print(f"Detail head input mode: {THEORETICAL_CONFIG['detail_head_input_mode']}")
+        print(f"Detail head hidden channels: {THEORETICAL_CONFIG['detail_head_hidden_channels']}")
+        print(f"Detail head depth: {THEORETICAL_CONFIG['detail_head_depth']}")
+        print(f"Detail head residual max: {THEORETICAL_CONFIG['detail_head_residual_max']}")
+        print(f"Detail head stage policy: {THEORETICAL_CONFIG['detail_head_stage_policy']}")
+        print(f"Detail head share weights: {THEORETICAL_CONFIG['detail_head_share_weights']}")
     else:
         print(f"Optimization iterations: {THEORETICAL_CONFIG['n_iter']}")
-    print(f"Memory units: {THEORETICAL_CONFIG['n_memory_units']}")
+        print(f"Memory units: {THEORETICAL_CONFIG['n_memory_units']}")
     print(f"Device: {device}")
     print(f"Train data source: {DATA_CONFIG['train_data_source']}")
     print(f"Val data source: {DATA_CONFIG['val_data_source']}")
@@ -557,6 +653,12 @@ def print_config():
     print(f"Training iterations: {n_train}")
     print(f"Batch size: {n_data}")
     print(f"Learning rate: {TRAINING_CONFIG['optimizer_learning_rate']}")
+    print(f"LR schedule: {TRAINING_CONFIG['lr_schedule']}")
+    print(f"RES loss weight: {TRAINING_CONFIG['res_loss_weight']}")
+    print(f"GradRES loss weight: {TRAINING_CONFIG['gradres_loss_weight']}")
+    print(f"LapRES loss weight: {TRAINING_CONFIG['lapres_loss_weight']}")
+    print(f"Aux loss decay start fraction: {TRAINING_CONFIG['aux_loss_decay_start_fraction']}")
+    print(f"Aux loss decay end fraction: {TRAINING_CONFIG['aux_loss_decay_end_fraction']}")
     print(f"Training patience: {TRAINING_CONFIG['early_stopping_patience']}")
     print(f"Model save path: {MODEL_PATH}")
     print("=" * 60)

@@ -243,6 +243,235 @@ class ResidualUNet(nn.Module):
         return residual
 
 
+class DenseResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, num_layers=3, growth_rate=None):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.num_layers = int(num_layers)
+        if growth_rate is None:
+            growth_rate = min(max(self.out_channels // 4, 16), 128)
+        self.growth_rate = int(growth_rate)
+        if self.in_channels <= 0 or self.out_channels <= 0 or self.num_layers <= 0:
+            raise ValueError("DenseResidualBlock channel counts and num_layers must be positive.")
+
+        layers = []
+        current_channels = self.in_channels
+        for _ in range(self.num_layers):
+            layers.append(
+                nn.Sequential(
+                    nn.Conv2d(current_channels, self.growth_rate, kernel_size=3, padding=1),
+                    _group_norm(self.growth_rate),
+                    nn.SiLU(inplace=True),
+                )
+            )
+            current_channels += self.growth_rate
+        self.layers = nn.ModuleList(layers)
+        self.compress = nn.Sequential(
+            nn.Conv2d(current_channels, self.out_channels, kernel_size=1),
+            _group_norm(self.out_channels),
+        )
+        self.shortcut = nn.Identity()
+        if self.in_channels != self.out_channels:
+            self.shortcut = nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x):
+        features = [x]
+        for layer in self.layers:
+            features.append(layer(torch.cat(features, dim=1)))
+        dense = self.compress(torch.cat(features, dim=1))
+        return self.act(dense + self.shortcut(x))
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super().__init__()
+        channels = int(channels)
+        hidden = max(channels // int(reduction), 4)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+        )
+
+    def forward(self, x):
+        avg = F.adaptive_avg_pool2d(x, 1)
+        max_pool = F.adaptive_max_pool2d(x, 1)
+        weight = torch.sigmoid(self.mlp(avg) + self.mlp(max_pool))
+        return x * weight
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = int(kernel_size) // 2
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
+
+    def forward(self, x):
+        avg = torch.mean(x, dim=1, keepdim=True)
+        max_pool = torch.amax(x, dim=1, keepdim=True)
+        weight = torch.sigmoid(self.conv(torch.cat([avg, max_pool], dim=1)))
+        return x * weight
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channel = ChannelAttention(channels)
+        self.spatial = SpatialAttention()
+
+    def forward(self, x):
+        return self.spatial(self.channel(x))
+
+
+class RADBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.dense_residual = DenseResidualBlock(in_channels, out_channels)
+        self.attention = CBAM(out_channels)
+
+    def forward(self, x):
+        x = self.dense_residual(x)
+        return self.attention(x) + x
+
+
+class AttentionGate(nn.Module):
+    def __init__(self, skip_channels, gate_channels, inter_channels=None):
+        super().__init__()
+        skip_channels = int(skip_channels)
+        gate_channels = int(gate_channels)
+        if inter_channels is None:
+            inter_channels = max(min(skip_channels, gate_channels) // 2, 8)
+        inter_channels = int(inter_channels)
+        self.skip_proj = nn.Conv2d(skip_channels, inter_channels, kernel_size=1, bias=False)
+        self.gate_proj = nn.Conv2d(gate_channels, inter_channels, kernel_size=1, bias=False)
+        self.psi = nn.Conv2d(inter_channels, 1, kernel_size=1)
+
+    def forward(self, skip, gate):
+        gate_resized = gate
+        if gate.shape[-2:] != skip.shape[-2:]:
+            gate_resized = F.interpolate(gate, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        logits = self.psi(F.silu(self.skip_proj(skip) + self.gate_proj(gate_resized)))
+        return skip * torch.sigmoid(logits)
+
+
+class RADDownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.pool = nn.MaxPool2d(2)
+        self.block = RADBlock(in_channels, out_channels)
+
+    def forward(self, x):
+        return self.block(self.pool(x))
+
+
+class RADUpBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.attention_gate = AttentionGate(skip_channels, in_channels)
+        self.block = RADBlock(in_channels + skip_channels, out_channels)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        diff_y = int(skip.shape[-2]) - int(x.shape[-2])
+        diff_x = int(skip.shape[-1]) - int(x.shape[-1])
+        if diff_x != 0 or diff_y != 0:
+            x = F.pad(x, [diff_x // 2, diff_x - diff_x // 2, diff_y // 2, diff_y - diff_y // 2])
+        skip = self.attention_gate(skip, x)
+        return self.block(torch.cat([skip, x], dim=1))
+
+
+class RADUNet(nn.Module):
+    """Residual-attention-dense U-Net that predicts one residual image."""
+
+    def __init__(self, input_channels, base_channels=32, depth=4, residual_max=0.0):
+        super().__init__()
+        self.input_channels = int(input_channels)
+        self.base_channels = int(base_channels)
+        self.depth = int(depth)
+        self.residual_max = float(residual_max)
+        if self.input_channels <= 0:
+            raise ValueError("input_channels must be positive.")
+        if self.base_channels <= 0:
+            raise ValueError("base_channels must be positive.")
+        if self.depth <= 0:
+            raise ValueError("depth must be positive.")
+
+        channels = [self.base_channels * (2 ** i) for i in range(self.depth + 1)]
+        self.input_norm = nn.InstanceNorm2d(self.input_channels, affine=True)
+        self.inc = RADBlock(self.input_channels, channels[0])
+        self.downs = nn.ModuleList(
+            RADDownBlock(channels[i], channels[i + 1]) for i in range(self.depth)
+        )
+        self.ups = nn.ModuleList(
+            RADUpBlock(channels[i + 1], channels[i], channels[i]) for i in range(self.depth - 1, -1, -1)
+        )
+        self.out_conv = nn.Conv2d(channels[0], 1, kernel_size=1)
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, x):
+        x = self.input_norm(x)
+        skips = []
+        x = self.inc(x)
+        skips.append(x)
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)
+        for up, skip in zip(self.ups, reversed(skips[:-1])):
+            x = up(x, skip)
+        residual = self.out_conv(x)
+        if self.residual_max > 0:
+            residual = self.residual_max * torch.tanh(residual / self.residual_max)
+        return residual
+
+
+class FullResolutionDetailHead(nn.Module):
+    """Small same-resolution residual head for sharpening local details."""
+
+    def __init__(self, input_channels, hidden_channels=16, depth=2, residual_max=0.0, zero_init=True):
+        super().__init__()
+        self.input_channels = int(input_channels)
+        self.hidden_channels = int(hidden_channels)
+        self.depth = int(depth)
+        self.residual_max = float(residual_max)
+        if self.input_channels <= 0:
+            raise ValueError("detail head input_channels must be positive.")
+        if self.hidden_channels <= 0:
+            raise ValueError("detail head hidden_channels must be positive.")
+        if self.depth <= 0:
+            raise ValueError("detail head depth must be positive.")
+
+        layers = [
+            nn.InstanceNorm2d(self.input_channels, affine=True),
+            nn.Conv2d(self.input_channels, self.hidden_channels, kernel_size=3, padding=1),
+            _group_norm(self.hidden_channels),
+            nn.SiLU(inplace=True),
+        ]
+        for _ in range(self.depth - 1):
+            layers.extend(
+                [
+                    nn.Conv2d(self.hidden_channels, self.hidden_channels, kernel_size=3, padding=1),
+                    _group_norm(self.hidden_channels),
+                    nn.SiLU(inplace=True),
+                ]
+            )
+        out_conv = nn.Conv2d(self.hidden_channels, 1, kernel_size=3, padding=1)
+        if bool(zero_init):
+            nn.init.zeros_(out_conv.weight)
+            nn.init.zeros_(out_conv.bias)
+        layers.append(out_conv)
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        detail = self.net(x)
+        if self.residual_max > 0:
+            detail = self.residual_max * torch.tanh(detail / self.residual_max)
+        return detail
+
+
 # ============================================================================
 # 4. Learned gradient descent (CNN updates)
 # ============================================================================
@@ -578,9 +807,16 @@ class TVPCUNetRefiner(nn.Module):
         super().__init__()
         self.height = int(height)
         self.width = int(width)
-        self.n_iter = 1
+        self.n_iter = max(int(THEORETICAL_CONFIG.get("refiner_stages", 1)), 1)
         self.n_memory = 0
-        self.model_arch = "tv_pc_unet"
+        self.model_arch = str(THEORETICAL_CONFIG.get("model_arch", "tv_pc_unet")).strip().lower()
+        self.refiner_stages = self.n_iter
+        self.refiner_share_weights = bool(THEORETICAL_CONFIG.get("refiner_share_weights", True))
+        self.stage_dc_enabled = bool(THEORETICAL_CONFIG.get("refiner_stage_dc_enabled", False))
+        self.stage_dc_cg_iters = int(THEORETICAL_CONFIG.get("refiner_stage_dc_cg_iters", 4))
+        self.stage_dc_damping = float(THEORETICAL_CONFIG.get("refiner_stage_dc_damping", 1.0e-2))
+        self.stage_dc_detach = bool(THEORETICAL_CONFIG.get("refiner_stage_dc_detach", True))
+        self.stage_dc_normalize = bool(THEORETICAL_CONFIG.get("refiner_stage_dc_normalize", True))
         self.refiner_input_mode = str(THEORETICAL_CONFIG.get("refiner_input_mode", "u2_stacked")).strip().lower()
         if self.refiner_input_mode not in {"u2", "u2_stacked", "physics_conditioned_u2", "u2_alpha_stack"}:
             raise ValueError(
@@ -645,18 +881,147 @@ class TVPCUNetRefiner(nn.Module):
         self.physics_explicit_update_max = float(TIME_DOMAIN_CONFIG.get("physics_explicit_update_max", 0.10))
         phys_alpha_init = max(float(TIME_DOMAIN_CONFIG.get("physics_explicit_update_alpha_init", 0.02)), 1.0e-8)
         self.physics_alpha_raw = nn.Parameter(torch.tensor(math.log(math.exp(phys_alpha_init) - 1.0), dtype=torch.float32))
+        self.physics_gate_mode = str(THEORETICAL_CONFIG.get("physics_gate_mode", "scalar")).strip().lower()
+        if self.physics_gate_mode not in {"scalar", "spatial"}:
+            raise ValueError("physics_gate_mode must be 'scalar' or 'spatial'.")
+        stage_alpha_count = max(self.refiner_stages - 1, 1)
+        stage_alpha_raw_init = math.log(math.exp(phys_alpha_init) - 1.0)
+        self.stage_dc_alpha_raw = nn.Parameter(torch.full((stage_alpha_count,), stage_alpha_raw_init, dtype=torch.float32))
 
         self.detach_physical_grads = bool(DATA_CONFIG.get("detach_physical_grads", True))
         self.input_channels = 1 + self.data_fidelity_channels + self.physics_residual_channels + 1
         base_channels = int(THEORETICAL_CONFIG.get("unet_base_channels", 32))
         depth = int(THEORETICAL_CONFIG.get("unet_depth", 4))
         residual_max = float(THEORETICAL_CONFIG.get("unet_residual_max", 0.0))
-        self.update_network = ResidualUNet(
+        self.unet_backbone = str(THEORETICAL_CONFIG.get("unet_backbone", "plain")).strip().lower()
+        self.update_network = self._build_refiner_network(
             input_channels=self.input_channels,
             base_channels=base_channels,
             depth=depth,
             residual_max=residual_max,
         )
+        self.extra_stage_networks = nn.ModuleList()
+        if self.refiner_stages > 1 and not self.refiner_share_weights:
+            self.extra_stage_networks.extend(
+                self._build_refiner_network(
+                    input_channels=self.input_channels,
+                    base_channels=base_channels,
+                    depth=depth,
+                    residual_max=residual_max,
+                )
+                for _ in range(self.refiner_stages - 1)
+            )
+        self.detail_head_enabled = bool(THEORETICAL_CONFIG.get("detail_head_enabled", False))
+        self.detail_head_input_mode = str(THEORETICAL_CONFIG.get("detail_head_input_mode", "features")).strip().lower()
+        if self.detail_head_input_mode not in {"features", "features_residual", "features_residual_coeff"}:
+            raise ValueError(
+                f"detail_head_input_mode={self.detail_head_input_mode!r}; "
+                "expected 'features', 'features_residual', or 'features_residual_coeff'."
+            )
+        self.detail_head_stage_policy = str(THEORETICAL_CONFIG.get("detail_head_stage_policy", "last")).strip().lower()
+        if self.detail_head_stage_policy not in {"last", "all"}:
+            raise ValueError("detail_head_stage_policy must be 'last' or 'all'.")
+        self.detail_head_share_weights = bool(THEORETICAL_CONFIG.get("detail_head_share_weights", True))
+        self.detail_head_input_channels = self._detail_head_input_channels()
+        self.detail_head = None
+        self.extra_detail_heads = nn.ModuleList()
+        if self.detail_head_enabled:
+            self.detail_head = self._build_detail_head(self.detail_head_input_channels)
+            if self.refiner_stages > 1 and not self.detail_head_share_weights:
+                self.extra_detail_heads.extend(
+                    self._build_detail_head(self.detail_head_input_channels)
+                    for _ in range(self.refiner_stages - 1)
+                )
+        self.physics_gate_network = None
+        if self.physics_gate_mode == "spatial":
+            hidden = max(min(base_channels, 64), 16)
+            self.physics_gate_network = nn.Sequential(
+                nn.InstanceNorm2d(self.input_channels, affine=True),
+                nn.Conv2d(self.input_channels, hidden, kernel_size=3, padding=1),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(hidden, 1, kernel_size=1),
+            )
+            final_conv = self.physics_gate_network[-1]
+            nn.init.zeros_(final_conv.weight)
+            ratio = phys_alpha_init / max(self.physics_explicit_update_max, phys_alpha_init + 1.0e-6)
+            ratio = min(max(ratio, 1.0e-4), 1.0 - 1.0e-4)
+            nn.init.constant_(final_conv.bias, math.log(ratio / (1.0 - ratio)))
+
+    def _build_refiner_network(self, input_channels, base_channels, depth, residual_max):
+        if self.unet_backbone in {"plain", "residual_unet"}:
+            return ResidualUNet(
+                input_channels=input_channels,
+                base_channels=base_channels,
+                depth=depth,
+                residual_max=residual_max,
+            )
+        if self.unet_backbone == "rad_unet":
+            return RADUNet(
+                input_channels=input_channels,
+                base_channels=base_channels,
+                depth=depth,
+                residual_max=residual_max,
+            )
+        raise ValueError(
+            f"Unsupported unet_backbone={self.unet_backbone!r}; "
+            "expected 'plain', 'residual_unet', or 'rad_unet'."
+        )
+
+    def _detail_head_input_channels(self):
+        channels = int(self.input_channels)
+        if self.detail_head_input_mode == "features_residual":
+            channels += 1
+        elif self.detail_head_input_mode == "features_residual_coeff":
+            channels += 2
+        return channels
+
+    def _build_detail_head(self, input_channels):
+        return FullResolutionDetailHead(
+            input_channels=input_channels,
+            hidden_channels=int(THEORETICAL_CONFIG.get("detail_head_hidden_channels", 16)),
+            depth=int(THEORETICAL_CONFIG.get("detail_head_depth", 2)),
+            residual_max=float(THEORETICAL_CONFIG.get("detail_head_residual_max", 0.0)),
+            zero_init=bool(THEORETICAL_CONFIG.get("detail_head_zero_init", True)),
+        )
+
+    def _get_stage_network(self, stage_idx):
+        if self.refiner_share_weights or stage_idx == 0:
+            return self.update_network
+        return self.extra_stage_networks[int(stage_idx) - 1]
+
+    def _get_detail_head(self, stage_idx):
+        if self.detail_head is None:
+            raise ValueError("detail_head_enabled=True requires a detail head module.")
+        if self.detail_head_share_weights or stage_idx == 0:
+            return self.detail_head
+        return self.extra_detail_heads[int(stage_idx) - 1]
+
+    def _detail_head_active_for_stage(self, stage_idx):
+        if not self.detail_head_enabled:
+            return False
+        if self.detail_head_stage_policy == "all":
+            return True
+        return int(stage_idx) == int(self.refiner_stages) - 1
+
+    def _compose_detail_features(self, features, residual, coeff_current):
+        if self.detail_head_input_mode == "features":
+            return features
+        if self.detail_head_input_mode == "features_residual":
+            return torch.cat([features, residual], dim=1)
+        if self.detail_head_input_mode == "features_residual_coeff":
+            return torch.cat([features, residual, coeff_current], dim=1)
+        raise ValueError(f"Unsupported detail_head_input_mode={self.detail_head_input_mode!r}.")
+
+    def _apply_detail_head(self, stage_idx, features, residual, coeff_current):
+        if not self._detail_head_active_for_stage(stage_idx):
+            return torch.zeros_like(residual)
+        detail_features = self._compose_detail_features(features, residual, coeff_current)
+        if int(detail_features.shape[1]) != int(self.detail_head_input_channels):
+            raise ValueError(
+                f"Detail head features have {int(detail_features.shape[1])} channels, "
+                f"expected {int(self.detail_head_input_channels)}."
+            )
+        return self._get_detail_head(stage_idx)(detail_features)
 
     def _resolve_cnn_channel_indices(self):
         if self.requested_cnn_angle_indices is not None:
@@ -704,13 +1069,73 @@ class TVPCUNetRefiner(nn.Module):
             alpha = torch.clamp(alpha, max=self.physics_explicit_update_max)
         return alpha
 
+    def current_stage_dc_alpha(self, stage_idx=0):
+        idx = min(max(int(stage_idx), 0), int(self.stage_dc_alpha_raw.numel()) - 1)
+        alpha = F.softplus(self.stage_dc_alpha_raw[idx])
+        if self.physics_explicit_update_max > 0:
+            alpha = torch.clamp(alpha, max=self.physics_explicit_update_max)
+        return alpha
+
+    def _current_physics_gate(self, features):
+        if self.physics_gate_mode == "spatial":
+            if self.physics_gate_network is None:
+                raise ValueError("physics_gate_mode='spatial' requires physics_gate_network.")
+            scale = self.physics_explicit_update_max if self.physics_explicit_update_max > 0 else 1.0
+            return float(scale) * torch.sigmoid(self.physics_gate_network(features))
+        return self.current_physics_alpha().view(1, 1, 1, 1)
+
+    def _apply_explicit_physics_update(self, features, physics_corr):
+        if not self.physics_explicit_update_enabled:
+            return torch.zeros_like(physics_corr)
+        return self._current_physics_gate(features) * physics_corr
+
+    @torch.no_grad()
+    def physics_gate_diagnostics(self, coeff_initial=None, g_observed=None):
+        diagnostics = {
+            "gate_mode": self.physics_gate_mode,
+            "legacy_alpha": float(self.current_physics_alpha().item()),
+        }
+        if self.stage_dc_enabled and hasattr(self, "stage_dc_alpha_raw"):
+            diagnostics["stage_dc_alpha"] = [
+                float(self.current_stage_dc_alpha(idx).item())
+                for idx in range(max(self.refiner_stages - 1, 1))
+            ]
+        if self.physics_gate_mode != "spatial" or coeff_initial is None or g_observed is None:
+            return diagnostics
+        if g_observed.dim() == 3 and g_observed.shape[1] == 1:
+            g_observed = g_observed.squeeze(1)
+        g_observed_learned = self._select_learned_measurements(g_observed)
+        features, physics_corr = self._compose_features(coeff_initial, g_observed_learned)
+        gate = self._current_physics_gate(features)
+        physics_update = gate * physics_corr
+        diagnostics.update(
+            {
+                "gate_mean": float(gate.mean().item()),
+                "gate_std": float(gate.std(unbiased=False).item()),
+                "gate_min": float(gate.min().item()),
+                "gate_max": float(gate.max().item()),
+                "physics_corr_norm": float(torch.norm(physics_corr).item()),
+                "physics_update_norm": float(torch.norm(physics_update).item()),
+            }
+        )
+        return diagnostics
+
     def _compose_data_fidelity_channels(self, data_grad_pa):
         selected_pa = self._select_cnn_angle_channels(data_grad_pa).squeeze(2)
         if self.refiner_input_mode == "u2_alpha_stack":
             return selected_pa
         return selected_pa.mean(dim=1, keepdim=True)
 
-    def _compute_physics_correction(self, coeff_initial, g_observed_learned):
+    def _compute_inverse_residual_correction(
+        self,
+        coeff_initial,
+        g_observed_learned,
+        *,
+        damping,
+        cg_iters,
+        detach,
+        normalize,
+    ):
         op = self.theoretical_gd.operator
         if self.physics_residual_mode == "per_angle_cg":
             if not hasattr(op, "residual_inverse_correction_per_angle"):
@@ -718,10 +1143,10 @@ class TVPCUNetRefiner(nn.Module):
             physics_corr_pa = op.residual_inverse_correction_per_angle(
                 coeff_initial,
                 g_observed_learned,
-                damping=self.physics_residual_damping,
-                cg_iters=self.physics_residual_cg_iters,
-                detach=self.physics_residual_detach,
-                normalize=self.physics_residual_normalize,
+                damping=damping,
+                cg_iters=cg_iters,
+                detach=detach,
+                normalize=normalize,
             )
             selected = self._select_cnn_angle_channels(physics_corr_pa)
             return selected.mean(dim=1)
@@ -732,20 +1157,40 @@ class TVPCUNetRefiner(nn.Module):
                 coeff_initial,
                 g_observed_learned,
                 angle_indices=self.cnn_channel_indices,
-                damping=self.physics_residual_damping,
-                cg_iters=self.physics_residual_cg_iters,
-                detach=self.physics_residual_detach,
-                normalize=self.physics_residual_normalize,
+                damping=damping,
+                cg_iters=cg_iters,
+                detach=detach,
+                normalize=normalize,
             )
         if not hasattr(op, "residual_inverse_correction"):
             raise ValueError("The active operator does not implement residual_inverse_correction().")
         return op.residual_inverse_correction(
             coeff_initial,
             g_observed_learned,
+            damping=damping,
+            cg_iters=cg_iters,
+            detach=detach,
+            normalize=normalize,
+        )
+
+    def _compute_physics_correction(self, coeff_initial, g_observed_learned):
+        return self._compute_inverse_residual_correction(
+            coeff_initial,
+            g_observed_learned,
             damping=self.physics_residual_damping,
             cg_iters=self.physics_residual_cg_iters,
             detach=self.physics_residual_detach,
             normalize=self.physics_residual_normalize,
+        )
+
+    def _compute_stage_dc_correction(self, coeff_current, g_observed_learned):
+        return self._compute_inverse_residual_correction(
+            coeff_current,
+            g_observed_learned,
+            damping=self.stage_dc_damping,
+            cg_iters=self.stage_dc_cg_iters,
+            detach=self.stage_dc_detach,
+            normalize=self.stage_dc_normalize,
         )
 
     def _compose_features(self, coeff_initial, g_observed_learned):
@@ -774,14 +1219,19 @@ class TVPCUNetRefiner(nn.Module):
             g_observed = g_observed.squeeze(1)
         x_tv = coeff_initial.clone()
         g_observed_learned = self._select_learned_measurements(g_observed)
-        features, physics_corr = self._compose_features(x_tv, g_observed_learned)
-        residual = self.update_network(features)
-        if self.physics_explicit_update_enabled:
-            coeff_pred = x_tv + self.current_physics_alpha() * physics_corr + residual
-        else:
-            coeff_pred = x_tv + residual
-        history = [x_tv.clone(), coeff_pred.clone()]
-        return coeff_pred, history
+        coeff_current = x_tv
+        history = [x_tv.clone()]
+        for stage_idx in range(self.refiner_stages):
+            features, physics_corr = self._compose_features(coeff_current, g_observed_learned)
+            residual = self._get_stage_network(stage_idx)(features)
+            detail = self._apply_detail_head(stage_idx, features, residual, coeff_current)
+            coeff_next = coeff_current + self._apply_explicit_physics_update(features, physics_corr) + residual + detail
+            if self.stage_dc_enabled and stage_idx < self.refiner_stages - 1:
+                dc_corr = self._compute_stage_dc_correction(coeff_next, g_observed_learned)
+                coeff_next = coeff_next + self.current_stage_dc_alpha(stage_idx).view(1, 1, 1, 1) * dc_corr
+            history.append(coeff_next.clone())
+            coeff_current = coeff_next
+        return coeff_current, history
 
 
 # ============================================================================
@@ -795,12 +1245,12 @@ class TheoreticalCTNet(nn.Module):
         self.model_arch = str(THEORETICAL_CONFIG.get("model_arch", "unrolled_cnn")).strip().lower()
         if self.model_arch in {"unrolled_cnn", "learned_gradient_descent", "lgd"}:
             self.optimizer = LearnedGradientDescent(height, width, regularizer_type, n_iter, n_memory)
-        elif self.model_arch in {"tv_pc_unet", "tv_pc_refiner", "physics_unet"}:
+        elif self.model_arch in {"tv_pc_unet", "tv_pc_refiner", "physics_unet", "tv_pc_cascade_unet"}:
             self.optimizer = TVPCUNetRefiner(height, width, regularizer_type)
         else:
             raise ValueError(
                 f"Unsupported model_arch={self.model_arch!r}; "
-                "expected 'unrolled_cnn' or 'tv_pc_unet'."
+                "expected 'unrolled_cnn', 'tv_pc_unet', or 'tv_pc_cascade_unet'."
             )
         self.mapping = CoefficientMapping((height, width))
 
@@ -851,6 +1301,10 @@ def export_trainable_state_dict(model: nn.Module, *, move_to_cpu: bool = True):
     return state
 
 
+def _is_optional_detail_head_parameter(name: str) -> bool:
+    return ".detail_head." in str(name) or ".extra_detail_heads." in str(name)
+
+
 def load_trainable_state_dict(model: nn.Module, state_dict):
     if not isinstance(state_dict, dict):
         raise TypeError(f"Expected state_dict to be a dict-like object, got {type(state_dict).__name__}.")
@@ -864,19 +1318,45 @@ def load_trainable_state_dict(model: nn.Module, state_dict):
         else:
             unexpected.append(key)
     missing_parameters = [name for name in parameter_map.keys() if name not in filtered]
-    if missing_parameters:
-        preview = missing_parameters[:8]
-        raise RuntimeError(f"Checkpoint is missing trainable parameters required by the current model: {preview}{' ...' if len(missing_parameters) > len(preview) else ''}")
+    initialized_missing_parameters = [
+        name for name in missing_parameters if _is_optional_detail_head_parameter(name)
+    ]
+    required_missing_parameters = [
+        name for name in missing_parameters if not _is_optional_detail_head_parameter(name)
+    ]
+    if required_missing_parameters:
+        preview = required_missing_parameters[:8]
+        suffix = " ..." if len(required_missing_parameters) > len(preview) else ""
+        raise RuntimeError(
+            "Checkpoint is missing trainable parameters required by the current model: "
+            f"{preview}{suffix}"
+        )
     incompatible = model.load_state_dict(filtered, strict=False)
     missing_buffers = [name for name in incompatible.missing_keys if name not in parameter_names]
-    missing_named_parameters = [name for name in incompatible.missing_keys if name in parameter_names]
+    missing_named_parameters = [
+        name
+        for name in incompatible.missing_keys
+        if name in parameter_names and not _is_optional_detail_head_parameter(name)
+    ]
     if missing_named_parameters:
         preview = missing_named_parameters[:8]
-        raise RuntimeError(f"load_state_dict reported missing trainable parameters after filtering: {preview}{' ...' if len(missing_named_parameters) > len(preview) else ''}")
+        suffix = " ..." if len(missing_named_parameters) > len(preview) else ""
+        raise RuntimeError(
+            "load_state_dict reported missing trainable parameters after filtering: "
+            f"{preview}{suffix}"
+        )
     if incompatible.unexpected_keys:
         preview = list(incompatible.unexpected_keys)[:8]
-        raise RuntimeError(f"load_state_dict reported unexpected keys after filtering: {preview}{' ...' if len(incompatible.unexpected_keys) > len(preview) else ''}")
-    return {"loaded_parameter_count": int(len(filtered)), "ignored_non_parameter_keys": unexpected, "missing_buffer_keys": missing_buffers}
+        suffix = " ..." if len(incompatible.unexpected_keys) > len(preview) else ""
+        raise RuntimeError(
+            f"load_state_dict reported unexpected keys after filtering: {preview}{suffix}"
+        )
+    return {
+        "loaded_parameter_count": int(len(filtered)),
+        "ignored_non_parameter_keys": unexpected,
+        "missing_buffer_keys": missing_buffers,
+        "initialized_missing_parameter_keys": initialized_missing_parameters,
+    }
 
 
 def initialize_model():
@@ -896,12 +1376,34 @@ def initialize_model():
     else:
         print("Optimization iterations: non-iterative refiner")
         print(
-            "U-Net refiner: input_mode=%s base_channels=%d depth=%d residual_max=%.3g"
+            "U-Net refiner: input_mode=%s backbone=%s base_channels=%d depth=%d residual_max=%.3g"
             % (
                 str(THEORETICAL_CONFIG.get("refiner_input_mode", "u2_stacked")),
+                str(THEORETICAL_CONFIG.get("unet_backbone", "plain")),
                 int(THEORETICAL_CONFIG.get("unet_base_channels", 32)),
                 int(THEORETICAL_CONFIG.get("unet_depth", 4)),
                 float(THEORETICAL_CONFIG.get("unet_residual_max", 0.0)),
+            )
+        )
+        print(
+            "Refiner cascade: stages=%d share_weights=%s stage_dc=%s stage_dc_iters=%d"
+            % (
+                int(getattr(model.optimizer, "refiner_stages", THEORETICAL_CONFIG.get("refiner_stages", 1))),
+                bool(getattr(model.optimizer, "refiner_share_weights", THEORETICAL_CONFIG.get("refiner_share_weights", True))),
+                bool(getattr(model.optimizer, "stage_dc_enabled", THEORETICAL_CONFIG.get("refiner_stage_dc_enabled", False))),
+                int(getattr(model.optimizer, "stage_dc_cg_iters", THEORETICAL_CONFIG.get("refiner_stage_dc_cg_iters", 4))),
+            )
+        )
+        print(
+            "Detail head: enabled=%s input=%s hidden=%d depth=%d residual_max=%.3g stage_policy=%s share_weights=%s"
+            % (
+                bool(getattr(model.optimizer, "detail_head_enabled", False)),
+                str(getattr(model.optimizer, "detail_head_input_mode", THEORETICAL_CONFIG.get("detail_head_input_mode", "features"))),
+                int(THEORETICAL_CONFIG.get("detail_head_hidden_channels", 16)),
+                int(THEORETICAL_CONFIG.get("detail_head_depth", 2)),
+                float(THEORETICAL_CONFIG.get("detail_head_residual_max", 0.0)),
+                str(getattr(model.optimizer, "detail_head_stage_policy", THEORETICAL_CONFIG.get("detail_head_stage_policy", "last"))),
+                bool(getattr(model.optimizer, "detail_head_share_weights", THEORETICAL_CONFIG.get("detail_head_share_weights", True))),
             )
         )
     print(
