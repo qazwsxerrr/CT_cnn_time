@@ -40,6 +40,16 @@ N_TRAIN = int(os.environ.get("N_TRAIN_OVERRIDE", n_train))
 N_DATA = int(os.environ.get("N_DATA_OVERRIDE", n_data))
 
 
+def _env_flag(name, default=False):
+    value = os.environ.get(name, None)
+    if value is None:
+        return bool(default)
+    value = str(value).strip().lower()
+    if value == "":
+        return bool(default)
+    return value in {"1", "true", "yes", "y", "on"}
+
+
 def _resolve_resume_checkpoint_path():
     resume_path = str(os.environ.get("RESUME_CHECKPOINT_OVERRIDE", "") or "").strip()
     if resume_path:
@@ -244,12 +254,34 @@ class TheoreticalTrainer:
             offline_env_name="OFFLINE_VAL_DATASET_OVERRIDE",
             shuffle_offline=False,
         )
+        secondary_val_dataset = os.environ.get("OFFLINE_SECONDARY_VAL_DATASET_OVERRIDE", "").strip()
+        self.secondary_val_data_generator = None
+        self.secondary_val_data_source = ""
+        self.secondary_val_label = os.environ.get("SECONDARY_VAL_LABEL_OVERRIDE", "secondary").strip() or "secondary"
+        if secondary_val_dataset:
+            self.secondary_val_data_source = os.environ.get(
+                "SECONDARY_VAL_DATA_SOURCE_OVERRIDE", "shepp_logan"
+            ).strip().lower()
+            self.secondary_val_data_generator = _build_train_or_val_generator(
+                data_source=self.secondary_val_data_source,
+                shared_time_operator=shared_time_operator,
+                offline_env_name="OFFLINE_SECONDARY_VAL_DATASET_OVERRIDE",
+                shuffle_offline=False,
+            )
         self.logger.info("Train data source: %s", train_data_source)
         self.logger.info("Validation data source: %s", val_data_source)
+        if self.secondary_val_data_generator is not None:
+            self.logger.info(
+                "Secondary validation data source: %s label=%s",
+                self.secondary_val_data_source,
+                self.secondary_val_label,
+            )
         if os.environ.get("OFFLINE_TRAIN_DATASET_OVERRIDE", "").strip():
             self.logger.info("Offline train dataset: %s", os.environ["OFFLINE_TRAIN_DATASET_OVERRIDE"])
         if os.environ.get("OFFLINE_VAL_DATASET_OVERRIDE", "").strip():
             self.logger.info("Offline validation dataset: %s", os.environ["OFFLINE_VAL_DATASET_OVERRIDE"])
+        if secondary_val_dataset:
+            self.logger.info("Secondary offline validation dataset: %s", secondary_val_dataset)
         self.logger.info("Experiment tag: %s", self.experiment_metadata["output_tag"])
         self.logger.info("Operator mode: %s", self.experiment_metadata["operator_mode"])
         self.logger.info("Operator class: %s", self.experiment_metadata["operator_class"])
@@ -360,8 +392,9 @@ class TheoreticalTrainer:
                 DATA_CONFIG.get("noise_level", 0.1),
             )
         self.logger.info(
-            "Validation: interval=%d batch_size=%d random_subsample=%s reproducible=%s",
+            "Validation: interval=%d samples=%d micro_batch=%d random_subsample=%s reproducible=%s",
             int(TRAINING_CONFIG.get("validation_interval", 10)),
+            int(DATA_CONFIG.get("val_subsample_size", DATA_CONFIG.get("val_batch_size", N_DATA))),
             int(DATA_CONFIG.get("val_batch_size", N_DATA)),
             bool(DATA_CONFIG.get("val_random_subsample", False)),
             bool(DATA_CONFIG.get("val_reproducible", False)),
@@ -626,25 +659,45 @@ class TheoreticalTrainer:
         # Option 3: fully random batches (do not reseed by iteration).
         return self.data_generator.generate_batch(batch_size, random_seed=None)
 
-    def _validate(self):
-        val_bs = DATA_CONFIG.get('val_batch_size', N_DATA)
+    def _validate(
+        self,
+        *,
+        generator=None,
+        val_bs=None,
+        val_sample_count=None,
+        random_subsample=None,
+        reproducible=None,
+        seed_override=None,
+    ):
+        val_generator = generator if generator is not None else self.val_data_generator
+        val_bs = max(int(DATA_CONFIG.get('val_batch_size', N_DATA) if val_bs is None else val_bs), 1)
+        val_sample_count = max(
+            int(DATA_CONFIG.get('val_subsample_size', val_bs) if val_sample_count is None else val_sample_count),
+            1,
+        )
         # Optional override to make validation fixed/reproducible for debugging.
         # This keeps the validation set (including noise) fixed so RES across iterations is comparable.
-        val_repro = bool(DATA_CONFIG.get("val_reproducible", False))
-        env_val_repro = os.environ.get("VAL_REPRODUCIBLE_OVERRIDE", None)
-        if env_val_repro is not None:
-            val_repro = env_val_repro.strip().lower() in ("1", "true", "yes", "y")
+        if reproducible is None:
+            val_repro = bool(DATA_CONFIG.get("val_reproducible", False))
+            env_val_repro = os.environ.get("VAL_REPRODUCIBLE_OVERRIDE", None)
+            if env_val_repro is not None:
+                val_repro = env_val_repro.strip().lower() in ("1", "true", "yes", "y")
+        else:
+            val_repro = bool(reproducible)
 
         seed = None
         if val_repro:
-            seed = int(os.environ.get("VAL_SEED_OVERRIDE", DATA_CONFIG.get("validation_seed", 42)))
-        val_random_subsample = bool(DATA_CONFIG.get("val_random_subsample", False))
-        if val_random_subsample and hasattr(self.val_data_generator, "generate_random_batch"):
+            if seed_override is None:
+                seed = int(os.environ.get("VAL_SEED_OVERRIDE", DATA_CONFIG.get("validation_seed", 42)))
+            else:
+                seed = int(seed_override)
+        val_random_subsample = bool(DATA_CONFIG.get("val_random_subsample", False) if random_subsample is None else random_subsample)
+        if val_random_subsample and hasattr(val_generator, "generate_random_batch"):
             subset_seed = None
             if seed is not None:
                 subset_seed = seed + max(int(getattr(self, "current_iter", 0)), 0)
-            coeff_true_val, _, g_observed_val, coeff_initial_val = self.val_data_generator.generate_random_batch(
-                batch_size=val_bs,
+            coeff_true_val, _, g_observed_val, coeff_initial_val = val_generator.generate_random_batch(
+                batch_size=val_sample_count,
                 random_seed=subset_seed,
             )
         elif seed is not None:
@@ -656,8 +709,8 @@ class TheoreticalTrainer:
             torch_state = torch.random.get_rng_state()
             cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
             try:
-                coeff_true_val, _, g_observed_val, coeff_initial_val = self.val_data_generator.generate_batch(
-                    batch_size=val_bs, random_seed=seed
+                coeff_true_val, _, g_observed_val, coeff_initial_val = val_generator.generate_batch(
+                    batch_size=val_sample_count, random_seed=seed
                 )
             finally:
                 random.setstate(py_state)
@@ -666,18 +719,35 @@ class TheoreticalTrainer:
                 if cuda_state is not None:
                     torch.cuda.set_rng_state_all(cuda_state)
         else:
-            coeff_true_val, _, g_observed_val, coeff_initial_val = self.val_data_generator.generate_batch(
-                batch_size=val_bs, random_seed=None
+            coeff_true_val, _, g_observed_val, coeff_initial_val = val_generator.generate_batch(
+                batch_size=val_sample_count, random_seed=None
             )
-        coeff_true_val = coeff_true_val.to(device)
-        g_observed_val = g_observed_val.to(device)
-        coeff_initial_val = coeff_initial_val.to(device)
         self.model.eval()
+        total_diff_sq = None
+        total_true_sq = None
+        metric_sums = {}
+        metric_weight = 0
         with torch.no_grad():
-            coeff_pred, _, metrics = self.model(coeff_initial_val, g_observed_val)
-            diff_sq_sum = torch.sum(torch.abs(coeff_pred - coeff_true_val) ** 2)
-            true_sq_sum = torch.sum(torch.abs(coeff_true_val) ** 2).clamp_min(1e-12)
-            val_loss = torch.sqrt(diff_sq_sum / true_sq_sum)
+            total = int(coeff_true_val.shape[0])
+            for start in range(0, total, val_bs):
+                end = min(start + val_bs, total)
+                coeff_true_chunk = coeff_true_val[start:end].to(device)
+                g_observed_chunk = g_observed_val[start:end].to(device)
+                coeff_initial_chunk = coeff_initial_val[start:end].to(device)
+                coeff_pred, _, metrics = self.model(coeff_initial_chunk, g_observed_chunk)
+                diff_sq_sum = torch.sum(torch.abs(coeff_pred - coeff_true_chunk) ** 2)
+                true_sq_sum = torch.sum(torch.abs(coeff_true_chunk) ** 2)
+                total_diff_sq = diff_sq_sum if total_diff_sq is None else total_diff_sq + diff_sq_sum
+                total_true_sq = true_sq_sum if total_true_sq is None else total_true_sq + true_sq_sum
+                chunk_weight = end - start
+                metric_weight += chunk_weight
+                for key, value in metrics.items():
+                    if isinstance(value, (int, float)):
+                        metric_sums[key] = metric_sums.get(key, 0.0) + float(value) * float(chunk_weight)
+            if total_diff_sq is None or total_true_sq is None:
+                raise RuntimeError("Validation batch is empty.")
+            val_loss = torch.sqrt(total_diff_sq / total_true_sq.clamp_min(1e-12))
+            metrics = {key: value / max(metric_weight, 1) for key, value in metric_sums.items()}
         self.model.train()
         return val_loss.item(), metrics
 
@@ -806,6 +876,22 @@ class TheoreticalTrainer:
                     f"Data Fidelity Error: {data_err:.6f} | "
                     f"Coeff Change: {upd_diff:.3e}"
                 )
+                if self.secondary_val_data_generator is not None:
+                    secondary_val_loss, _ = self._validate(
+                        generator=self.secondary_val_data_generator,
+                        val_bs=int(os.environ.get("SECONDARY_VAL_BATCH_SIZE_OVERRIDE", DATA_CONFIG.get("val_batch_size", N_DATA))),
+                        val_sample_count=int(os.environ.get("SECONDARY_VAL_SUBSAMPLE_SIZE_OVERRIDE", 100)),
+                        random_subsample=_env_flag("SECONDARY_VAL_RANDOM_SUBSAMPLE_OVERRIDE", True),
+                        reproducible=_env_flag("SECONDARY_VAL_REPRODUCIBLE_OVERRIDE", True),
+                        seed_override=int(os.environ.get("SECONDARY_VAL_SEED_OVERRIDE", DATA_CONFIG.get("validation_seed", 42))),
+                    )
+                    self.logger.info(
+                        "Iter: %4d | Secondary Val (%s) RES: %.6f | samples=%d",
+                        self.current_iter,
+                        self.secondary_val_label,
+                        secondary_val_loss,
+                        int(os.environ.get("SECONDARY_VAL_SUBSAMPLE_SIZE_OVERRIDE", 100)),
+                    )
                 if val_loss < self.best_val_loss:
                     self.best_val_loss = val_loss
                     self.patience_counter = 0
@@ -826,17 +912,28 @@ class TheoreticalTrainer:
         self._save_checkpoint()
         self._save_training_plots()
 
-    def _save_checkpoint(self, is_best=False):
+    def _build_checkpoint_payload(self, *, include_training_state):
         checkpoint = {
             'iter': self.current_iter,
             'model_state_dict': export_trainable_state_dict(self.model, move_to_cpu=True),
             'model_state_format': 'trainable_parameters_only',
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
-            'training_history': self.training_history,
             'experiment_metadata': self.experiment_metadata,
+            'compact_checkpoint': not bool(include_training_state),
         }
+        if include_training_state:
+            checkpoint.update({
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'training_history': self.training_history,
+            })
+        return checkpoint
+
+    def _save_checkpoint(self, is_best=False):
+        # Default to compact model checkpoints for training outputs used by evaluation.
+        # Set COMPACT_CHECKPOINTS_OVERRIDE=0 only when optimizer/scheduler state is needed for exact resume.
+        compact_checkpoints = _env_flag("COMPACT_CHECKPOINTS_OVERRIDE", True)
+        checkpoint = self._build_checkpoint_payload(include_training_state=not compact_checkpoints)
         checkpoint_path = os.path.join(
             CHECKPOINT_DIR, f'checkpoint_iter_{self.current_iter}.pth'
         )

@@ -56,6 +56,11 @@ from b_spline.b2b1_spline import (
     radon_phi_b1b1,
 )
 
+try:
+    from detector_select.detector_grid import make_support_detector_grid_sampling_points
+except ImportError:  # pragma: no cover - supports package-style imports.
+    from models.detector_select.detector_grid import make_support_detector_grid_sampling_points
+
 
 def _morozov_settings(max_iter: int, lambda_min: float, lambda_max: float) -> dict[str, float]:
     lam_min = max(float(lambda_min), float(DATA_CONFIG.get("morozov_lambda_min", 1.0e-12)))
@@ -327,12 +332,23 @@ def _project_l1_ball(x: torch.Tensor, radius: torch.Tensor | float) -> torch.Ten
     return projected.view_as(x)
 
 
-def _sparse_blocks_apply_batched(rows: torch.Tensor, cols: torch.Tensor, values: torch.Tensor, nnz: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def _sparse_blocks_apply_batched(
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    values: torch.Tensor,
+    nnz: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    num_rows: Optional[int] = None,
+) -> torch.Tensor:
     """Apply per-angle sparse projection-order matrices stored as padded COO buffers."""
     if x.dim() != 3:
         raise ValueError(f"x must have shape (B,K,N), got {tuple(x.shape)}")
-    batch, num_angles, n = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
-    y = torch.zeros((batch, num_angles, n), dtype=x.dtype, device=x.device)
+    batch, num_angles, n_cols = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    out_rows = n_cols if num_rows is None else int(num_rows)
+    if out_rows <= 0:
+        raise ValueError(f"num_rows must be positive, got {out_rows!r}.")
+    y = torch.zeros((batch, num_angles, out_rows), dtype=x.dtype, device=x.device)
     for angle_idx in range(num_angles):
         count = int(nnz[angle_idx].item())
         if count <= 0:
@@ -345,12 +361,23 @@ def _sparse_blocks_apply_batched(rows: torch.Tensor, cols: torch.Tensor, values:
     return y
 
 
-def _sparse_blocks_adjoint_apply_batched(rows: torch.Tensor, cols: torch.Tensor, values: torch.Tensor, nnz: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def _sparse_blocks_adjoint_apply_batched(
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    values: torch.Tensor,
+    nnz: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    num_cols: Optional[int] = None,
+) -> torch.Tensor:
     """Apply adjoints of per-angle sparse projection-order matrices stored as padded COO buffers."""
     if x.dim() != 3:
-        raise ValueError(f"x must have shape (B,K,N), got {tuple(x.shape)}")
-    batch, num_angles, n = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
-    y = torch.zeros((batch, num_angles, n), dtype=x.dtype, device=x.device)
+        raise ValueError(f"x must have shape (B,K,M_per_angle), got {tuple(x.shape)}")
+    batch, num_angles, n_rows = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    out_cols = n_rows if num_cols is None else int(num_cols)
+    if out_cols <= 0:
+        raise ValueError(f"num_cols must be positive, got {out_cols!r}.")
+    y = torch.zeros((batch, num_angles, out_cols), dtype=x.dtype, device=x.device)
     for angle_idx in range(num_angles):
         count = int(nnz[angle_idx].item())
         if count <= 0:
@@ -410,15 +437,23 @@ def _build_sparse_b1b1_block_from_sampling_points(
     sampling_points: torch.Tensor,
     value_tol: float = 1.0e-15,
 ) -> dict[str, torch.Tensor]:
-    """Build the full sparse projection-order block for arbitrary time samples."""
+    """Build a sparse projection-order block for arbitrary time samples.
+
+    ``sorted_proj`` always has length ``N = H*W`` and indexes coefficient
+    columns. ``sampling_points`` may have a smaller length ``R``; in that case
+    this constructs a rectangular ``R x N`` projection block.
+    """
     sorted_proj = sorted_proj.detach().to(dtype=torch.float64, device="cpu")
     direction = direction.detach().to(dtype=torch.float64, device="cpu")
     sampling_points = sampling_points.detach().to(dtype=torch.float64, device="cpu").view(-1)
     proj_np = sorted_proj.numpy()
     sample_np = sampling_points.numpy()
-    n = int(proj_np.shape[0])
-    if int(sample_np.shape[0]) != n:
-        raise ValueError(f"sampling_points length={int(sample_np.shape[0])} but expected {n}.")
+    n_cols = int(proj_np.shape[0])
+    n_rows = int(sample_np.shape[0])
+    if n_cols <= 0:
+        raise ValueError("sorted_proj must contain at least one coefficient projection.")
+    if n_rows <= 0:
+        raise ValueError("sampling_points must contain at least one detector sample.")
     support_lo, support_hi = phi_support_bounds_b1b1(direction)
     support_lo = float(support_lo)
     support_hi = float(support_hi)
@@ -429,7 +464,7 @@ def _build_sparse_b1b1_block_from_sampling_points(
     lower_width = 0
     upper_width = 0
 
-    for row_idx in range(n):
+    for row_idx in range(n_rows):
         t_i = float(sample_np[row_idx])
         left = t_i - support_hi
         right = t_i - support_lo
@@ -466,12 +501,349 @@ def _build_sparse_b1b1_block_from_sampling_points(
         "sparse_cols": torch.from_numpy(cols_np),
         "sparse_values": torch.from_numpy(vals_np),
         "sparse_nnz": torch.tensor(int(vals_np.shape[0]), dtype=torch.int64),
+        "num_rows": torch.tensor(int(n_rows), dtype=torch.int64),
+        "num_cols": torch.tensor(int(n_cols), dtype=torch.int64),
         "lower_width": torch.tensor(int(lower_width), dtype=torch.int64),
         "upper_width": torch.tensor(int(upper_width), dtype=torch.int64),
         "diag0": torch.tensor(0.0, dtype=torch.float64),
         "support_lo": torch.tensor(float(support_lo), dtype=torch.float64),
         "support_hi": torch.tensor(float(support_hi), dtype=torch.float64),
     }
+
+
+def uniform_sis_bin_ranges(n: int, num_bins: int) -> list[tuple[int, int]]:
+    """Partition ``N`` sorted SIS row indices into non-empty detector bins."""
+    n = int(n)
+    num_bins = int(num_bins)
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n!r}.")
+    if num_bins <= 0 or num_bins > n:
+        raise ValueError(f"num_bins must be in [1,{n}], got {num_bins!r}.")
+    ranges: list[tuple[int, int]] = []
+    for bin_idx in range(num_bins):
+        start = int(math.floor(float(bin_idx) * float(n) / float(num_bins)))
+        end = int(math.floor(float(bin_idx + 1) * float(n) / float(num_bins)))
+        if end <= start:
+            raise RuntimeError(f"Failed to build a non-empty SIS bin {bin_idx}: [{start},{end}).")
+        ranges.append((start, end))
+    return ranges
+
+
+def uniform_sis_row_indices(n: int, num_detector_samples: int) -> torch.Tensor:
+    """Uniformly subsample sorted SIS row indices from the full shifted lattice."""
+    n = int(n)
+    num_detector_samples = int(num_detector_samples)
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n!r}.")
+    if num_detector_samples <= 0 or num_detector_samples > n:
+        raise ValueError(
+            f"num_detector_samples must be in [1,{n}], got {num_detector_samples!r}."
+        )
+    if num_detector_samples == n:
+        return torch.arange(n, dtype=torch.int64)
+    indices = np.rint(np.linspace(0.0, float(n - 1), num_detector_samples)).astype(np.int64)
+    for idx in range(1, int(indices.size)):
+        if int(indices[idx]) <= int(indices[idx - 1]):
+            indices[idx] = int(indices[idx - 1]) + 1
+    overflow = int(indices[-1]) - (n - 1)
+    if overflow > 0:
+        indices -= overflow
+        for idx in range(int(indices.size) - 2, -1, -1):
+            if int(indices[idx]) >= int(indices[idx + 1]):
+                indices[idx] = int(indices[idx + 1]) - 1
+    if int(indices[0]) < 0 or int(indices[-1]) >= n or int(np.unique(indices).size) != num_detector_samples:
+        raise RuntimeError(
+            f"Failed to build {num_detector_samples} unique uniform SIS row indices from N={n}."
+        )
+    return torch.as_tensor(indices, dtype=torch.int64)
+
+
+def _uniform_indices_in_half_open_range(start: int, end: int, count: int) -> torch.Tensor:
+    """Return ``count`` rounded-linspace row indices in ``[start, end)``."""
+    start = int(start)
+    end = int(end)
+    count = int(count)
+    if count <= 0:
+        return torch.empty((0,), dtype=torch.int64)
+    if end <= start:
+        raise ValueError(f"Invalid half-open range [{start}, {end}).")
+    width = int(end - start)
+    if count > width:
+        raise ValueError(f"Cannot choose {count} unique indices from range width {width}.")
+    if count == 1:
+        return torch.tensor([int((start + end - 1) // 2)], dtype=torch.int64)
+    values = np.rint(np.linspace(float(start), float(end - 1), count)).astype(np.int64)
+    for idx in range(1, int(values.size)):
+        if int(values[idx]) <= int(values[idx - 1]):
+            values[idx] = int(values[idx - 1]) + 1
+    overflow = int(values[-1]) - (end - 1)
+    if overflow > 0:
+        values -= overflow
+        for idx in range(int(values.size) - 2, -1, -1):
+            if int(values[idx]) >= int(values[idx + 1]):
+                values[idx] = int(values[idx + 1]) - 1
+    if int(values[0]) < start or int(values[-1]) >= end or int(np.unique(values).size) != count:
+        raise RuntimeError(f"Failed to build {count} unique indices in [{start}, {end}).")
+    return torch.as_tensor(values, dtype=torch.int64)
+
+
+def edge_weighted_sis_region_counts(
+    num_detector_samples: int,
+    *,
+    edge_weight: int = 3,
+    middle_weight: int = 1,
+) -> tuple[int, int, int]:
+    """Return front/middle/back detector counts for an edge-weighted subset."""
+    total = int(num_detector_samples)
+    edge = int(edge_weight)
+    middle = int(middle_weight)
+    if total <= 0:
+        raise ValueError(f"num_detector_samples must be positive, got {num_detector_samples!r}.")
+    if edge <= 0 or middle <= 0:
+        raise ValueError("edge_weight and middle_weight must be positive.")
+    edge_count = int(math.floor(total * edge / float(2 * edge + middle)))
+    middle_count = total - 2 * edge_count
+    if edge_count <= 0 or middle_count <= 0:
+        raise ValueError(f"Invalid region counts {(edge_count, middle_count, edge_count)!r}.")
+    return int(edge_count), int(middle_count), int(edge_count)
+
+
+def edge_weighted_sis_region_bounds(
+    n: int,
+    *,
+    boundary_fraction: float = 0.2,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Return front/middle/back half-open row ranges for a full SIS detector."""
+    n = int(n)
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n!r}.")
+    fraction = float(boundary_fraction)
+    if not math.isfinite(fraction) or fraction <= 0.0 or fraction >= 0.5:
+        raise ValueError(f"boundary_fraction must be in (0, 0.5), got {boundary_fraction!r}.")
+    left_end = int(round(n * fraction))
+    right_start = n - left_end
+    if left_end <= 0 or right_start <= left_end or right_start >= n:
+        raise ValueError(
+            f"Invalid region bounds for n={n}, boundary_fraction={fraction}: "
+            f"left_end={left_end}, right_start={right_start}."
+        )
+    return (0, int(left_end)), (int(left_end), int(right_start)), (int(right_start), int(n))
+
+
+def edge_weighted_sis_row_indices(
+    *,
+    n: int,
+    num_detector_samples: int,
+    boundary_fraction: float = 0.2,
+    edge_weight: int = 3,
+    middle_weight: int = 1,
+) -> torch.Tensor:
+    """Build edge-weighted shifted-lattice row indices.
+
+    The default is the empirically tested 20% boundary split with a symmetric
+    front:middle:back weight ratio of 3:1:3.  For 256 detector samples this
+    gives counts 109:38:109.
+    """
+    n = int(n)
+    total = int(num_detector_samples)
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n!r}.")
+    if total <= 0 or total > n:
+        raise ValueError(f"num_detector_samples must be in [1,{n}], got {total!r}.")
+    front_count, middle_count, back_count = edge_weighted_sis_region_counts(
+        total,
+        edge_weight=int(edge_weight),
+        middle_weight=int(middle_weight),
+    )
+    front_range, middle_range, back_range = edge_weighted_sis_region_bounds(
+        n,
+        boundary_fraction=float(boundary_fraction),
+    )
+
+    left = _uniform_indices_in_half_open_range(front_range[0], front_range[1], front_count)
+    middle = _uniform_indices_in_half_open_range(middle_range[0], middle_range[1], middle_count)
+    right = _uniform_indices_in_half_open_range(back_range[0], back_range[1], back_count)
+    indices = torch.cat((left, middle, right), dim=0).to(dtype=torch.int64)
+    if int(indices.numel()) != total:
+        raise RuntimeError(f"Edge-weighted row construction returned {int(indices.numel())} rows, expected {total}.")
+    if bool(torch.any(indices[1:] <= indices[:-1])):
+        raise RuntimeError("Edge-weighted row construction did not produce strictly increasing indices.")
+    return indices
+
+
+def edge_weighted_sis_sampling_summary(
+    *,
+    n: int,
+    num_angles: int,
+    num_detector_samples: int,
+    boundary_fraction: float = 0.2,
+    edge_weight: int = 3,
+    middle_weight: int = 1,
+    include_indices: bool = False,
+) -> dict[str, object]:
+    """Summarize the main edge-weighted subset detector design.
+
+    The current sparse-detector main flow uses a 20%/60%/20% split of the full
+    shifted-lattice detector rows and allocates samples with a 3:1:3
+    front:middle:back weight ratio.
+    """
+    n = int(n)
+    num_angles = int(num_angles)
+    total = int(num_detector_samples)
+    front_count, middle_count, back_count = edge_weighted_sis_region_counts(
+        total,
+        edge_weight=int(edge_weight),
+        middle_weight=int(middle_weight),
+    )
+    front_range, middle_range, back_range = edge_weighted_sis_region_bounds(
+        n,
+        boundary_fraction=float(boundary_fraction),
+    )
+    indices = edge_weighted_sis_row_indices(
+        n=n,
+        num_detector_samples=total,
+        boundary_fraction=float(boundary_fraction),
+        edge_weight=int(edge_weight),
+        middle_weight=int(middle_weight),
+    )
+    summary: dict[str, object] = {
+        "mode": "shifted_lattice_edge_weighted_subset",
+        "selection_rule": (
+            "split full sorted SIS rows into first 20%, middle 60%, last 20%; "
+            "allocate rows as 3:1:3 by default"
+        ),
+        "N": int(n),
+        "num_angles": int(num_angles),
+        "num_detector_samples": int(total),
+        "M_per_angle": int(total),
+        "M": int(num_angles * total),
+        "edge_boundary_fraction": float(boundary_fraction),
+        "boundary_fraction": float(boundary_fraction),
+        "edge_weight": int(edge_weight),
+        "middle_weight": int(middle_weight),
+        "front_middle_back_ratio": [int(edge_weight), int(middle_weight), int(edge_weight)],
+        "region_bounds_half_open": {
+            "front": [int(front_range[0]), int(front_range[1])],
+            "middle": [int(middle_range[0]), int(middle_range[1])],
+            "back": [int(back_range[0]), int(back_range[1])],
+        },
+        "region_counts_front_middle_back": [int(front_count), int(middle_count), int(back_count)],
+        "first_indices": [int(v) for v in indices[: min(10, int(indices.numel()))].tolist()],
+        "last_indices": [int(v) for v in indices[-min(10, int(indices.numel())) :].tolist()],
+        "formula": (
+            "t_i = sorted(k1*cos(alpha)+k2*sin(alpha))[r_i] + tau_star, "
+            "r_i from 20%/60%/20% edge-weighted rows"
+        ),
+    }
+    if include_indices:
+        selected_rows = [int(v) for v in indices.tolist()]
+        summary["selected_row_indices_per_angle"] = [list(selected_rows) for _ in range(int(num_angles))]
+    return summary
+
+
+def _coalesce_sparse_b1b1_block(
+    *,
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    values: torch.Tensor,
+    num_rows: int,
+    num_cols: int,
+    value_tol: float,
+    support_lo: torch.Tensor,
+    support_hi: torch.Tensor,
+    diag0: float = 0.0,
+) -> dict[str, torch.Tensor]:
+    """Sum duplicate COO entries after detector-bin row aggregation."""
+    num_rows = int(num_rows)
+    num_cols = int(num_cols)
+    if num_rows <= 0 or num_cols <= 0:
+        raise ValueError(f"num_rows and num_cols must be positive, got {num_rows!r}, {num_cols!r}.")
+    rows = rows.detach().to(dtype=torch.int64, device="cpu").view(-1)
+    cols = cols.detach().to(dtype=torch.int64, device="cpu").view(-1)
+    values = values.detach().to(dtype=torch.float64, device="cpu").view(-1)
+    if int(rows.numel()) != int(cols.numel()) or int(rows.numel()) != int(values.numel()):
+        raise ValueError("rows, cols, and values must have the same number of entries.")
+    if int(rows.numel()) == 0:
+        out_rows = torch.empty((0,), dtype=torch.int64)
+        out_cols = torch.empty((0,), dtype=torch.int64)
+        out_values = torch.empty((0,), dtype=torch.float64)
+    else:
+        linear = rows * int(num_cols) + cols
+        unique, inverse = torch.unique(linear, sorted=True, return_inverse=True)
+        out_values = torch.zeros(int(unique.numel()), dtype=torch.float64)
+        out_values.scatter_add_(0, inverse, values)
+        out_rows = torch.div(unique, int(num_cols), rounding_mode="floor").to(dtype=torch.int64)
+        out_cols = torch.remainder(unique, int(num_cols)).to(dtype=torch.int64)
+        if float(value_tol) > 0.0:
+            keep = torch.abs(out_values) > float(value_tol)
+            out_rows = out_rows.index_select(0, torch.nonzero(keep, as_tuple=False).view(-1))
+            out_cols = out_cols.index_select(0, torch.nonzero(keep, as_tuple=False).view(-1))
+            out_values = out_values.index_select(0, torch.nonzero(keep, as_tuple=False).view(-1))
+
+    if int(out_rows.numel()) > 0:
+        lower_width = int(torch.clamp((out_rows - out_cols).max(), min=0).item()) + 1
+        upper_width = int(torch.clamp((out_cols - out_rows).max(), min=0).item()) + 1
+    else:
+        lower_width = 0
+        upper_width = 0
+
+    return {
+        "sparse_rows": out_rows,
+        "sparse_cols": out_cols,
+        "sparse_values": out_values,
+        "sparse_nnz": torch.tensor(int(out_values.numel()), dtype=torch.int64),
+        "num_rows": torch.tensor(int(num_rows), dtype=torch.int64),
+        "num_cols": torch.tensor(int(num_cols), dtype=torch.int64),
+        "lower_width": torch.tensor(int(lower_width), dtype=torch.int64),
+        "upper_width": torch.tensor(int(upper_width), dtype=torch.int64),
+        "diag0": torch.tensor(float(diag0), dtype=torch.float64),
+        "support_lo": support_lo.detach().to(dtype=torch.float64, device="cpu"),
+        "support_hi": support_hi.detach().to(dtype=torch.float64, device="cpu"),
+    }
+
+
+def _build_sparse_b1b1_block_from_binned_shifted_lattice(
+    *,
+    sorted_proj: torch.Tensor,
+    direction: torch.Tensor,
+    tau: float,
+    num_detector_bins: int,
+    value_tol: float = 1.0e-15,
+) -> dict[str, torch.Tensor]:
+    """Build detector-bin averages of the full shifted-lattice SIS rows."""
+    sorted_proj = sorted_proj.detach().to(dtype=torch.float64, device="cpu")
+    direction = direction.detach().to(dtype=torch.float64, device="cpu")
+    n = int(sorted_proj.numel())
+    num_detector_bins = int(num_detector_bins)
+    ranges = uniform_sis_bin_ranges(n, num_detector_bins)
+    fine_block = _build_sparse_b1b1_block_from_continuous_proj(
+        sorted_proj=sorted_proj,
+        direction=direction,
+        tau=float(tau),
+        value_tol=float(value_tol),
+    )
+    fine_to_bin = torch.empty(n, dtype=torch.int64)
+    fine_weights = torch.empty(n, dtype=torch.float64)
+    for bin_idx, (start, end) in enumerate(ranges):
+        fine_to_bin[start:end] = int(bin_idx)
+        fine_weights[start:end] = 1.0 / float(end - start)
+
+    fine_rows = fine_block["sparse_rows"].to(dtype=torch.int64, device="cpu")
+    binned_rows = fine_to_bin.index_select(0, fine_rows)
+    binned_cols = fine_block["sparse_cols"].to(dtype=torch.int64, device="cpu")
+    binned_values = fine_block["sparse_values"].to(dtype=torch.float64, device="cpu") * fine_weights.index_select(0, fine_rows)
+    diag0 = float(fine_block["diag0"].item()) if num_detector_bins == n else 0.0
+    return _coalesce_sparse_b1b1_block(
+        rows=binned_rows,
+        cols=binned_cols,
+        values=binned_values,
+        num_rows=int(num_detector_bins),
+        num_cols=int(n),
+        value_tol=float(value_tol),
+        support_lo=fine_block["support_lo"],
+        support_hi=fine_block["support_hi"],
+        diag0=diag0,
+    )
 
 
 def _build_sparse_b1b1_block_from_continuous_proj(
@@ -501,8 +873,13 @@ def _sampling_points_digest(sampling_points: torch.Tensor) -> str:
     return hashlib.sha256(values.tobytes()).hexdigest()
 
 
+def _integer_tensor_digest(values: torch.Tensor) -> str:
+    array = values.detach().to(dtype=torch.int64, device="cpu").contiguous().numpy()
+    return hashlib.sha256(array.tobytes()).hexdigest()
+
+
 class AlphaContinuousB1B1Operator2D(torch.nn.Module):
-    """Continuous-alpha B1*B1 operator with one full sparse block per angle."""
+    """Continuous-alpha B1*B1 operator with one sparse block per angle."""
 
     def __init__(
         self,
@@ -511,8 +888,17 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         width: int = IMAGE_SIZE,
         tau_offsets=None,
         sampling_points_per_angle=None,
+        selected_row_indices_per_angle=None,
         t0: float = 0.5,
         injective_tol: float = 1.0e-12,
+        sampling_mode: str = "shifted_lattice",
+        num_detector_samples: int | None = None,
+        detector_phase: float = 0.5,
+        detector_margin_ratio: float = 0.0,
+        subset_selection: str = "uniform",
+        edge_boundary_fraction: float = 0.2,
+        edge_weight: int = 3,
+        middle_weight: int = 1,
     ):
         super().__init__()
         self.height = int(height)
@@ -522,9 +908,33 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         if not self.alpha_values:
             raise ValueError("alpha_values must be a non-empty list of angles in radians.")
         self.num_angles = int(len(self.alpha_values))
-        self.M_per_angle = int(self.N)
-        self.M = int(self.num_angles * self.M_per_angle)
         self.t0 = float(t0)
+        requested_sampling_mode = str(sampling_mode or "shifted_lattice").strip().lower().replace("-", "_")
+        if requested_sampling_mode in {"", "auto"}:
+            requested_sampling_mode = "shifted_lattice"
+        if requested_sampling_mode == "shifted_lattice_edge_weighted_subset":
+            requested_sampling_mode = "shifted_lattice_subset"
+            subset_selection = "edge_weighted"
+        if requested_sampling_mode not in {"shifted_lattice", "shifted_lattice_subset", "shifted_lattice_binned", "ct_detector_grid", "custom_points"}:
+            raise ValueError(
+                f"Unknown sampling_mode={sampling_mode!r}; expected 'shifted_lattice', "
+                "'shifted_lattice_subset', 'shifted_lattice_edge_weighted_subset', "
+                "'shifted_lattice_binned', 'ct_detector_grid', or 'custom_points'."
+            )
+        self.detector_phase = float(detector_phase)
+        self.detector_margin_ratio = float(detector_margin_ratio)
+        self.subset_selection = str(subset_selection or "uniform").strip().lower().replace("-", "_")
+        if self.subset_selection in {"edge", "edge20", "edge_weighted_20", "edge_weighted_20pct", "edge_weighted_3_1_3"}:
+            self.subset_selection = "edge_weighted"
+        if self.subset_selection not in {"uniform", "edge_weighted"}:
+            raise ValueError("subset_selection must be 'uniform' or 'edge_weighted'.")
+        self.edge_boundary_fraction = float(edge_boundary_fraction)
+        self.edge_weight = int(edge_weight)
+        self.middle_weight = int(middle_weight)
+        default_detector_samples = 256 if requested_sampling_mode in {"shifted_lattice_subset", "shifted_lattice_binned", "ct_detector_grid"} else self.N
+        self.num_detector_samples = int(default_detector_samples if num_detector_samples is None else num_detector_samples)
+        if self.num_detector_samples <= 0:
+            raise ValueError(f"num_detector_samples must be positive, got {self.num_detector_samples!r}.")
         self.formula_mode = "alpha_continuous"
         self.uses_sparse_blocks = True
         self._gram_cache_dir_override = str(
@@ -535,6 +945,12 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         )
         if tau_offsets is not None and sampling_points_per_angle is not None:
             raise ValueError("Specify either tau_offsets or sampling_points_per_angle, not both.")
+        if sampling_points_per_angle is not None:
+            requested_sampling_mode = "custom_points"
+        if requested_sampling_mode in {"shifted_lattice_binned", "ct_detector_grid"} and selected_row_indices_per_angle is not None:
+            raise ValueError("selected_row_indices_per_angle is only supported for shifted_lattice/custom_points modes.")
+        if selected_row_indices_per_angle is not None and requested_sampling_mode == "shifted_lattice_subset":
+            self.subset_selection = "manual"
         if tau_offsets is None:
             tau_list = None
         else:
@@ -542,25 +958,101 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             if len(tau_list) != self.num_angles:
                 raise ValueError(f"tau_offsets length={len(tau_list)} but num_angles={self.num_angles}.")
         self.tau_offsets = tau_list
+
+        selected_row_indices_list_input = None
+        selected_row_count: int | None = None
+        if selected_row_indices_per_angle is not None:
+            selected_row_indices_list_input = []
+            for angle_idx, values in enumerate(list(selected_row_indices_per_angle)):
+                tensor = torch.as_tensor(values, dtype=torch.int64).view(-1)
+                current_count = int(tensor.numel())
+                if current_count <= 0:
+                    raise ValueError(f"selected_row_indices_per_angle[{angle_idx}] must not be empty.")
+                if bool(torch.any(tensor < 0)) or bool(torch.any(tensor >= int(self.N))):
+                    raise ValueError(
+                        f"selected_row_indices_per_angle[{angle_idx}] contains indices outside [0,{int(self.N)})."
+                    )
+                if selected_row_count is None:
+                    selected_row_count = current_count
+                elif current_count != int(selected_row_count):
+                    raise ValueError(
+                        f"selected_row_indices_per_angle[{angle_idx}] length={int(tensor.numel())} "
+                        f"but expected common per-angle length={int(selected_row_count)}."
+                    )
+                selected_row_indices_list_input.append(tensor)
+            if len(selected_row_indices_list_input) != self.num_angles:
+                raise ValueError(
+                    f"selected_row_indices_per_angle length={len(selected_row_indices_list_input)} "
+                    f"but num_angles={self.num_angles}."
+                )
+        elif requested_sampling_mode == "shifted_lattice_subset":
+            if int(self.num_detector_samples) > int(self.N):
+                raise ValueError(
+                    f"num_detector_samples must be in [1,{int(self.N)}] for shifted_lattice_subset, "
+                    f"got {int(self.num_detector_samples)}."
+                )
+            if self.subset_selection == "edge_weighted":
+                row_indices = edge_weighted_sis_row_indices(
+                    n=int(self.N),
+                    num_detector_samples=int(self.num_detector_samples),
+                    boundary_fraction=float(self.edge_boundary_fraction),
+                    edge_weight=int(self.edge_weight),
+                    middle_weight=int(self.middle_weight),
+                )
+            else:
+                row_indices = uniform_sis_row_indices(int(self.N), int(self.num_detector_samples))
+            selected_row_indices_list_input = [row_indices.clone() for _ in range(int(self.num_angles))]
+            selected_row_count = int(row_indices.numel())
+
         if sampling_points_per_angle is None:
             sampling_points_list_input = None
-            self.sampling_mode = "shifted_lattice"
+            if requested_sampling_mode == "ct_detector_grid":
+                self.sampling_mode = "ct_detector_grid"
+            elif requested_sampling_mode == "shifted_lattice_binned":
+                self.sampling_mode = "shifted_lattice_binned"
+            elif requested_sampling_mode == "shifted_lattice_subset":
+                self.sampling_mode = "shifted_lattice_subset"
+            else:
+                self.sampling_mode = "shifted_lattice" if selected_row_indices_list_input is None else "shifted_lattice_subset"
         else:
             sampling_points_list_input = []
+            sample_count: int | None = None
             for angle_idx, values in enumerate(list(sampling_points_per_angle)):
                 tensor = torch.as_tensor(values, dtype=torch.float64).view(-1)
-                if int(tensor.numel()) != self.N:
+                current_count = int(tensor.numel())
+                if current_count <= 0:
+                    raise ValueError(f"sampling_points_per_angle[{angle_idx}] must not be empty.")
+                if sample_count is None:
+                    sample_count = current_count
+                elif current_count != int(sample_count):
                     raise ValueError(
                         f"sampling_points_per_angle[{angle_idx}] length={int(tensor.numel())} "
-                        f"but expected height*width={self.N}."
+                        f"but expected common per-angle length={int(sample_count)}."
                     )
                 sampling_points_list_input.append(tensor)
             if len(sampling_points_list_input) != self.num_angles:
                 raise ValueError(
                     f"sampling_points_per_angle length={len(sampling_points_list_input)} "
-                    f"but num_angles={self.num_angles}."
+                        f"but num_angles={self.num_angles}."
                 )
-            self.sampling_mode = "custom_points"
+            self.sampling_mode = "ct_detector_grid" if str(sampling_mode or "").strip().lower().replace("-", "_") == "ct_detector_grid" else "custom_points"
+            if selected_row_indices_list_input is not None and int(selected_row_count or 0) != int(sampling_points_list_input[0].numel()):
+                raise ValueError(
+                    f"selected_row_indices_per_angle common length={int(selected_row_count or 0)} but "
+                    f"sampling_points_per_angle common length={int(sampling_points_list_input[0].numel())}."
+                )
+            if self.sampling_mode == "ct_detector_grid" and int(sampling_points_list_input[0].numel()) != int(self.num_detector_samples):
+                raise ValueError(
+                    f"ct_detector_grid sampling_points_per_angle length={int(sampling_points_list_input[0].numel())} "
+                    f"but num_detector_samples={int(self.num_detector_samples)}."
+                )
+        if sampling_points_list_input is not None:
+            self.M_per_angle = int(sampling_points_list_input[0].numel())
+        elif self.sampling_mode in {"shifted_lattice_binned", "ct_detector_grid"}:
+            self.M_per_angle = int(self.num_detector_samples)
+        elif sampling_points_list_input is None:
+            self.M_per_angle = int(self.N if selected_row_indices_list_input is None else selected_row_count)
+        self.M = int(self.num_angles * self.M_per_angle)
 
         with torch.no_grad():
             directions = []
@@ -573,22 +1065,69 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             support_hi_list = []
             blocks = []
             effective_tau = []
+            selected_row_indices_list = []
 
             for angle_idx, alpha in enumerate(self.alpha_values):
                 info = _alpha_projection_order(alpha, self.height, self.width, injective_tol=float(injective_tol))
                 direction = info["direction"]
                 support_lo, support_hi = phi_support_bounds_b1b1(direction)
-                if sampling_points_list_input is None:
+                if self.sampling_mode == "ct_detector_grid" and sampling_points_list_input is None:
+                    tau = float("nan")
+                    selected_rows = torch.full((int(self.M_per_angle),), -1, dtype=torch.int64)
+                    sampling_points = make_support_detector_grid_sampling_points(
+                        sorted_proj=info["sorted_proj"],
+                        direction=direction,
+                        num_detector_samples=int(self.M_per_angle),
+                        detector_phase=float(self.detector_phase),
+                        margin_ratio=float(self.detector_margin_ratio),
+                    )
+                    block = _build_sparse_b1b1_block_from_sampling_points(
+                        sorted_proj=info["sorted_proj"],
+                        direction=direction,
+                        sampling_points=sampling_points,
+                    )
+                elif self.sampling_mode == "shifted_lattice_binned" and sampling_points_list_input is None:
                     tau = float(support_lo) + float(t0) * (float(support_hi) - float(support_lo)) if tau_list is None else float(tau_list[angle_idx])
-                    sampling_points = info["sorted_proj"] + float(tau)
-                    block = _build_sparse_b1b1_block_from_continuous_proj(
+                    fine_sampling_points = info["sorted_proj"] + float(tau)
+                    bin_ranges = uniform_sis_bin_ranges(int(self.N), int(self.M_per_angle))
+                    representative_rows = []
+                    binned_sampling_points = []
+                    for start, end in bin_ranges:
+                        representative_rows.append(int((start + end - 1) // 2))
+                        binned_sampling_points.append(torch.mean(fine_sampling_points[start:end]))
+                    selected_rows = torch.as_tensor(representative_rows, dtype=torch.int64)
+                    sampling_points = torch.stack(binned_sampling_points).to(dtype=torch.float64)
+                    block = _build_sparse_b1b1_block_from_binned_shifted_lattice(
                         sorted_proj=info["sorted_proj"],
                         direction=direction,
                         tau=tau,
+                        num_detector_bins=int(self.M_per_angle),
                     )
+                elif sampling_points_list_input is None:
+                    tau = float(support_lo) + float(t0) * (float(support_hi) - float(support_lo)) if tau_list is None else float(tau_list[angle_idx])
+                    if selected_row_indices_list_input is None:
+                        selected_rows = torch.arange(int(self.N), dtype=torch.int64)
+                        sampling_points = info["sorted_proj"] + float(tau)
+                        block = _build_sparse_b1b1_block_from_continuous_proj(
+                            sorted_proj=info["sorted_proj"],
+                            direction=direction,
+                            tau=tau,
+                        )
+                    else:
+                        selected_rows = selected_row_indices_list_input[angle_idx]
+                        sampling_points = info["sorted_proj"].index_select(0, selected_rows) + float(tau)
+                        block = _build_sparse_b1b1_block_from_sampling_points(
+                            sorted_proj=info["sorted_proj"],
+                            direction=direction,
+                            sampling_points=sampling_points,
+                        )
                 else:
                     tau = float("nan")
                     sampling_points = sampling_points_list_input[angle_idx]
+                    if selected_row_indices_list_input is None:
+                        selected_rows = torch.full((int(self.M_per_angle),), -1, dtype=torch.int64)
+                    else:
+                        selected_rows = selected_row_indices_list_input[angle_idx]
                     block = _build_sparse_b1b1_block_from_sampling_points(
                         sorted_proj=info["sorted_proj"],
                         direction=direction,
@@ -604,6 +1143,7 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
                 support_hi_list.append(torch.tensor(float(support_hi), dtype=torch.float64))
                 blocks.append(block)
                 effective_tau.append(float(tau) if math.isfinite(float(tau)) else 0.0)
+                selected_row_indices_list.append(selected_rows.to(dtype=torch.int64))
 
             sparse_nnz = torch.stack([blk["sparse_nnz"] for blk in blocks], dim=0).to(dtype=torch.int64, device=device)
             max_nnz = int(sparse_nnz.max().item()) if int(sparse_nnz.numel()) > 0 else 0
@@ -633,6 +1173,7 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             self.register_buffer("sorted_proj_per_angle", torch.stack(sorted_proj_list, dim=0).to(dtype=torch.float32, device=device))
             self.register_buffer("sampling_points_per_angle", torch.stack(sampling_points_list, dim=0).to(dtype=torch.float32, device=device))
             self.register_buffer("sampling_points", self.sampling_points_per_angle.reshape(-1))
+            self.register_buffer("selected_row_indices_per_angle", torch.stack(selected_row_indices_list, dim=0).to(dtype=torch.int64, device=device))
             self.register_buffer("lex_to_order_indices", torch.stack(lex_to_order_list, dim=0).to(dtype=torch.int64, device=device))
             self.register_buffer("order_to_lex_indices", torch.stack(order_to_lex_list, dim=0).to(dtype=torch.int64, device=device))
             self.register_buffer("min_projected_gaps", torch.stack(min_gap_list, dim=0).to(dtype=torch.float32, device=device))
@@ -657,10 +1198,31 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             "width": int(self.width),
             "num_angles": int(self.num_angles),
             "alpha_values": [round(float(v), 15) for v in self.alpha_values],
+            "M_per_angle": int(self.M_per_angle),
+            "M": int(self.M),
             "sampling_mode": str(self.sampling_mode),
+            "subset_selection": str(getattr(self, "subset_selection", "uniform")),
+            "edge_weighted_subset": (
+                {
+                    "boundary_fraction": round(float(self.edge_boundary_fraction), 15),
+                    "edge_weight": int(self.edge_weight),
+                    "middle_weight": int(self.middle_weight),
+                }
+                if str(getattr(self, "subset_selection", "")) == "edge_weighted"
+                else None
+            ),
             "tau_offsets": (
                 [round(float(v), 15) for v in self.tau_offsets_tensor.detach().cpu().tolist()]
-                if str(self.sampling_mode) == "shifted_lattice"
+                if str(self.sampling_mode) in {"shifted_lattice", "shifted_lattice_subset", "shifted_lattice_binned"}
+                else None
+            ),
+            "sis_binning": (
+                {
+                    "domain": "sorted_sis_index",
+                    "weight": "normalized_mean",
+                    "num_bins": int(self.M_per_angle),
+                }
+                if str(self.sampling_mode) == "shifted_lattice_binned"
                 else None
             ),
             "sampling_points_sha256": (
@@ -668,10 +1230,15 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
                 if str(self.sampling_mode) == "shifted_lattice"
                 else _sampling_points_digest(self.sampling_points_per_angle)
             ),
+            "selected_row_indices_sha256": (
+                None
+                if bool(torch.all(self.selected_row_indices_per_angle < 0))
+                else _integer_tensor_digest(self.selected_row_indices_per_angle)
+            ),
             "sparse_nnz_per_angle": [int(v.item()) for v in self.sparse_nnz],
             "formula_mode": "alpha_continuous",
             "basis": "b1b1",
-            "implementation_version": "alpha_continuous_full_sparse_v2",
+            "implementation_version": "alpha_continuous_rect_sparse_v6_edge_weighted_subset",
         }
 
     def _gram_context_signature(self, b: torch.Tensor) -> tuple[object, ...]:
@@ -715,7 +1282,14 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
         coeff_flat = coeff_matrix.reshape(batch, self.N)
         gather_index = self.order_to_lex_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
         ordered = coeff_flat.unsqueeze(1).expand(-1, self.num_angles, -1).gather(2, gather_index)
-        return _sparse_blocks_apply_batched(self.sparse_rows, self.sparse_cols, self.sparse_values, self.sparse_nnz, ordered)
+        return _sparse_blocks_apply_batched(
+            self.sparse_rows,
+            self.sparse_cols,
+            self.sparse_values,
+            self.sparse_nnz,
+            ordered,
+            num_rows=int(self.M_per_angle),
+        )
 
     def forward(self, coeff_matrix: torch.Tensor) -> torch.Tensor:
         return self.forward_per_angle(coeff_matrix).reshape(coeff_matrix.shape[0], self.M)
@@ -725,9 +1299,21 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             residual_per_angle = residual_per_angle.squeeze(2)
         if residual_per_angle.dim() != 3:
             raise ValueError(f"Expected residual_per_angle with shape (B,K,M_per_angle), got {tuple(residual_per_angle.shape)}")
+        if int(residual_per_angle.shape[1]) != int(self.num_angles) or int(residual_per_angle.shape[2]) != int(self.M_per_angle):
+            raise ValueError(
+                f"Expected residual_per_angle shape (B,{self.num_angles},{self.M_per_angle}), "
+                f"got {tuple(residual_per_angle.shape)}"
+            )
         residual_per_angle = residual_per_angle.to(dtype=torch.float32, device=self.sampling_points.device)
         batch = int(residual_per_angle.shape[0])
-        grad_ordered = _sparse_blocks_adjoint_apply_batched(self.sparse_rows, self.sparse_cols, self.sparse_values, self.sparse_nnz, residual_per_angle)
+        grad_ordered = _sparse_blocks_adjoint_apply_batched(
+            self.sparse_rows,
+            self.sparse_cols,
+            self.sparse_values,
+            self.sparse_nnz,
+            residual_per_angle,
+            num_cols=int(self.N),
+        )
         gather_index = self.lex_to_order_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
         grad_lex = grad_ordered.gather(2, gather_index)
         return grad_lex.view(batch, self.num_angles, 1, self.height, self.width)
@@ -975,6 +1561,7 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             self.sparse_values,
             self.sparse_nnz,
             ordered,
+            num_rows=int(self.M_per_angle),
         )
         grad_ordered = _sparse_blocks_adjoint_apply_batched(
             self.sparse_rows,
@@ -982,6 +1569,7 @@ class AlphaContinuousB1B1Operator2D(torch.nn.Module):
             self.sparse_values,
             self.sparse_nnz,
             measurement_pa,
+            num_cols=int(self.N),
         )
         lex_to_order = self.lex_to_order_indices.view(1, self.num_angles, self.N).expand(batch, -1, -1)
         grad_lex = grad_ordered.gather(2, lex_to_order)
@@ -1941,26 +2529,99 @@ def _resolve_theoretical_formula_mode(formula_mode: str | None = None, solver_mo
     raise ValueError(f"Unsupported theoretical_formula_mode={formula_mode!r}; only 'alpha_continuous' is supported.")
 
 
+def _time_domain_sampling_kwargs() -> dict[str, object]:
+    sampling_mode = str(TIME_DOMAIN_CONFIG.get("sampling_mode", "shifted_lattice") or "shifted_lattice").strip().lower().replace("-", "_")
+    return {
+        "sampling_mode": sampling_mode,
+        "num_detector_samples": int(TIME_DOMAIN_CONFIG.get("num_detector_samples", IMAGE_SIZE * IMAGE_SIZE)),
+        "detector_phase": float(TIME_DOMAIN_CONFIG.get("detector_phase", 0.5)),
+        "detector_margin_ratio": float(TIME_DOMAIN_CONFIG.get("detector_margin_ratio", 0.0)),
+        "subset_selection": str(TIME_DOMAIN_CONFIG.get("subset_selection", "uniform") or "uniform"),
+        "edge_boundary_fraction": float(TIME_DOMAIN_CONFIG.get("edge_boundary_fraction", 0.2)),
+        "edge_weight": int(TIME_DOMAIN_CONFIG.get("edge_weight", 3)),
+        "middle_weight": int(TIME_DOMAIN_CONFIG.get("middle_weight", 1)),
+    }
+
+
+def _detector_sampling_points_from_records(records, *, expected_count: int, num_detector_samples: int):
+    record_list = list(records or [])
+    if not record_list:
+        return None
+    if int(len(record_list)) != int(expected_count):
+        return None
+    points_per_angle = []
+    for item in record_list:
+        values = item.get("detector_sampling_points") if isinstance(item, dict) else None
+        if values is None:
+            return None
+        tensor = torch.as_tensor(values, dtype=torch.float64).view(-1)
+        if int(tensor.numel()) != int(num_detector_samples):
+            raise ValueError(
+                f"detector_sampling_points length={int(tensor.numel())} but "
+                f"num_detector_samples={int(num_detector_samples)}."
+            )
+        points_per_angle.append(tensor)
+    return points_per_angle
+
+
 def build_time_domain_operator(height: int = IMAGE_SIZE, width: int = IMAGE_SIZE) -> torch.nn.Module:
     """Build the single retained alpha-continuous operator."""
     alpha_values = TIME_DOMAIN_CONFIG.get("alpha_values") or []
     tau_offsets = TIME_DOMAIN_CONFIG.get("alpha_tau_offsets") or []
-    if not alpha_values or not tau_offsets:
-        raise ValueError("alpha_continuous operator requires TIME_DOMAIN_CONFIG['alpha_values'] and TIME_DOMAIN_CONFIG['alpha_tau_offsets'].")
-    if len(alpha_values) != len(tau_offsets):
-        raise ValueError(f"alpha_values and alpha_tau_offsets length mismatch: {len(alpha_values)} vs {len(tau_offsets)}.")
-    return AlphaContinuousB1B1Operator2D(alpha_values=alpha_values, tau_offsets=tau_offsets, height=int(height), width=int(width)).to(device)
+    sampling_kwargs = _time_domain_sampling_kwargs()
+    if not alpha_values:
+        raise ValueError("alpha_continuous operator requires TIME_DOMAIN_CONFIG['alpha_values'].")
+    if str(sampling_kwargs["sampling_mode"]) == "ct_detector_grid":
+        tau_offsets_for_operator = None
+        sampling_points_per_angle = _detector_sampling_points_from_records(
+            TIME_DOMAIN_CONFIG.get("alpha_condition_constrained_records") or [],
+            expected_count=len(alpha_values),
+            num_detector_samples=int(sampling_kwargs["num_detector_samples"]),
+        )
+    else:
+        if not tau_offsets:
+            raise ValueError("shifted_lattice operator requires TIME_DOMAIN_CONFIG['alpha_tau_offsets'].")
+        if len(alpha_values) != len(tau_offsets):
+            raise ValueError(f"alpha_values and alpha_tau_offsets length mismatch: {len(alpha_values)} vs {len(tau_offsets)}.")
+        tau_offsets_for_operator = tau_offsets
+        sampling_points_per_angle = None
+    return AlphaContinuousB1B1Operator2D(
+        alpha_values=alpha_values,
+        tau_offsets=tau_offsets_for_operator,
+        sampling_points_per_angle=sampling_points_per_angle,
+        height=int(height),
+        width=int(width),
+        **sampling_kwargs,
+    ).to(device)
 
 
 def build_time_domain_operator_from_alpha_records(records, height: int = IMAGE_SIZE, width: int = IMAGE_SIZE) -> torch.nn.Module:
     """Build an alpha-continuous operator from selected JSON-style records."""
-    alpha_values = [float(item["alpha"]) for item in list(records or [])]
-    tau_offsets = [float(item["tau_star"] if "tau_star" in item else item["tau"]) for item in list(records or [])]
+    record_list = list(records or [])
+    alpha_values = [float(item["alpha"]) for item in record_list]
+    sampling_kwargs = _time_domain_sampling_kwargs()
     if not alpha_values:
         raise ValueError("init alpha records must contain at least one selected angle.")
-    if len(alpha_values) != len(tau_offsets):
-        raise ValueError(f"init alpha/tau length mismatch: {len(alpha_values)} vs {len(tau_offsets)}.")
-    return AlphaContinuousB1B1Operator2D(alpha_values=alpha_values, tau_offsets=tau_offsets, height=int(height), width=int(width)).to(device)
+    if str(sampling_kwargs["sampling_mode"]) == "ct_detector_grid":
+        tau_offsets = None
+        sampling_points_per_angle = _detector_sampling_points_from_records(
+            record_list,
+            expected_count=len(alpha_values),
+            num_detector_samples=int(sampling_kwargs["num_detector_samples"]),
+        )
+    else:
+        tau_offsets = [float(item["tau_star"] if "tau_star" in item else item["tau"]) for item in record_list]
+        if len(alpha_values) != len(tau_offsets):
+            raise ValueError(f"init alpha/tau length mismatch: {len(alpha_values)} vs {len(tau_offsets)}.")
+        sampling_points_per_angle = None
+    return AlphaContinuousB1B1Operator2D(
+        alpha_values=alpha_values,
+        tau_offsets=tau_offsets,
+        sampling_points_per_angle=sampling_points_per_angle,
+        height=int(height),
+        width=int(width),
+        **sampling_kwargs,
+    ).to(device)
 
 
 def _resolve_data_formula_mode(reconstruction_formula_mode: str) -> str:

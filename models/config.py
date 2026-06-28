@@ -17,10 +17,17 @@ except ImportError:  # pragma: no cover - supports package-style imports.
 # Paths
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_CODE_DIR = os.path.join(PROJECT_ROOT, "models")
-CHECKPOINT_ROOT = os.path.join(PROJECT_ROOT, "checkpoints")
+
+
+def _path_override(env_name: str, default: str) -> str:
+    value = str(os.environ.get(env_name, "") or "").strip()
+    return value if value else default
+
+
+CHECKPOINT_ROOT = _path_override("CHECKPOINT_ROOT_OVERRIDE", os.path.join(PROJECT_ROOT, "checkpoints"))
 LEGACY_MODEL_DIR = os.path.join(CHECKPOINT_ROOT, "deep_learn")
-DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
+DATA_DIR = _path_override("DATA_DIR_OVERRIDE", os.path.join(PROJECT_ROOT, "data"))
+RESULTS_DIR = _path_override("RESULTS_DIR_OVERRIDE", os.path.join(PROJECT_ROOT, "results"))
 
 # 128x128 Shepp-Logan phantom with B1*B1 pixel basis.
 IMAGE_SIZE = 128
@@ -317,6 +324,7 @@ DATA_CONFIG = {
     "update_max_norm": 0.0,
     "validation_seed": 42,
     "val_batch_size": n_data,
+    "val_subsample_size": n_data,
     "val_reproducible": True,
     "val_random_subsample": False,
     "intermediate_supervision_enabled": False,
@@ -355,7 +363,7 @@ _apply_float_override(DATA_CONFIG, "l1_init_admm_cg_tol", "L1_INIT_ADMM_CG_TOL_O
 _apply_float_override(DATA_CONFIG, "l1_init_admm_rho_data", "L1_INIT_ADMM_RHO_DATA_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "l1_init_admm_rho_reg", "L1_INIT_ADMM_RHO_REG_OVERRIDE")
 _apply_int_override(DATA_CONFIG, "val_batch_size", "VAL_BATCH_SIZE_OVERRIDE")
-_apply_int_override(DATA_CONFIG, "val_batch_size", "VAL_SUBSAMPLE_SIZE_OVERRIDE")
+_apply_int_override(DATA_CONFIG, "val_subsample_size", "VAL_SUBSAMPLE_SIZE_OVERRIDE")
 _apply_bool_override(DATA_CONFIG, "val_random_subsample", "VAL_RANDOM_SUBSAMPLE_OVERRIDE")
 _apply_bool_override(DATA_CONFIG, "intermediate_supervision_enabled", "INTERMEDIATE_SUPERVISION_ENABLED_OVERRIDE")
 _apply_float_override(DATA_CONFIG, "intermediate_supervision_weight_start", "INTERMEDIATE_SUPERVISION_WEIGHT_START_OVERRIDE")
@@ -391,7 +399,10 @@ TIME_DOMAIN_CONFIG = {
     "init_method": "tikhonov_direct",
     "init_cg_iters": 40,
     "init_cg_tol": 1.0e-4,
+    "sampling_mode": "shifted_lattice",
     "num_detector_samples": IMAGE_SIZE * IMAGE_SIZE,
+    "detector_phase": 0.5,
+    "detector_margin_ratio": 0.0,
 }
 
 
@@ -495,13 +506,51 @@ if _init_alpha_json_override is not None:
     TIME_DOMAIN_CONFIG["init_alpha_condition_constrained_json"] = str(_init_resolved_json)
 
 _m_override = os.environ.get("NUM_DETECTOR_SAMPLES_OVERRIDE", None)
+_num_detector_samples_overridden = False
 if _m_override is not None:
     _s = str(_m_override).strip()
     if _s:
         try:
             TIME_DOMAIN_CONFIG["num_detector_samples"] = int(_s)
+            _num_detector_samples_overridden = True
         except ValueError as e:
             raise ValueError(f"Invalid NUM_DETECTOR_SAMPLES_OVERRIDE={_m_override!r}; expected an integer.") from e
+if int(TIME_DOMAIN_CONFIG.get("num_detector_samples", 0)) <= 0:
+    raise ValueError("TIME_DOMAIN_CONFIG['num_detector_samples'] must be positive.")
+
+_apply_string_override(
+    TIME_DOMAIN_CONFIG,
+    "sampling_mode",
+    "SAMPLING_MODE_OVERRIDE",
+    allowed_values={
+        "shifted_lattice",
+        "shifted_lattice_subset",
+        "shifted_lattice_edge_weighted_subset",
+        "ct_detector_grid",
+        "custom_points",
+    },
+)
+TIME_DOMAIN_CONFIG["sampling_mode"] = str(TIME_DOMAIN_CONFIG.get("sampling_mode", "shifted_lattice")).strip().lower().replace("-", "_")
+if TIME_DOMAIN_CONFIG["sampling_mode"] not in {
+    "shifted_lattice",
+    "shifted_lattice_subset",
+    "shifted_lattice_edge_weighted_subset",
+    "ct_detector_grid",
+    "custom_points",
+}:
+    raise ValueError(
+        f"Invalid sampling_mode={TIME_DOMAIN_CONFIG['sampling_mode']!r}; "
+        "expected 'shifted_lattice', 'shifted_lattice_subset', "
+        "'shifted_lattice_edge_weighted_subset', 'ct_detector_grid', or 'custom_points'."
+    )
+if TIME_DOMAIN_CONFIG["sampling_mode"] == "ct_detector_grid" and not _num_detector_samples_overridden:
+    TIME_DOMAIN_CONFIG["num_detector_samples"] = 256
+_apply_float_override(TIME_DOMAIN_CONFIG, "detector_phase", "DETECTOR_PHASE_OVERRIDE")
+if not (0.0 < float(TIME_DOMAIN_CONFIG.get("detector_phase", 0.5)) < 1.0):
+    raise ValueError("TIME_DOMAIN_CONFIG['detector_phase'] must be in (0, 1).")
+_apply_float_override(TIME_DOMAIN_CONFIG, "detector_margin_ratio", "DETECTOR_MARGIN_RATIO_OVERRIDE")
+if not (0.0 <= float(TIME_DOMAIN_CONFIG.get("detector_margin_ratio", 0.0)) < 0.5):
+    raise ValueError("TIME_DOMAIN_CONFIG['detector_margin_ratio'] must be in [0, 0.5).")
 
 _apply_string_override(TIME_DOMAIN_CONFIG, "operator_mode", "OPERATOR_MODE_OVERRIDE", allowed_values={"theoretical_b1b1"})
 _init_method_override = _get_env_override("INIT_METHOD_OVERRIDE")
@@ -576,14 +625,22 @@ _default_profile_tag = {
 }.get(str(TIME_DOMAIN_CONFIG.get("experiment_profile", "default")).strip().lower(), "")
 EXPERIMENT_OUTPUT_TAG = str(os.environ.get("OUTPUT_TAG_OVERRIDE", "") or _default_profile_tag).strip()
 _model_dir_name = str(os.environ.get("MODEL_DIR_NAME_OVERRIDE", "") or EXPERIMENT_OUTPUT_TAG or "deep_learn").strip()
-MODEL_DIR = os.path.join(CHECKPOINT_ROOT, _model_dir_name)
+_model_dir_override = str(os.environ.get("MODEL_DIR_OVERRIDE", "") or "").strip()
+MODEL_DIR = _model_dir_override or os.path.join(CHECKPOINT_ROOT, _model_dir_name)
 _model_stem = "theoretical_ct"
 if EXPERIMENT_OUTPUT_TAG:
     _model_stem = f"{_model_stem}_{EXPERIMENT_OUTPUT_TAG}"
 
-MODEL_PATH = os.path.join(MODEL_DIR, f"{_model_stem}_model.pth")
-BEST_MODEL_PATH = os.path.join(MODEL_DIR, f"{_model_stem}_best_model.pth")
-CHECKPOINT_DIR = os.path.join(MODEL_DIR, f"checkpoints_{EXPERIMENT_OUTPUT_TAG}") if EXPERIMENT_OUTPUT_TAG else os.path.join(MODEL_DIR, "checkpoints")
+_model_path_override = str(os.environ.get("MODEL_PATH_OVERRIDE", "") or "").strip()
+_best_model_path_override = str(os.environ.get("BEST_MODEL_PATH_OVERRIDE", "") or "").strip()
+_checkpoint_dir_override = str(os.environ.get("CHECKPOINT_DIR_OVERRIDE", "") or "").strip()
+MODEL_PATH = _model_path_override or os.path.join(MODEL_DIR, f"{_model_stem}_model.pth")
+BEST_MODEL_PATH = _best_model_path_override or os.path.join(MODEL_DIR, f"{_model_stem}_best_model.pth")
+CHECKPOINT_DIR = _checkpoint_dir_override or (
+    os.path.join(MODEL_DIR, f"checkpoints_{EXPERIMENT_OUTPUT_TAG}")
+    if EXPERIMENT_OUTPUT_TAG
+    else os.path.join(MODEL_DIR, "checkpoints")
+)
 _log_dir_override = str(os.environ.get("LOG_DIR_OVERRIDE", "") or "").strip()
 LOG_DIR = _log_dir_override or (os.path.join(PROJECT_ROOT, "logs", EXPERIMENT_OUTPUT_TAG) if EXPERIMENT_OUTPUT_TAG else os.path.join(PROJECT_ROOT, "logs"))
 

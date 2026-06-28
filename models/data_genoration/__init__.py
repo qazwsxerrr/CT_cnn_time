@@ -1,21 +1,33 @@
 from .offline_tvinit_data import (
     OfflineBatchProvider,
     OfflineCTDataset,
+    apply_alpha16_tvinit_env_defaults,
     apply_alpha8_tvinit_env_defaults,
+    apply_tvinit_env_defaults,
+    default_alpha16_json_path,
     default_alpha_json_path,
+    generate_train_val_test_offline_datasets,
     generate_offline_dataset,
     generate_mixed_offline_dataset,
+    load_offline_metadata,
     load_offline_tensors,
     save_offline_tensors,
+    validate_offline_metadata_against_env,
 )
 
 __all__ = [
     "OfflineBatchProvider",
     "OfflineCTDataset",
+    "apply_alpha16_tvinit_env_defaults",
     "apply_alpha8_tvinit_env_defaults",
+    "apply_tvinit_env_defaults",
+    "default_alpha16_json_path",
     "default_alpha_json_path",
+    "generate_train_val_test_offline_datasets",
     "generate_offline_dataset",
     "generate_mixed_offline_dataset",
+    "load_offline_metadata",
     "load_offline_tensors",
     "save_offline_tensors",
+    "validate_offline_metadata_against_env",
 ]
